@@ -408,7 +408,7 @@ async function renderStun() {
     const rows = tasks.map(t => `
       <tr>
         <td>${esc(t.name)} <span class="small muted">${esc(t.protocol)}</span></td>
-        <td>${esc(t.target_ip)}:${t.target_port}</td>
+        <td>${esc(t.target_ip)}:${t.target_port}${t.peer_addr ? `<div class="small muted">对端: ${esc(t.peer_addr)}</div>` : ''}</td>
         <td class="small">${esc(t.stun_host)}:${t.stun_port}</td>
         <td>${t.status === 'RUNNING' ? badge('运行中', 'ok') : t.status === 'ERROR' ? badge('错误', 'err') : badge('已停止', 'gray')}</td>
         <td>${t.nat_type ? `<div class="small">${esc(t.nat_type)}</div>` : '-'}</td>
@@ -424,10 +424,13 @@ async function renderStun() {
       </tr>`).join('');
     $('#pageBody').innerHTML = `
       <div class="tip">
-        <b>STUN 仅建立 NAT 映射，不做数据中继。</b>
-        穿透效果取决于 NAT 类型：Full Cone 成功率高；受限锥形需对端配合打洞并保持保活；
-        <b>对称型（Symmetric）NAT 纯 STUN 无法穿透</b>，请改用路由器端口转发。
-        启动后可用外网设备访问「映射地址」验证。
+        <b>穿透通道支持承载 UDP / TCP / HTTP 数据传输。</b>
+        UDP 任务：外网数据包经 NAT 映射进入后按会话转发到内网目标，响应原路返回；
+        TCP/HTTP 任务：建议填写「对端公网地址」由本端主动打洞，连接建立后双向透传（HTTP 直接可用），
+        或依赖路由器端口映射/锥形 NAT 接受入站连接。
+        <br><b>注意：任务运行中 ≠ 外网可访问。</b>外网能否主动连入取决于 NAT 过滤行为：
+        Full Cone 可直接访问；受限锥形仅允许已打洞的对端访问；<b>对称型（Symmetric）NAT 纯 STUN 无法穿透</b>，
+        请改用路由器端口转发。同时请确认主机防火墙已放行监听端口（Windows 需允许 Java 入站连接）。
       </div>
       <div class="toolbar"><div class="spacer"></div><button class="btn primary" onclick="stunForm()">＋ 新增穿透任务</button></div>
       <div class="panel"><table>
@@ -443,8 +446,11 @@ window.stunCmd = async (id, cmd) => {
             toast('正在探测 NAT 类型...');
             const r = await api('POST', `/api/stun/tasks/${id}/test`);
             modal('STUN 探测结果', `<p>NAT 类型：<b>${esc(r.natType)}</b></p>
-              <p style="margin-top:8px">外网映射地址：<b>${esc(r.mapped || '无')}</b></p>
-              <p class="muted small" style="margin-top:10px">对称型 NAT 下每次探测映射端口可能不同，属正常现象。</p>`);
+              <p style="margin-top:8px">外网映射地址(UDP)：<b>${esc(r.mapped || '无')}</b></p>
+              ${r.tcpMapped ? `<p style="margin-top:8px">TCP 映射地址：<b>${esc(r.tcpMapped)}</b>
+                <span class="muted small">（TCP 入站以此为准）</span></p>` : ''}
+              <p class="muted small" style="margin-top:10px">对称型 NAT 下每次探测映射端口可能不同，属正常现象；
+              任务运行中不代表外网可访问，受限/对称型需端口转发或已打洞对端。</p>`);
         } else {
             await api('POST', `/api/stun/tasks/${id}/${cmd}`);
             toast(cmd === 'start' ? '已启动' : '已停止');
@@ -471,8 +477,9 @@ window.stunForm = async (id) => {
         <div class="field"><label>内网目标端口 <b>*</b></label><input name="target_port" required type="number" min="1" max="65535" value="${t.target_port ?? ''}"></div>
         <div class="field"><label>本地绑定端口</label><input name="bind_port" type="number" min="0" max="65535" value="${t.bind_port ?? 0}" placeholder="0=随机"></div>
         <div class="field"><label>保活间隔（秒）</label><input name="keepalive_sec" type="number" min="10" value="${t.keepalive_sec ?? 25}"></div>
-        <div class="field"><label>STUN 服务器 <b>*</b></label><input name="stun_host" required value="${esc(t.stun_host || 'stun.l.google.com')}"></div>
-        <div class="field"><label>STUN 端口</label><input name="stun_port" type="number" value="${t.stun_port ?? 19302}"></div>
+        <div class="field full"><label>对端公网地址（TCP 打洞选填）</label><input name="peer_addr" value="${esc(t.peer_addr || '')}" placeholder="如 203.0.113.5:8080，留空则仅接受入站连接"></div>
+        <div class="field"><label>STUN 服务器 <b>*</b></label><input name="stun_host" required value="${esc(t.stun_host || 'stun.miwifi.com')}"></div>
+        <div class="field"><label>STUN 端口</label><input name="stun_port" type="number" value="${t.stun_port ?? 3478}"></div>
         <div class="form-foot full">
           <button type="button" class="btn" onclick="closeModal()">取消</button>
           <button class="btn primary">保存</button>

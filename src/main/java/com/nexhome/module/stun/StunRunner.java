@@ -2,6 +2,7 @@ package com.nexhome.module.stun;
 
 import com.nexhome.core.Database;
 import com.nexhome.core.Logs;
+import com.nexhome.core.Tasks;
 
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -16,15 +17,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 
 /**
- * STUN 穿透任务运行器（每个任务一个实例）。
+ * STUN 穿透任务运行器（每个任务一个实例），穿透通道承载 UDP / TCP / HTTP 三类数据传输。
  * <p>
  * <b>UDP 模式</b>：在绑定端口上打开 UDP Socket，持续向 STUN 服务器发送绑定请求
- * 建立并保活 NAT 映射；外网发入该映射端口的数据包被转发到目标内网服务，
- * 响应按会话回传给对端（简易会话表实现）。
+ * 建立并保活 NAT 映射；外网发入该映射端口的数据包按会话转发到目标内网服务，
+ * 响应沿原路回传给对端（简易会话表实现）。
  * <p>
- * <b>TCP 模式</b>：TCP 无法仅靠 STUN 打洞（需双端同时发起连接），
- * 因此这里在同一本地端口监听 TCP 并转发到目标服务，同时用 STUN 探测该端口的
- * 外网映射地址用于展示。该模式在路由器存在端口映射/DMZ/锥形 NAT 时可被外网访问。
+ * <b>TCP 模式</b>：在同一本地端口监听 TCP，接受外网入站连接并双向管道化转发到目标服务，
+ * HTTP 等 TCP 流量透明传输；若配置了「对端公网地址」，额外周期性从同一本地端口主动向对端
+ * 发起连接（TCP 打洞，在 NAT 上建立双向过滤条目），连接建立后同样并入转发管道。
+ * 同时在同端口用 STUN 探测/保活外网映射地址用于展示。
  * <p>
  * 局限性：对称型 NAT（Symmetric）下映射端口随机，纯 STUN 无法保证穿透成功，
  * 此时建议在路由器配置端口转发或改用中继方案。
@@ -40,11 +42,14 @@ final class StunRunner {
     private final int stunPort;
     private final int bindPort;
     private final int keepaliveSec;
+    /** TCP 打洞对端公网地址（ip:port，可为空；为空时仅依赖入站连接） */
+    private final String peerAddr;
 
     private volatile boolean running;
     private DatagramSocket udpSocket;
     private ServerSocket tcpServer;
     private ScheduledFuture<?> keepaliveTask;
+    private ScheduledFuture<?> punchTask;
     /** UDP 会话表：对端地址 -> 与目标服务通信的 socket */
     private final Map<String, DatagramSocket> sessions = new ConcurrentHashMap<>();
 
@@ -58,16 +63,17 @@ final class StunRunner {
         this.stunPort = intVal(task, "stun_port");
         this.bindPort = intVal(task, "bind_port");
         this.keepaliveSec = Math.max(10, intVal(task, "keepalive_sec"));
+        this.peerAddr = str(task, "peer_addr").trim();
     }
 
     /** 启动穿透任务 */
     void start() throws Exception {
+        running = true; // 先置位：接收线程启动后立即依赖该标志
         if ("UDP".equalsIgnoreCase(protocol)) {
             startUdp();
         } else {
             startTcp();
         }
-        running = true;
         updateStatus("RUNNING");
         Logs.info(Logs.STUN, "穿透任务[" + name + "] 已启动 (" + protocol + ")");
     }
@@ -81,20 +87,30 @@ final class StunRunner {
         Logs.info(Logs.STUN, "任务[" + name + "] NAT类型: " + (r == null ? "Unknown" : r.natType())
                 + "，映射地址: " + (r == null ? "无" : r.mappedAddress()));
 
-        // 接收线程：区分 STUN 响应与业务数据
+        startUdpReceiver(true);
+        startKeepalive();
+    }
+
+    /**
+     * UDP 接收线程：STUN 响应仅用于刷新映射地址；
+     * relayData=true 时其余数据包按会话转发到内网目标（UDP 模式）。
+     */
+    private void startUdpReceiver(boolean relayData) throws Exception {
         InetAddress stunAddr = InetAddress.getByName(stunHost);
         Thread receiver = new Thread(() -> {
             byte[] buf = new byte[65535];
             while (running && !udpSocket.isClosed()) {
                 try {
-                    DatagramPacket pkt = new DatagramPacket(buf, buf.length);
                     udpSocket.setSoTimeout(2000);
+                    DatagramPacket pkt = new DatagramPacket(buf, buf.length);
                     udpSocket.receive(pkt);
                     if (pkt.getAddress().equals(stunAddr) && pkt.getPort() == stunPort) {
-                        // STUN 响应仅用于确认映射存活，不做解析转发
+                        // 保活响应：刷新外网映射地址（不再与保活线程竞争 receive）
+                        String mapped = StunClient.parseBindingMapped(pkt.getData(), pkt.getLength());
+                        if (mapped != null) updateMapped(mapped, null);
                         continue;
                     }
-                    forwardToTarget(pkt);
+                    if (relayData) forwardToTarget(pkt);
                 } catch (java.net.SocketTimeoutException ignored) {
                     // 超时继续循环
                 } catch (Exception e) {
@@ -104,16 +120,21 @@ final class StunRunner {
         }, "stun-udp-" + id);
         receiver.setDaemon(true);
         receiver.start();
+    }
 
-        // 周期保活：重复发送绑定请求，防止 NAT 映射超时回收
-        keepaliveTask = com.nexhome.core.Tasks.every(keepaliveSec, keepaliveSec, () -> {
+    /** 周期保活：UDP 只发绑定请求（响应由接收线程解析）；TCP 模式额外刷新 TCP 映射 */
+    private void startKeepalive() {
+        boolean tcpMode = tcpServer != null;
+        keepaliveTask = Tasks.every(keepaliveSec, keepaliveSec, () -> {
             try {
-                String mapped = StunClient.bind(udpSocket, stunHost, stunPort, 2000);
-                if (mapped != null) {
-                    updateMapped(mapped, null);
-                }
+                StunClient.sendBindingRequest(udpSocket, stunHost, stunPort);
             } catch (Exception e) {
                 Logs.warn(Logs.STUN, "任务[" + name + "] STUN保活失败: " + e.getMessage());
+            }
+            if (tcpMode) {
+                // 出站连接本身即建立/保活 TCP 映射，并返回最新映射地址供展示
+                String mapped = StunClient.bindOverTcp(stunHost, stunPort, tcpServer.getLocalPort(), 3000);
+                if (mapped != null) updateMapped(mapped, null);
             }
         });
     }
@@ -162,13 +183,30 @@ final class StunRunner {
     }
 
     private void startTcp() throws Exception {
-        // 用同一本地端口先做 UDP STUN 探测，得到外网映射地址供展示
-        try (DatagramSocket probe = bindPort > 0 ? new DatagramSocket(bindPort) : new DatagramSocket()) {
-            StunClient.Result r = StunClient.detectNatType(probe, stunHost, stunPort, 3000);
-            updateMapped(r == null ? null : r.mappedAddress(), r == null ? "Unknown" : r.natType());
-            // TCP 监听与 UDP 探测保持同一本地端口
-            tcpServer = new ServerSocket(probe.getLocalPort());
+        // 入站方向：同一本地端口监听 TCP，外网连接进来后转发到目标内网服务（HTTP 等 TCP 流量透明传输）
+        tcpServer = new ServerSocket();
+        tcpServer.setReuseAddress(true);
+        tcpServer.bind(new InetSocketAddress(bindPort));
+        int localPort = tcpServer.getLocalPort();
+
+        // 同端口维护 UDP STUN 映射：展示外网地址并保活，锥形 NAT 下对端可经该映射打洞回连
+        udpSocket = new DatagramSocket(localPort);
+        StunClient.Result r = StunClient.detectNatType(udpSocket, stunHost, stunPort, 3000);
+        updateMapped(r == null ? null : r.mappedAddress(), r == null ? "Unknown" : r.natType());
+        Logs.info(Logs.STUN, "任务[" + name + "] NAT类型: " + (r == null ? "Unknown" : r.natType())
+                + "，映射地址: " + (r == null ? "无" : r.mappedAddress()));
+        startUdpReceiver(false);
+
+        // STUN-over-TCP 探测：TCP 入站真正对应的是 TCP 映射（可能与 UDP 探测结果不同），优先展示并保活
+        String tcpMapped = StunClient.bindOverTcp(stunHost, stunPort, localPort, 3000);
+        if (tcpMapped != null) {
+            updateMapped(tcpMapped, null);
+            Logs.info(Logs.STUN, "任务[" + name + "] TCP映射地址(STUN/TCP): " + tcpMapped);
+        } else {
+            Logs.warn(Logs.STUN, "任务[" + name + "] STUN服务器不支持TCP探测，仍展示UDP映射；"
+                    + "外网主动访问需全锥形NAT或路由器端口转发，并请确认主机防火墙已放行该端口");
         }
+        startKeepalive();
 
         Thread acceptor = new Thread(() -> {
             while (running && !tcpServer.isClosed()) {
@@ -184,9 +222,49 @@ final class StunRunner {
         }, "stun-accept-" + id);
         acceptor.setDaemon(true);
         acceptor.start();
+
+        // 出站方向：配置了对端公网地址时，周期性从同一本地端口主动打洞（TCP 需双方向建立 NAT 过滤条目）
+        if (!peerAddr.isBlank()) {
+            punchTask = Tasks.every(3, keepaliveSec, () -> punchToPeer(parsePeerAddr(peerAddr)));
+        }
     }
 
-    /** TCP 双向管道：外网连接 <-> 目标内网服务 */
+    /** 解析对端地址 ip:port */
+    private static InetSocketAddress parsePeerAddr(String addr) {
+        int ci = addr.lastIndexOf(':');
+        return new InetSocketAddress(addr.substring(0, ci), Integer.parseInt(addr.substring(ci + 1)));
+    }
+
+    /**
+     * TCP 打洞：从与监听相同的本地端口主动向对端发起连接，在双端 NAT 上建立过滤条目。
+     * 连接建立后并入转发管道，双向承载 TCP/HTTP 数据（无论连接由哪一端发起）。
+     */
+    private void punchToPeer(InetSocketAddress peer) {
+        if (!running) return;
+        Socket punch = new Socket();
+        try {
+            punch.setReuseAddress(true);
+            try {
+                // 与监听同端口绑定：锥形 NAT 下对端可直接回连该映射端口（同时打开也可建立连接）
+                punch.bind(new InetSocketAddress(tcpServer.getLocalPort()));
+            } catch (Exception ignored) {
+                // 同端口绑定受限时退回随机端口，主动连接方向仍可建立数据通道
+            }
+            punch.connect(peer, 3000);
+            Logs.info(Logs.STUN, "任务[" + name + "] TCP打洞成功，与对端 " + peer + " 建立转发通道");
+            Thread pipe = new Thread(() -> pipeToTarget(punch), "stun-punch-" + id);
+            pipe.setDaemon(true);
+            pipe.start();
+        } catch (Exception e) {
+            try {
+                punch.close();
+            } catch (Exception ignored) {
+            }
+            Logs.warn(Logs.STUN, "任务[" + name + "] TCP打洞未成功(" + peer + "): " + e.getMessage());
+        }
+    }
+
+    /** TCP 双向管道：外网连接 <-> 目标内网服务（字节级透明，HTTP 等应用层协议直接可用） */
     private void pipeToTarget(Socket client) {
         try (client; Socket target = new Socket(targetIp, targetPort)) {
             Logs.info(Logs.STUN, "任务[" + name + "] 外网连接: " + client.getRemoteSocketAddress());
@@ -218,6 +296,7 @@ final class StunRunner {
     void stop() {
         running = false;
         if (keepaliveTask != null) keepaliveTask.cancel(false);
+        if (punchTask != null) punchTask.cancel(false);
         if (udpSocket != null) udpSocket.close();
         if (tcpServer != null) {
             try {

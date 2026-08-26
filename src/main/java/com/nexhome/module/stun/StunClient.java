@@ -1,9 +1,11 @@
 package com.nexhome.module.stun;
 
+import java.io.InputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.security.SecureRandom;
 import java.util.Arrays;
 
@@ -19,7 +21,7 @@ import java.util.Arrays;
  *   <li>Restricted / Port Restricted（受限锥形）：需要对方先"打洞"握手，配合保活可用，成功率中等</li>
  *   <li>Symmetric（对称型）：每次出站映射端口不同，纯 STUN 无法穿透，需要中继服务器，成功率极低</li>
  * </ul>
- * 注意：STUN 只负责建立/探测 NAT 映射，不做数据中继。
+ * 注意：STUN 只负责建立/探测 NAT 映射；映射端口上的数据转发由 StunRunner 完成。
  */
 public final class StunClient {
 
@@ -57,6 +59,83 @@ public final class StunClient {
 
         BindingResponse resp = receive(socket, tid, timeoutMs);
         return resp == null ? null : resp.mapped;
+    }
+
+    /**
+     * 只发送一次 Binding 请求，不等待响应（fire-and-forget 保活）。
+     * <p>
+     * 供与接收线程共用同一 socket 的保活场景使用：响应包由接收线程通过
+     * {@link #parseBindingMapped} 解析，避免两个线程在同一个 socket 上竞争 receive。
+     */
+    public static void sendBindingRequest(DatagramSocket socket, String stunHost, int stunPort) throws Exception {
+        byte[] tid = new byte[12];
+        RANDOM.nextBytes(tid);
+        byte[] req = buildRequest(tid, false);
+        socket.send(new DatagramPacket(req, req.length, InetAddress.getByName(stunHost), stunPort));
+    }
+
+    /**
+     * 解析入站报文：若是 STUN Binding 响应则返回映射地址（ip:port），否则返回 null。
+     * 用于接收线程在区分业务数据的同时刷新映射地址。
+     */
+    public static String parseBindingMapped(byte[] data, int len) {
+        if (data == null || len < 20) return null;
+        if (readU16(data, 0) != MSG_BINDING_RESPONSE) return null;
+        return extractMapped(data, len);
+    }
+
+    /** 从绑定响应报文中提取映射地址（支持 MAPPED-ADDRESS 与 XOR-MAPPED-ADDRESS） */
+    private static String extractMapped(byte[] data, int len) {
+        int msgLen = readU16(data, 2);
+        int pos = 20;
+        while (pos + 4 <= 20 + msgLen && pos + 4 <= len) {
+            int attrType = readU16(data, pos);
+            int attrLen = readU16(data, pos + 2);
+            int valStart = pos + 4;
+            if (valStart + attrLen > len) break;
+            if (attrType == ATTR_MAPPED_ADDRESS) {
+                return parseAddress(data, valStart, null);
+            }
+            if (attrType == ATTR_XOR_MAPPED_ADDRESS) {
+                return parseAddress(data, valStart, Arrays.copyOfRange(data, 8, 20));
+            }
+            pos = valStart + ((attrLen + 3) & ~3);
+        }
+        return null;
+    }
+
+    /**
+     * STUN-over-TCP 探测（RFC 5389 §7.1）：从指定本地端口向 STUN 服务器建立 TCP 连接
+     * 并发送绑定请求，返回该 TCP 出口的外网映射地址（ip:port）。
+     * <p>
+     * TCP 入站访问真正对应的是 TCP 映射，与 UDP 探测结果可能不同；
+     * 该出站连接同时起到建立/保活 TCP 映射的作用。
+     * 服务器不支持 STUN/TCP 或本地端口绑定失败时返回 null。
+     */
+    public static String bindOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
+        try (Socket s = new Socket()) {
+            s.setReuseAddress(true);
+            if (localPort > 0) {
+                // 必须与监听同端口：只有这样得到的映射才对应外网可访问的入站端口
+                s.bind(new InetSocketAddress(localPort));
+            }
+            s.connect(new InetSocketAddress(InetAddress.getByName(stunHost), stunPort), timeoutMs);
+            s.setSoTimeout(timeoutMs);
+            byte[] tid = new byte[12];
+            RANDOM.nextBytes(tid);
+            s.getOutputStream().write(buildRequest(tid, false));
+            InputStream in = s.getInputStream();
+            byte[] head = in.readNBytes(20);
+            if (head.length < 20 || readU16(head, 0) != MSG_BINDING_RESPONSE) return null;
+            if (!Arrays.equals(tid, Arrays.copyOfRange(head, 8, 20))) return null;
+            byte[] attrs = in.readNBytes(readU16(head, 2));
+            byte[] full = new byte[head.length + attrs.length];
+            System.arraycopy(head, 0, full, 0, head.length);
+            System.arraycopy(attrs, 0, full, head.length, attrs.length);
+            return extractMapped(full, full.length);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**

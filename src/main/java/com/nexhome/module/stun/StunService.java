@@ -39,29 +39,48 @@ public final class StunService {
             stop(ctx.paramLong("id"));
             ctx.ok(mustGet(ctx.paramLong("id")));
         });
-        // 单独探测一次：不启动任务，仅检测 NAT 类型与映射地址
+        // 单独探测一次：不启动任务，仅检测 NAT 类型与映射地址（TCP 任务另探测 TCP 映射）
         WebServer.route("POST", "/api/stun/tasks/{id}/test", ctx -> {
             Map<String, Object> task = mustGet(ctx.paramLong("id"));
             try (DatagramSocket s = new DatagramSocket()) {
                 StunClient.Result r = StunClient.detectNatType(s, str(task, "stun_host"),
                         intVal(task, "stun_port"), 3000);
+                String tcpMapped = "";
+                if ("TCP".equalsIgnoreCase(str(task, "protocol")) && intVal(task, "bind_port") > 0) {
+                    // 绑定端口固定时才能探测到对入站有效的 TCP 映射
+                    String m = StunClient.bindOverTcp(str(task, "stun_host"),
+                            intVal(task, "stun_port"), intVal(task, "bind_port"), 3000);
+                    if (m != null) tcpMapped = m;
+                }
                 Logs.info(Logs.STUN, "手动探测任务[" + task.get("name") + "] 结果: "
-                        + (r == null ? "无响应" : r.natType() + " / " + r.mappedAddress()));
+                        + (r == null ? "无响应" : r.natType() + " / " + r.mappedAddress())
+                        + (tcpMapped.isEmpty() ? "" : " / TCP映射: " + tcpMapped));
                 ctx.ok(Map.of(
                         "mapped", r == null || r.mappedAddress() == null ? "" : r.mappedAddress(),
-                        "natType", r == null ? "Unknown(STUN服务器无响应)" : r.natType()));
+                        "natType", r == null ? "Unknown(STUN服务器无响应)" : r.natType(),
+                        "tcpMapped", tcpMapped));
             }
         });
     }
 
     /** 启动时自动加载：恢复启用了的穿透任务 */
     public static void init() throws SQLException {
+        ensurePeerAddrColumn();
         for (Map<String, Object> task : Database.query("SELECT * FROM stun_task WHERE enabled=1")) {
             try {
                 start(((Number) task.get("id")).longValue());
             } catch (Exception e) {
                 Logs.error(Logs.STUN, "自动恢复穿透任务 #" + task.get("id") + " 失败: " + e);
             }
+        }
+    }
+
+    /** 旧库升级：补充 peer_addr 列（新库建表脚本已包含） */
+    private static void ensurePeerAddrColumn() throws SQLException {
+        boolean exists = Database.query("PRAGMA table_info(stun_task)").stream()
+                .anyMatch(col -> "peer_addr".equals(col.get("name")));
+        if (!exists) {
+            Database.update("ALTER TABLE stun_task ADD COLUMN peer_addr TEXT");
         }
     }
 
@@ -72,12 +91,12 @@ public final class StunService {
         validate(b);
         long id = Database.insert("""
                 INSERT INTO stun_task(name, protocol, target_ip, target_port, bind_port,
-                    stun_host, stun_port, keepalive_sec, enabled)
-                VALUES(?,?,?,?,?,?,?,?,?)""",
+                    stun_host, stun_port, keepalive_sec, peer_addr, enabled)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "protocol"), JsonUtils.str(b, "target_ip"),
                 JsonUtils.num(b, "target_port", 0), JsonUtils.num(b, "bind_port", 0),
                 JsonUtils.str(b, "stun_host"), JsonUtils.num(b, "stun_port", 19302),
-                JsonUtils.num(b, "keepalive_sec", 25),
+                JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"),
                 JsonUtils.bool(b, "enabled", false) ? 1 : 0);
         Logs.info(Logs.STUN, "新增穿透任务: " + JsonUtils.str(b, "name"));
         // 创建即要求启动的场景：前端传 enabled=1 时自动启动
@@ -94,11 +113,11 @@ public final class StunService {
         validate(b);
         Database.update("""
                 UPDATE stun_task SET name=?, protocol=?, target_ip=?, target_port=?, bind_port=?,
-                    stun_host=?, stun_port=?, keepalive_sec=? WHERE id=?""",
+                    stun_host=?, stun_port=?, keepalive_sec=?, peer_addr=? WHERE id=?""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "protocol"), JsonUtils.str(b, "target_ip"),
                 JsonUtils.num(b, "target_port", 0), JsonUtils.num(b, "bind_port", 0),
                 JsonUtils.str(b, "stun_host"), JsonUtils.num(b, "stun_port", 19302),
-                JsonUtils.num(b, "keepalive_sec", 25), id);
+                JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"), id);
         Logs.info(Logs.STUN, "更新穿透任务 #" + id + ": " + JsonUtils.str(b, "name"));
         // 运行中修改配置 -> 重启任务使配置生效
         if (wasRunning) {
@@ -153,6 +172,19 @@ public final class StunService {
         if (sp < 1 || sp > 65535) throw new IllegalArgumentException("STUN 端口需在 1-65535 之间");
         int bp = JsonUtils.num(b, "bind_port", 0);
         if (bp < 0 || bp > 65535) throw new IllegalArgumentException("本地绑定端口需在 0-65535 之间（0=随机）");
+        String peer = JsonUtils.str(b, "peer_addr").trim();
+        if (!peer.isBlank()) {
+            int ci = peer.lastIndexOf(':');
+            if (ci <= 0 || ci == peer.length() - 1) {
+                throw new IllegalArgumentException("对端公网地址格式需为 ip:端口");
+            }
+            try {
+                int pp = Integer.parseInt(peer.substring(ci + 1));
+                if (pp < 1 || pp > 65535) throw new IllegalArgumentException("对端端口需在 1-65535 之间");
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("对端公网地址端口需为数字");
+            }
+        }
     }
 
     private static Map<String, Object> mustGet(long id) throws SQLException {

@@ -46,8 +46,9 @@ CREATE TABLE IF NOT EXISTS ddns_task (
 );
 
 -- STUN 穿透任务表
--- protocol : TCP / UDP
--- status   : STOPPED / RUNNING / ERROR
+-- protocol  : TCP / UDP
+-- status    : STOPPED / RUNNING / ERROR
+-- peer_addr : TCP 打洞对端公网地址（ip:port，可空）
 CREATE TABLE IF NOT EXISTS stun_task (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS stun_task (
     stun_host     TEXT NOT NULL DEFAULT 'stun.l.google.com',
     stun_port     INTEGER NOT NULL DEFAULT 19302,
     keepalive_sec INTEGER NOT NULL DEFAULT 25,
+    peer_addr     TEXT,
     enabled       INTEGER NOT NULL DEFAULT 0,
     status        TEXT NOT NULL DEFAULT 'STOPPED',
     mapped_addr   TEXT,
