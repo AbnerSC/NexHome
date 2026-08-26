@@ -6,14 +6,20 @@ import com.nexhome.core.AppConfig;
 import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Properties;
 
 /**
  * 系统级 REST 接口：登录鉴权、全局日志分页查询、系统信息。
  */
 public final class SystemRoutes {
+
+    /** 应用版本号：构建期由 Maven 从 pom.xml 注入到 app.properties */
+    private static final String VERSION = readVersion();
 
     private SystemRoutes() {
     }
@@ -64,7 +70,7 @@ public final class SystemRoutes {
             Runtime rt = Runtime.getRuntime();
             Map<String, Object> info = new LinkedHashMap<>();
             info.put("name", "NexHome 联枢");
-            info.put("version", "1.0.0");
+            info.put("version", VERSION);
             info.put("javaVersion", System.getProperty("java.version"));
             info.put("os", System.getProperty("os.name") + " " + System.getProperty("os.arch"));
             info.put("port", AppConfig.port());
@@ -80,6 +86,19 @@ public final class SystemRoutes {
             return s == null ? 0 : Integer.parseInt(s);
         } catch (NumberFormatException e) {
             return 0;
+        }
+    }
+
+    /** 从 classpath 的 app.properties 读取注入的版本号，读取失败时回退为 unknown */
+    private static String readVersion() {
+        try (InputStream in = SystemRoutes.class.getResourceAsStream("/app.properties")) {
+            if (in == null) return "unknown";
+            Properties p = new Properties();
+            p.load(in);
+            String v = p.getProperty("app.version", "unknown").trim();
+            return v.isEmpty() || v.contains("${") ? "unknown" : v;
+        } catch (IOException e) {
+            return "unknown";
         }
     }
 }

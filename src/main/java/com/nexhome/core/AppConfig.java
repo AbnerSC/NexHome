@@ -10,7 +10,7 @@ import java.util.Properties;
 /**
  * 全局应用配置。
  * <p>
- * 配置文件为程序运行目录下的 {@code nexhome.properties}，首次启动自动生成默认文件。
+ * 配置文件为数据目录下的 {@code nexhome.properties}，首次启动自动生成默认文件。
  * 仅包含少量基础项（端口等），业务配置全部持久化在 SQLite 中。
  */
 public final class AppConfig {
@@ -19,8 +19,8 @@ public final class AppConfig {
     public static final Path WORK_DIR = Path.of("").toAbsolutePath();
     /** 数据目录：数据库与证书文件均存放于此 */
     public static final Path DATA_DIR = WORK_DIR.resolve("data");
-    /** 配置文件路径 */
-    public static final Path CONFIG_FILE = WORK_DIR.resolve("nexhome.properties");
+    /** 配置文件路径（位于数据目录下） */
+    public static final Path CONFIG_FILE = DATA_DIR.resolve("nexhome.properties");
 
     private static final Properties props = new Properties();
 

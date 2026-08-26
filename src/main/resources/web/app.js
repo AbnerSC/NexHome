@@ -782,11 +782,11 @@ async function renderSettings() {
       </div>
       <div class="panel">
         <h3 style="font-size:14px;margin-bottom:12px">修改登录密码</h3>
-        <form id="pwdForm" class="form-grid">
-          <div class="field"><label>原密码 <b>*</b></label><input name="old_password" type="password" required></div>
-          <div class="field"><label>新密码 <b>*</b>（至少4位）</label><input name="new_password" type="password" required minlength="4"></div>
-          <div class="field"><label>确认新密码 <b>*</b></label><input name="confirm" type="password" required></div>
-          <div class="field" style="align-self:end"><button class="btn primary">修改密码</button></div>
+        <form id="pwdForm">
+          <div class="field" style="width: 200px"><label>原密码 <b>*</b></label><input name="old_password" type="password" required></div>
+          <div class="field" style="width: 200px"><label>新密码 <b>*</b>（至少12位）</label><input name="new_password" type="password" required minlength="12"></div>
+          <div class="field" style="width: 200px"><label>确认新密码 <b>*</b></label><input name="confirm" type="password" required></div>
+          <div class="field" style="align-self:end; margin-top: 10px"><button class="btn primary">修改密码</button></div>
         </form>
       </div>`;
     $('#pwdForm').addEventListener('submit', async e => {

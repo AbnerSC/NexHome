@@ -28,12 +28,12 @@
         <dependency>
             <groupId>org.xerial</groupId>
             <artifactId>sqlite-jdbc</artifactId>
-            <version>3.50.3.0</version>
+            <version>3.53.2.1</version>
         </dependency>
         <dependency>
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>
-            <version>2.13.1</version>
+            <version>2.14.0</version>
         </dependency>
         <dependency>
             <groupId>org.shredzone.acme4j</groupId>
@@ -44,18 +44,35 @@
         <dependency>
             <groupId>org.bouncycastle</groupId>
             <artifactId>bcpkix-jdk18on</artifactId>
-            <version>1.81</version>
+            <version>1.85</version>
         </dependency>
         <!-- acme4j 使用 slf4j 门面，绑定 JDK 内置日志，避免额外引入 logback/log4j -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-jdk14</artifactId>
-            <version>2.0.17</version>
+            <version>2.0.18</version>
         </dependency>
     </dependencies>
 
     <build>
         <finalName>nexhome</finalName>
+        <resources>
+            <!-- 仅对 app.properties 做过滤，构建期把 pom.xml 版本号注入进去 -->
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+                <includes>
+                    <include>app.properties</include>
+                </includes>
+            </resource>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>false</filtering>
+                <excludes>
+                    <exclude>app.properties</exclude>
+                </excludes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

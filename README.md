@@ -35,7 +35,8 @@ mvn clean package
 ## 三、启动方式
 
 ```bash
-java -jar target/nexhome.jar
+# --enable-native-access=ALL-UNNAMED：sqlite-jdbc 需加载本地库，Java 22+ 不加此参数会输出 restricted method 警告
+java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
 ```
 
 启动后访问：**http://127.0.0.1:8090**（默认端口）
@@ -44,7 +45,7 @@ java -jar target/nexhome.jar
 - **默认登录密码：`admin`**，登录后请立即在「系统设置」中修改
 - 自定义端口：修改运行目录 `nexhome.properties` 中的 `server.port`，重启生效
 
-低内存环境可选：`java -Xmx128m -jar nexhome.jar`
+低内存环境可选：`java -Xmx128m --enable-native-access=ALL-UNNAMED -jar nexhome.jar`
 
 ## 四、功能说明
 
