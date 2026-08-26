@@ -413,11 +413,17 @@ async function renderStun() {
         <td>${t.status === 'RUNNING' ? badge('运行中', 'ok') : t.status === 'ERROR' ? badge('错误', 'err') : badge('已停止', 'gray')}</td>
         <td>${t.nat_type ? `<div class="small">${esc(t.nat_type)}</div>` : '-'}</td>
         <td>${t.mapped_addr ? badge(t.mapped_addr, 'info') : '-'}</td>
+        <td>${t.punched_at ? `<span class="small">${esc(t.punched_at)}</span>` : '-'}</td>
+        <td>${t.check_result
+            ? `<div>${t.check_result.startsWith('OK') ? badge(t.check_result, 'ok') : badge(t.check_result, 'err')}</div>
+               ${t.check_time ? `<div class="small muted">${esc(t.check_time)}</div>` : ''}`
+            : '<span class="muted small">未自测</span>'}</td>
         <td>
           ${t.status === 'RUNNING'
             ? `<button class="btn small danger" onclick="stunCmd(${t.id},'stop')">停止</button>`
             : `<button class="btn small success" onclick="stunCmd(${t.id},'start')">启动</button>`}
           <button class="btn small" onclick="stunCmd(${t.id},'test')">探测</button>
+          ${t.status === 'RUNNING' ? `<button class="btn small" onclick="stunCmd(${t.id},'verify')">自测</button>` : ''}
           <button class="btn small" onclick="stunForm(${t.id})">编辑</button>
           <button class="btn small danger" onclick="stunDelete(${t.id})">删除</button>
         </td>
@@ -431,11 +437,17 @@ async function renderStun() {
         <br><b>注意：任务运行中 ≠ 外网可访问。</b>外网能否主动连入取决于 NAT 过滤行为：
         Full Cone 可直接访问；受限锥形仅允许已打洞的对端访问；<b>对称型（Symmetric）NAT 纯 STUN 无法穿透</b>，
         请改用路由器端口转发。同时请确认主机防火墙已放行监听端口（Windows 需允许 Java 入站连接）。
+        <br><b>可用性自测：</b>穿透成功（取得外网映射地址）后系统自动测试一次：
+        TCP 任务向外网映射地址发起 TCP 连接，握手成功即通道可用；UDP 任务向映射地址发送探测包验证可达；
+        自测失败会自动重新穿透（刷新 STUN 映射 + 重新 UPnP 映射）并复测。穿透启动时同时尝试 <b>UPnP 端口映射</b>（需路由器开启 UPnP），
+        TCP 任务还会从监听端口主动向支持 TCP 的 STUN 服务器出站（配置服务器不支持时自动改用内置兜底服务器），
+        在运营商 CGNAT 上建立真实 TCP 映射并周期保活——多层 NAT 下外网主动连入的关键；若路由器 WAN 口非公网（CGNAT，如 100.64.x.x），
+        展示改用 STUN 出口公网 IP；也可在操作列点「自测」手动复测。
       </div>
       <div class="toolbar"><div class="spacer"></div><button class="btn primary" onclick="stunForm()">＋ 新增穿透任务</button></div>
       <div class="panel"><table>
-        <thead><tr><th>任务</th><th>内网目标</th><th>STUN服务器</th><th>状态</th><th>NAT类型</th><th>外网映射地址</th><th>操作</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="muted">暂无任务</td></tr>'}</tbody>
+        <thead><tr><th>任务</th><th>内网目标</th><th>STUN服务器</th><th>状态</th><th>NAT类型</th><th>外网映射地址</th><th>穿透成功时间</th><th>可用性自测</th><th>操作</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="9" class="muted">暂无任务</td></tr>'}</tbody>
       </table></div>`;
     setRefresh(renderStun, 5000);
 }
@@ -451,6 +463,10 @@ window.stunCmd = async (id, cmd) => {
                 <span class="muted small">（TCP 入站以此为准）</span></p>` : ''}
               <p class="muted small" style="margin-top:10px">对称型 NAT 下每次探测映射端口可能不同，属正常现象；
               任务运行中不代表外网可访问，受限/对称型需端口转发或已打洞对端。</p>`);
+        } else if (cmd === 'verify') {
+            toast('正在自测外网可达性（TCP 连接外网映射地址）...');
+            const r = await api('POST', `/api/stun/tasks/${id}/verify`);
+            toast('自测结果: ' + r.result, r.result.startsWith('OK') ? 'ok' : 'err');
         } else {
             await api('POST', `/api/stun/tasks/${id}/${cmd}`);
             toast(cmd === 'start' ? '已启动' : '已停止');

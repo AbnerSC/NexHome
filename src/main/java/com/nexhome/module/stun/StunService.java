@@ -39,6 +39,12 @@ public final class StunService {
             stop(ctx.paramLong("id"));
             ctx.ok(mustGet(ctx.paramLong("id")));
         });
+        // 可用性自测：验证外网能否经映射地址主动连入（TCP 连接外网IP:穿透端口，UDP 发探测包）
+        WebServer.route("POST", "/api/stun/tasks/{id}/verify", ctx -> {
+            StunRunner runner = RUNNERS.get(ctx.paramLong("id"));
+            if (runner == null) throw new IllegalArgumentException("任务未运行，无法自测");
+            ctx.ok(runner.verifyNow());
+        });
         // 单独探测一次：不启动任务，仅检测 NAT 类型与映射地址（TCP 任务另探测 TCP 映射）
         WebServer.route("POST", "/api/stun/tasks/{id}/test", ctx -> {
             Map<String, Object> task = mustGet(ctx.paramLong("id"));
@@ -47,9 +53,13 @@ public final class StunService {
                         intVal(task, "stun_port"), 3000);
                 String tcpMapped = "";
                 if ("TCP".equalsIgnoreCase(str(task, "protocol")) && intVal(task, "bind_port") > 0) {
-                    // 绑定端口固定时才能探测到对入站有效的 TCP 映射
-                    String m = StunClient.bindOverTcp(str(task, "stun_host"),
-                            intVal(task, "stun_port"), intVal(task, "bind_port"), 3000);
+                    // 绑定端口固定时才能探测到对入站有效的 TCP 映射；配置服务器不支持 TCP 时尝试内置兜底服务器
+                    int bp = intVal(task, "bind_port");
+                    String m = StunClient.bindOverTcp(str(task, "stun_host"), intVal(task, "stun_port"), bp, 3000);
+                    for (int i = 0; m == null && i < StunClient.TCP_STUN_SERVERS.length; i++) {
+                        m = StunClient.bindOverTcp(StunClient.TCP_STUN_SERVERS[i][0],
+                                Integer.parseInt(StunClient.TCP_STUN_SERVERS[i][1]), bp, 3000);
+                    }
                     if (m != null) tcpMapped = m;
                 }
                 Logs.info(Logs.STUN, "手动探测任务[" + task.get("name") + "] 结果: "
@@ -65,7 +75,7 @@ public final class StunService {
 
     /** 启动时自动加载：恢复启用了的穿透任务 */
     public static void init() throws SQLException {
-        ensurePeerAddrColumn();
+        ensureColumns();
         for (Map<String, Object> task : Database.query("SELECT * FROM stun_task WHERE enabled=1")) {
             try {
                 start(((Number) task.get("id")).longValue());
@@ -75,12 +85,19 @@ public final class StunService {
         }
     }
 
-    /** 旧库升级：补充 peer_addr 列（新库建表脚本已包含） */
-    private static void ensurePeerAddrColumn() throws SQLException {
+    /** 旧库升级：补充缺失列（新库建表脚本已包含） */
+    private static void ensureColumns() throws SQLException {
+        ensureColumn("peer_addr", "TEXT");
+        ensureColumn("punched_at", "TEXT");
+        ensureColumn("check_time", "TEXT");
+        ensureColumn("check_result", "TEXT");
+    }
+
+    private static void ensureColumn(String name, String type) throws SQLException {
         boolean exists = Database.query("PRAGMA table_info(stun_task)").stream()
-                .anyMatch(col -> "peer_addr".equals(col.get("name")));
+                .anyMatch(col -> name.equals(col.get("name")));
         if (!exists) {
-            Database.update("ALTER TABLE stun_task ADD COLUMN peer_addr TEXT");
+            Database.update("ALTER TABLE stun_task ADD COLUMN " + name + " " + type);
         }
     }
 

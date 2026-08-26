@@ -24,7 +24,7 @@ public final class NexHomeApp {
     private NexHomeApp() {
     }
 
-    public static void main(String[] args) {
+    static void main(String[] args) {
         System.out.println("""
                 ========================================
                   NexHome 联枢 · 内网节点守护工具

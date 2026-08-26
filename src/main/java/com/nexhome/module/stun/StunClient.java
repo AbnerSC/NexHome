@@ -40,8 +40,23 @@ public final class StunClient {
 
     private static final SecureRandom RANDOM = new SecureRandom();
 
+    /**
+     * 支持 STUN-over-TCP 的公共 STUN 服务器（host:port），供配置的服务器仅支持 UDP 时兜底。
+     * TCP 穿透必须借助支持 TCP 的 STUN 服务器出站，才能在运营商 CGNAT 上建立 TCP 映射。
+     */
+    public static final String[][] TCP_STUN_SERVERS = {
+            {"stun.antisip.com", "3478"},
+            {"stun.stunprotocol.org", "3478"},
+            {"stun.sipgate.net", "3478"},
+            {"stun.ekiga.net", "3478"},
+    };
+
     /** STUN 探测结果：外网映射地址 + NAT 类型 */
     public record Result(String mappedAddress, String natType) {
+    }
+
+    /** STUN-over-TCP 探测结果：外网映射地址 + 本地出站端口（绑定 0 时用于回填实际占用端口） */
+    public record TcpProbe(String mapped, int localPort) {
     }
 
     private StunClient() {
@@ -105,20 +120,26 @@ public final class StunClient {
     }
 
     /**
-     * STUN-over-TCP 探测（RFC 5389 §7.1）：从指定本地端口向 STUN 服务器建立 TCP 连接
-     * 并发送绑定请求，返回该 TCP 出口的外网映射地址（ip:port）。
-     * <p>
-     * TCP 入站访问真正对应的是 TCP 映射，与 UDP 探测结果可能不同；
-     * 该出站连接同时起到建立/保活 TCP 映射的作用。
-     * 服务器不支持 STUN/TCP 或本地端口绑定失败时返回 null。
+     * STUN-over-TCP 探测（兼容旧调用）：仅返回外网映射地址，详见 {@link #probeOverTcp}。
      */
     public static String bindOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
+        TcpProbe p = probeOverTcp(stunHost, stunPort, localPort, timeoutMs);
+        return p == null ? null : p.mapped();
+    }
+
+    /**
+     * STUN-over-TCP 探测（RFC 5389 §7.1）：从指定本地端口向 STUN 服务器建立 TCP 连接
+     * 并发送绑定请求，返回该 TCP 出口的外网映射地址与实际本地端口。
+     * <p>
+     * 出站连接会在沿途全部 NAT（含运营商 CGNAT）上建立真实 TCP 映射，
+     * CGNAT 通常会改写外网端口，入站访问需以返回的映射地址为准。
+     * 服务器不支持 STUN/TCP 或本地端口绑定失败时返回 null。
+     */
+    public static TcpProbe probeOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
         try (Socket s = new Socket()) {
             s.setReuseAddress(true);
-            if (localPort > 0) {
-                // 必须与监听同端口：只有这样得到的映射才对应外网可访问的入站端口
-                s.bind(new InetSocketAddress(localPort));
-            }
+            s.bind(new InetSocketAddress(Math.max(localPort, 0)));
+            int bound = s.getLocalPort();
             s.connect(new InetSocketAddress(InetAddress.getByName(stunHost), stunPort), timeoutMs);
             s.setSoTimeout(timeoutMs);
             byte[] tid = new byte[12];
@@ -132,7 +153,8 @@ public final class StunClient {
             byte[] full = new byte[head.length + attrs.length];
             System.arraycopy(head, 0, full, 0, head.length);
             System.arraycopy(attrs, 0, full, head.length, attrs.length);
-            return extractMapped(full, full.length);
+            String mapped = extractMapped(full, full.length);
+            return mapped == null ? null : new TcpProbe(mapped, bound);
         } catch (Exception e) {
             return null;
         }

@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS ddns_task (
 -- protocol  : TCP / UDP
 -- status    : STOPPED / RUNNING / ERROR
 -- peer_addr : TCP 打洞对端公网地址（ip:port，可空）
+-- punched_at  : 穿透成功时间（本次运行首次取得外网映射地址的时刻）
+-- check_time / check_result : 可用性自测（穿透后测试一次）的时间与结果
 CREATE TABLE IF NOT EXISTS stun_task (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
@@ -64,6 +66,9 @@ CREATE TABLE IF NOT EXISTS stun_task (
     status        TEXT NOT NULL DEFAULT 'STOPPED',
     mapped_addr   TEXT,
     nat_type      TEXT,
+    punched_at    TEXT,
+    check_time    TEXT,
+    check_result  TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
