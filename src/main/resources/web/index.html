@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NexHome 联枢 · 内网节点守护工具</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏠</text></svg>">
+</head>
+<body>
+<!-- 登录页 -->
+<div id="loginView" class="login-wrap hidden">
+    <div class="login-card">
+        <div class="login-logo">🏠</div>
+        <h1>NexHome 联枢</h1>
+        <p class="muted">一站式内网节点守护工具</p>
+        <form id="loginForm">
+            <input type="password" id="loginPwd" placeholder="请输入登录密码" autocomplete="current-password" required>
+            <button type="submit" class="btn primary block">登 录</button>
+        </form>
+        <p class="muted small">首次使用默认密码为 admin</p>
+    </div>
+</div>
+
+<!-- 主界面 -->
+<div id="mainView" class="layout hidden">
+    <aside class="sidebar">
+        <div class="brand"><span class="brand-logo">🏠</span> NexHome 联枢</div>
+        <nav>
+            <a class="nav-item active" data-page="home">🧭 网站导航</a>
+            <a class="nav-item" data-page="ddns">🌐 DDNS 同步</a>
+            <a class="nav-item" data-page="stun">🔓 STUN 穿透</a>
+            <a class="nav-item" data-page="wol">⚡ WOL 唤醒</a>
+            <a class="nav-item" data-page="cert">🔐 SSL 证书</a>
+            <a class="nav-item" data-page="logs">📋 操作日志</a>
+            <a class="nav-item" data-page="settings">⚙️ 系统设置</a>
+        </nav>
+        <div class="sidebar-foot">
+            <span id="sysInfo" class="muted small"></span>
+        </div>
+    </aside>
+    <main class="content">
+        <header class="topbar">
+            <h2 id="pageTitle">网站导航</h2>
+            <div class="topbar-actions">
+                <button class="btn ghost small" id="btnLogout">退出登录</button>
+            </div>
+        </header>
+        <section id="pageBody" class="page-body"></section>
+    </main>
+</div>
+
+<!-- 通用模态框 -->
+<div id="modalMask" class="modal-mask hidden">
+    <div class="modal">
+        <div class="modal-head"><span id="modalTitle"></span><span class="modal-close" id="modalClose">✕</span></div>
+        <div id="modalBody" class="modal-body"></div>
+    </div>
+</div>
+
+<!-- 轻提示 -->
+<div id="toast" class="toast hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
