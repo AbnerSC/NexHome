@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS stun_task (
     created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
--- STUN 服务器维护表（穿透任务新增/编辑时下拉选择）
+-- STUN 服务器维护表（穿透任务新增/编辑时下拉选择，按 sort_order 排序展示）
 -- tcp_support : 是否支持 STUN-over-TCP（TCP 穿透任务需经支持 TCP 的服务器出站，在 CGNAT 上建立真实 TCP 映射）
 CREATE TABLE IF NOT EXISTS stun_server (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS stun_server (
     host        TEXT NOT NULL,
     port        INTEGER NOT NULL DEFAULT 3478,
     tcp_support INTEGER NOT NULL DEFAULT 0,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 

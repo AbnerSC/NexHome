@@ -37,6 +37,9 @@ import java.util.concurrent.ScheduledFuture;
  * 在内的全部 NAT 上建立真实 TCP 映射，以返回的映射地址为权威外网地址（CGNAT 通常改写外网端口）；
  * 之后再在该本地端口监听入站。保活时同样需要出站刷新映射：Windows 下监听中无法绑定同端口出站，
  * 故保活会短暂暂停监听（约 1-2 秒，TCP 客户端 SYN 重传可自然恢复）。
+ * 同理，路由器 WAN 口为公网且 UPnP 映射成功时，UPnP 端口映射即权威入站通道：此时跳过 STUN/TCP
+ * 出站探测与周期刷新（路由器上的临时映射不受控，是展示端口漂移、周期关监听与自测误报的根源），
+ * 只有路由器 WAN 口非公网（上层还有 CGNAT）时才启用出站探测。
  * <p>
  * 局限性：对称型 NAT（Symmetric）下映射端口随机，纯 STUN 无法保证穿透成功，
  * 因此同时配合 UPnP：任务启动时 SSDP 发现路由器并经 SOAP 添加 WAN-&gt;LAN 端口映射
@@ -82,6 +85,12 @@ final class StunRunner {
     private volatile long lastMappedAt;
     /** 周期巡检连续失败次数（巡检周期内自动重穿后复测仍失败的累计） */
     private volatile int watchFails;
+    /** 路由器 WAN 口为公网且 UPnP 映射成功：UPnP 端口映射即权威入站通道，无需 STUN/TCP 出站探测与刷新 */
+    private volatile boolean upnpPublicWan;
+    /** TCP 映射刷新进行中（刷新需短暂关闭监听，自测与巡检应错开该窗口避免误报） */
+    private volatile boolean tcpRefreshing;
+    /** 保活失败已告警过的服务器（失效服务器仅告警一次，避免每个保活周期重复刷屏） */
+    private final Set<String> warnedKeepalive = ConcurrentHashMap.newKeySet();
 
     private volatile boolean running;
     private DatagramSocket udpSocket;
@@ -113,6 +122,8 @@ final class StunRunner {
         punched = false;
         wanTcpReady = false;
         upnpWanAddr = null;
+        upnpPublicWan = false;
+        tcpRefreshing = false;
         repunchCount = 0;
         try {
             if ("UDP".equalsIgnoreCase(protocol)) {
@@ -132,11 +143,31 @@ final class StunRunner {
         startWatcher();
     }
 
+    /**
+     * NAT 类型探测：配置的服务器不可达（域名失效/被墙）时回退到维护列表候选服务器，
+     * 保证 NAT 类型与外网映射地址展示不受单点服务器故障影响。
+     */
+    private StunClient.Result detectNatWithFallback(DatagramSocket socket) {
+        StunClient.Result r = StunClient.detectNatType(socket, stunHost, stunPort, 3000);
+        if (r != null && r.mappedAddress() != null) return r;
+        for (String addr : stunServerCandidates()) {
+            int ci = addr.lastIndexOf(':');
+            try {
+                StunClient.Result f = StunClient.detectNatType(socket, addr.substring(0, ci),
+                        Integer.parseInt(addr.substring(ci + 1)), 3000);
+                if (f != null && f.mappedAddress() != null) return f;
+            } catch (Exception ignored) {
+                // 候选探测异常，继续尝试下一个
+            }
+        }
+        return r;
+    }
+
     private void startUdp() throws Exception {
         udpSocket = bindPort > 0 ? new DatagramSocket(bindPort) : new DatagramSocket();
 
         // 首次 STUN 探测：建立 NAT 映射并识别 NAT 类型
-        StunClient.Result r = StunClient.detectNatType(udpSocket, stunHost, stunPort, 3000);
+        StunClient.Result r = detectNatWithFallback(udpSocket);
         updateMapped(r == null ? null : r.mappedAddress(), r == null ? "Unknown" : r.natType());
         Logs.info(Logs.STUN, "任务[" + name + "] NAT类型: " + (r == null ? "Unknown" : r.natType())
                 + "，映射地址: " + (r == null ? "无" : r.mappedAddress()));
@@ -195,7 +226,8 @@ final class StunRunner {
         keepaliveTask = Tasks.every(keepaliveSec, keepaliveSec, () -> {
             // UDP 绑定保活两模式都需要：UDP 模式维持映射；TCP 模式维持同端口 STUN 映射（展示与锥形回连）
             repunchUdpMapping();
-            if (tcpMode) refreshTcpMapping();
+            // UPnP 公网直通时无需刷新 STUN/TCP 映射（刷新需短暂关监听，会造成入站中断与自测误报）
+            if (tcpMode && !upnpPublicWan) refreshTcpMapping();
         });
     }
 
@@ -211,16 +243,19 @@ final class StunRunner {
             try {
                 StunClient.sendBindingRequest(udpSocket, addr.substring(0, ci), Integer.parseInt(addr.substring(ci + 1)));
             } catch (Exception e) {
-                Logs.warn(Logs.STUN, "任务[" + name + "] STUN保活失败(" + addr + "): " + e.getMessage());
+                // 失效服务器（如域名已注销）每次保活都会解析失败，仅首次告警避免刷屏
+                if (warnedKeepalive.add(addr)) {
+                    Logs.warn(Logs.STUN, "任务[" + name + "] STUN保活失败(" + addr + "): " + e.getMessage());
+                }
             }
         }
     }
 
-    /** STUN 服务器候选地址（host:port）：配置的服务器 + 维护列表中支持 TCP 的兜底服务器 */
+    /** STUN 服务器候选地址（host:port）：配置的服务器 + 维护列表中全部服务器（按维护排序兜底） */
     private Set<String> stunServerCandidates() {
         LinkedHashSet<String> set = new LinkedHashSet<>();
         set.add(stunHost + ":" + stunPort);
-        for (String[] s : StunServerService.tcpServers()) set.add(s[0] + ":" + s[1]);
+        for (String[] s : StunServerService.allServers()) set.add(s[0] + ":" + s[1]);
         return set;
     }
 
@@ -282,16 +317,33 @@ final class StunRunner {
     }
 
     private void startTcp() throws Exception {
+        // 先判断 UPnP 能否提供公网直达通道：路由器 WAN 口为公网时，UPnP 端口映射即权威入站路径，
+        // 此时跳过 STUN/TCP 出站探测——探测在路由器上建立的临时映射不受控，是展示端口漂移、
+        // 周期关监听抖动与自测误报的根源；仅路由器 WAN 非公网（上层还有 CGNAT）时探测才必要
+        boolean skipProbe = false;
+        if (upnpEnabled) {
+            try {
+                if (upnpGateway == null) upnpGateway = UpnpClient.discover(3000);
+                String wanIp = upnpGateway == null ? null : UpnpClient.externalIp(upnpGateway);
+                skipProbe = wanIp != null && isPublicIp(wanIp);
+                if (skipProbe) {
+                    Logs.info(Logs.STUN, "任务[" + name + "] 路由器WAN口 " + wanIp
+                            + " 为公网，以UPnP端口映射为权威入站通道，跳过STUN/TCP出站探测");
+                }
+            } catch (Exception e) {
+                Logs.warn(Logs.STUN, "任务[" + name + "] UPnP网关预检异常: " + e.getMessage());
+            }
+        }
         // 先出站探测，再监听：① 出站连接在沿途全部 NAT（含运营商 CGNAT）上建立真实 TCP 映射，
         // 返回地址即权威外网地址（CGNAT 通常改写外网端口）；② Windows 下监听中无法绑定同端口出站，
         // 探测必须在监听之前完成（后续保活采用「短暂停监听」策略）
-        StunClient.TcpProbe probe = tcpProbe(bindPort);
+        StunClient.TcpProbe probe = skipProbe ? null : tcpProbe(bindPort, 3000);
         int listenPort = bindPort;
         if (probe != null) {
             listenPort = probe.localPort(); // bind_port=0 时以探测实际占用端口作为监听端口
             updateTcpMapped(probe.mapped());
             Logs.info(Logs.STUN, "任务[" + name + "] TCP映射已建立(STUN/TCP服务器 " + tcpStunServer + "): " + probe.mapped());
-        } else {
+        } else if (!skipProbe) {
             Logs.warn(Logs.STUN, "任务[" + name + "] 无可用STUN-over-TCP服务器，无法在运营商CGNAT上建立TCP映射；"
                     + "仍展示UDP映射，外网主动访问需路由器端口转发且上层NAT放行");
         }
@@ -302,7 +354,7 @@ final class StunRunner {
 
         // 同端口维护 UDP STUN 映射：展示外网地址并保活，锥形 NAT 下对端可经该映射打洞回连
         udpSocket = new DatagramSocket(localPort);
-        StunClient.Result r = StunClient.detectNatType(udpSocket, stunHost, stunPort, 3000);
+        StunClient.Result r = detectNatWithFallback(udpSocket);
         updateUdpMapped(r == null ? null : r.mappedAddress(), r == null ? "Unknown" : r.natType());
         Logs.info(Logs.STUN, "任务[" + name + "] NAT类型: " + (r == null ? "Unknown" : r.natType())
                 + "，映射地址: " + (r == null ? "无" : r.mappedAddress()));
@@ -360,28 +412,42 @@ final class StunRunner {
      * TCP 映射保活：从监听端口出站刷新运营商 CGNAT 上的 TCP 映射（防会话超时）并更新展示地址。
      * Windows 下监听中无法绑定同端口出站，需先短暂停止监听：探测完成后重开监听，
      * 窗口内（约 1-2 秒）入站 SYN 被丢弃，由客户端 TCP SYN 重传自然恢复。
+     * <p>
+     * 刷新前先以临时端口快速预检服务器可用性：全部不可用时直接跳过（无需关闭监听），
+     * 避免服务器故障期监听被关闭数十秒导致入站中断、自测误报被拒。
      */
-    private void refreshTcpMapping() {
-        if (!running || tcpServer == null) return;
+    private synchronized void refreshTcpMapping() {
+        if (!running || tcpServer == null || upnpPublicWan) return;
+        if (tcpProbe(0, 1500) == null) { // 临时端口快速预检：服务器全不可用时无需打扰监听
+            Logs.warn(Logs.STUN, "任务[" + name + "] TCP映射保活预检失败(无可用STUN-over-TCP服务器)");
+            return;
+        }
+        tcpRefreshing = true;
         int port = tcpServer.getLocalPort();
+        boolean bounced = false;
         try {
-            tcpServer.close();
-        } catch (Exception ignored) {
-        }
-        try {
-            Thread.sleep(800); // 等待端口与刚关闭连接完全释放（实测刚关闭立即重绑会被 Windows 拒绝）
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
-        try {
-            StunClient.TcpProbe probe = tcpProbe(port);
-            if (probe != null) {
-                updateTcpMapped(probe.mapped());
-            } else {
-                Logs.warn(Logs.STUN, "任务[" + name + "] TCP映射保活失败(无可用STUN-over-TCP服务器)");
+            try {
+                tcpServer.close();
+                bounced = true;
+            } catch (Exception e) {
+                Logs.warn(Logs.STUN, "任务[" + name + "] 关闭TCP监听失败，跳过本次映射刷新: " + e.getMessage());
+            }
+            if (bounced) {
+                try {
+                    Thread.sleep(800); // 等待端口与刚关闭连接完全释放（实测刚关闭立即重绑会被 Windows 拒绝）
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+                StunClient.TcpProbe probe = tcpProbe(port, 3000);
+                if (probe != null) {
+                    updateTcpMapped(probe.mapped());
+                } else {
+                    Logs.warn(Logs.STUN, "任务[" + name + "] TCP映射保活失败(无可用STUN-over-TCP服务器)");
+                }
             }
         } finally {
-            if (running) {
+            tcpRefreshing = false;
+            if (running && bounced) {
                 try {
                     tcpServer = openTcpListener(port);
                     startAcceptor();
@@ -431,7 +497,7 @@ final class StunRunner {
      * STUN-over-TCP 探测：依次尝试上次成功的服务器、配置的服务器与内置支持 TCP 的兜底服务器，
      * 从指定本地端口（0=随机）出站，返回真实 TCP 出口映射，成功服务器记入 {@link #tcpStunServer}。
      */
-    private StunClient.TcpProbe tcpProbe(int localPort) {
+    private StunClient.TcpProbe tcpProbe(int localPort, int timeoutMs) {
         LinkedHashSet<String> candidates = new LinkedHashSet<>();
         if (tcpStunServer != null) candidates.add(tcpStunServer);
         candidates.add(stunHost + ":" + stunPort);
@@ -440,7 +506,7 @@ final class StunRunner {
         for (String addr : candidates) {
             int ci = addr.lastIndexOf(':');
             StunClient.TcpProbe probe = StunClient.probeOverTcp(addr.substring(0, ci),
-                    Integer.parseInt(addr.substring(ci + 1)), localPort, 3000);
+                    Integer.parseInt(addr.substring(ci + 1)), localPort, timeoutMs);
             if (probe != null) {
                 tcpStunServer = addr;
                 return probe;
@@ -604,7 +670,12 @@ final class StunRunner {
     /** 本机局域网 IP：UDP connect 仅选出出口网卡（不真实发包），避免通配绑定 socket 返回 0.0.0.0 */
     private String lanIp() {
         try (DatagramSocket s = new DatagramSocket()) {
-            s.connect(InetAddress.getByName(stunHost), stunPort);
+            try {
+                s.connect(InetAddress.getByName(stunHost), stunPort);
+            } catch (Exception e) {
+                // 配置的 STUN 域名失效时退回公共 DNS 地址选出口网卡（UDP connect 仅本机路由决策，不真实发包）
+                s.connect(InetAddress.getByName("223.5.5.5"), 53);
+            }
             return s.getLocalAddress().getHostAddress();
         } catch (Exception e) {
             return null;
@@ -656,6 +727,13 @@ final class StunRunner {
      * UDP 任务从新 socket 向映射地址发送探测包，接收线程收到即映射可达。
      */
     private Map<String, Object> verifyChannel() throws Exception {
+        // 保活刷新会短暂关闭 TCP 监听（约 1-2 秒），等待其完成再自测，避免恰逢窗口误报被拒
+        if (tcpRefreshing) {
+            long deadline = System.currentTimeMillis() + 6000;
+            while (tcpRefreshing && System.currentTimeMillis() < deadline) {
+                Thread.sleep(200);
+            }
+        }
         Map<String, Object> row = Database.queryOne("SELECT mapped_addr FROM stun_task WHERE id=?", id);
         String mapped = row == null ? null : str(row, "mapped_addr");
         String result;
@@ -690,15 +768,31 @@ final class StunRunner {
     private String verifyTcp(String mapped, String note) {
         long t0 = System.currentTimeMillis();
         String[] parts = mapped.split(":");
-        try (Socket s = new Socket()) {
-            s.connect(new InetSocketAddress(parts[0], Integer.parseInt(parts[1])), 3000);
-            return "OK(TCP连接成功，" + (System.currentTimeMillis() - t0) + "ms" + note + ")";
-        } catch (java.net.ConnectException e) {
-            // RST 拒绝：自测走本机→路由器WAN回环，多为路由器自身拒绝（无NAT回流/拦截入站），不代表真实外网可达性
-            return "FAIL(被拒绝: 自测经路由器WAN回环, 路由器无NAT回流或拦截未请求入站时即使穿透正常也会被拒绝, 请用外部设备验证" + note + ")";
-        } catch (Exception e) {
-            return "FAIL(" + e.getMessage() + note + ")";
+        int port = Integer.parseInt(parts[1]);
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                try (Socket s = new Socket()) {
+                    s.connect(new InetSocketAddress(parts[0], port), 3000);
+                }
+                return "OK(TCP连接成功，" + (System.currentTimeMillis() - t0) + "ms" + note + ")";
+            } catch (java.net.ConnectException e) {
+                // RST 拒绝：自测走本机→路由器WAN回环，多为路由器自身拒绝（无NAT回流/拦截入站），
+                // 也可能撞上保活刷新的短暂关监听窗口，短暂等待后重试再下结论
+                if (attempt < 3) {
+                    try {
+                        Thread.sleep(800);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                return "FAIL(" + e.getMessage() + note + ")";
+            }
         }
+        // 重试后仍被拒：多为路由器回环策略限制（映射通常正常），不记为 FAIL 以免周期性误报干扰判断；
+        // 映射真正失效时通常表现为连接超时（而非被拒），由超时分支触发重新穿透
+        return "UNKNOWN(回环自测被拒: 自测经路由器WAN回环, 路由器无NAT回流或拦截未请求入站时即使穿透正常也会被拒绝, 请用外部设备验证" + note + ")";
     }
 
     /** UDP 任务：从新 socket 向映射地址发送探测包，接收线程在超时前收到即视为映射可达 */
@@ -756,6 +850,8 @@ final class StunRunner {
                 upnpMapped = true;
                 upnpPort = extPort;
                 String wanIp = UpnpClient.externalIp(upnpGateway);
+                // 路由器 WAN 公网：UPnP 映射即权威入站通道，关闭 TCP 方向周期 STUN 出站刷新
+                if (wanIp != null && isPublicIp(wanIp)) upnpPublicWan = true;
                 upnpWanAddr = wanIp == null ? null : wanIp + ":" + extPort;
                 String displayIp = wanIp;
                 if (wanIp != null && !isPublicIp(wanIp)) {
@@ -855,6 +951,7 @@ final class StunRunner {
 
     private void watchChannel() {
         if (!running || !punched) return;
+        if (tcpRefreshing) return; // 保活刷新短暂关闭监听，本周期跳过自测避免误报
         try {
             long silentMs = System.currentTimeMillis() - lastMappedAt;
             if ("UDP".equalsIgnoreCase(protocol) && silentMs > keepaliveSec * 3000L) {

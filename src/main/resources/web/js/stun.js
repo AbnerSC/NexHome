@@ -13,7 +13,8 @@ async function renderStun() {
         <td>${t.mapped_addr ? badge(t.mapped_addr, 'info') : '-'}</td>
         <td>${t.punched_at ? `<span class="small">${esc(t.punched_at)}</span>` : '-'}</td>
         <td>${t.check_result
-            ? `<div>${t.check_result.startsWith('OK') ? badge(t.check_result, 'ok') : badge(t.check_result, 'err')}</div>
+            ? `<div>${badge(t.check_result, t.check_result.startsWith('OK') ? 'ok'
+                : t.check_result.startsWith('FAIL') ? 'err' : 'warn')}</div>
                ${t.check_time ? `<div class="small muted">${esc(t.check_time)}</div>` : ''}`
             : '<span class="muted small">未自测</span>'}</td>
         <td>
@@ -36,9 +37,9 @@ async function renderStun() {
         Full Cone 可直接访问；受限锥形仅允许已打洞的对端访问；<b>对称型（Symmetric）NAT 纯 STUN 无法穿透</b>，
         请改用路由器端口转发。同时请确认主机防火墙已放行监听端口（Windows 需允许 Java 入站连接）。
         <br><b>可用性自测：</b>穿透成功后系统自动测试一次（TCP 连接映射地址 / UDP 发探测包）。
-        <b>自测走本机→路由器 WAN 回环路径：路由器不支持 NAT 回流(hairpin)或拦截未请求入站时（企业路由器常见），即使穿透正常自测也会失败</b>
-        （典型表现 Connection refused），此时请用外部设备（手机流量等）访问映射地址验证真实可达性。
-        自测失败最多自动重新穿透 3 次并复测；连接被拒绝说明映射正常但被路由器拒绝，不会触发重穿。
+        <b>自测走本机→路由器 WAN 回环路径：路由器不支持 NAT 回流(hairpin)或拦截未请求入站时（企业路由器常见），即使穿透正常自测也会被拒绝</b>
+        （典型表现 Connection refused）。此时自测结果记为「无法判断」（黄色），<b>不代表穿透失败</b>，请用外部设备（手机流量等）访问映射地址验证真实可达性；
+        仅连接超时等其他失败会触发自动重新穿透并复测（最多 3 次），被拒绝不触发重穿。
         <br>穿透启动时同时尝试 <b>UPnP 端口映射</b>（需路由器开启 UPnP，路由器不支持时可在任务中关闭），
         TCP 任务还会从监听端口主动向支持 TCP 的 STUN 服务器出站（配置服务器不支持时自动改用「STUN 服务器维护」中标记支持 TCP 的服务器），
         在运营商 CGNAT 上建立真实 TCP 映射并周期保活——多层 NAT 下外网主动连入的关键；若路由器 WAN 口非公网（CGNAT，如 100.64.x.x），
@@ -155,12 +156,15 @@ async function renderStunServers() {
         <td class="small">${esc(s.host)}:${s.port}</td>
         <td>${s.tcp_support === 1 ? badge('支持', 'ok') : badge('不支持', 'gray')}</td>
         <td>
+          <button class="btn small" onclick="stunServerMove(${s.id},'up')">↑</button>
+          <button class="btn small" onclick="stunServerMove(${s.id},'down')">↓</button>
           <button class="btn small" onclick="stunServerForm(${s.id})">编辑</button>
           <button class="btn small danger" onclick="stunServerDelete(${s.id})">删除</button>
         </td>
       </tr>`).join('');
     $('#pageBody').innerHTML = `
-      <div class="tip">维护常用 STUN 服务器列表，穿透任务新增/编辑时从下拉中选择。
+      <div class="tip">维护常用 STUN 服务器列表，穿透任务新增/编辑时从下拉中选择（按列表顺序展示）。
+        可用 <b>↑/↓</b> 调整顺序：排在前面的服务器优先作为穿透探测与保活的兜底候选。
         <b>支持 TCP</b> 表示服务器支持 STUN-over-TCP：TCP 穿透任务需经支持 TCP 的服务器出站，才能在运营商 CGNAT 上建立真实 TCP 映射。</div>
       <div class="toolbar">
         <button class="btn small" onclick="renderStun()">← 返回穿透任务</button>
@@ -234,4 +238,12 @@ window.stunServerDelete = async id => {
     if (!confirm('确定删除该 STUN 服务器？已创建的穿透任务不受影响。')) return;
     try { await api('DELETE', '/api/stun/servers/' + id); toast('已删除'); renderStunServers(); }
     catch (e) { toast(e.message, 'err'); }
+};
+
+/** 上移/下移调整服务器顺序 */
+window.stunServerMove = async (id, dir) => {
+    try {
+        await api('POST', `/api/stun/servers/${id}/move`, { dir });
+        renderStunServers();
+    } catch (e) { toast(e.message, 'err'); }
 };

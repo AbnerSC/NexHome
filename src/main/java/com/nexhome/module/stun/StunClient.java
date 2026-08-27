@@ -43,12 +43,14 @@ public final class StunClient {
     /**
      * 支持 STUN-over-TCP 的公共 STUN 服务器（host:port），供配置的服务器仅支持 UDP 时兜底。
      * TCP 穿透必须借助支持 TCP 的 STUN 服务器出站，才能在运营商 CGNAT 上建立 TCP 映射。
+     * （列表经实测验证可用；STUN-over-TCP 服务会随运营调整，失效时可在「STUN 服务器维护」中自定义）
      */
     public static final String[][] TCP_STUN_SERVERS = {
             {"stun.antisip.com", "3478"},
-            {"stun.stunprotocol.org", "3478"},
-            {"stun.sipgate.net", "3478"},
-            {"stun.ekiga.net", "3478"},
+            {"stun.nextcloud.com", "3478"},
+            {"stun.nextcloud.com", "443"},
+            {"turn.cloudflare.com", "3478"},
+            {"stun.freeswitch.org", "3478"},
     };
 
     /** STUN 探测结果：外网映射地址 + NAT 类型 */
@@ -170,13 +172,19 @@ public final class StunClient {
      *   <li>其余 => Restricted / Port Restricted；服务器不支持检测时给出保守结论</li>
      * </ol>
      */
-    public static Result detectNatType(DatagramSocket socket, String stunHost, int stunPort, int timeoutMs) throws Exception {
+    public static Result detectNatType(DatagramSocket socket, String stunHost, int stunPort, int timeoutMs) {
         byte[] tid1 = new byte[12];
         RANDOM.nextBytes(tid1);
         byte[] req1 = buildRequest(tid1, false);
-        socket.send(new DatagramPacket(req1, req1.length,
-                InetAddress.getByName(stunHost), stunPort));
-        BindingResponse r1 = receive(socket, tid1, timeoutMs);
+        BindingResponse r1;
+        try {
+            socket.send(new DatagramPacket(req1, req1.length,
+                    InetAddress.getByName(stunHost), stunPort));
+            r1 = receive(socket, tid1, timeoutMs);
+        } catch (Exception e) {
+            // 配置的服务器域名失效/不可达：返回未知结果，不阻断任务启动（运行期保活另有维护列表服务器兜底）
+            return new Result(null, "Unknown(STUN服务器无响应)");
+        }
         if (r1 == null) {
             return new Result(null, "Unknown(STUN服务器无响应)");
         }
@@ -195,23 +203,31 @@ public final class StunClient {
         byte[] tid2 = new byte[12];
         RANDOM.nextBytes(tid2);
         byte[] req2 = buildRequest(tid2, true);
-        socket.send(new DatagramPacket(req2, req2.length,
-                InetAddress.getByName(stunHost), stunPort));
-        if (receive(socket, tid2, timeoutMs) != null) {
-            return new Result(r1.mapped, "Full Cone(全锥形，穿透成功率高)");
+        try {
+            socket.send(new DatagramPacket(req2, req2.length,
+                    InetAddress.getByName(stunHost), stunPort));
+            if (receive(socket, tid2, timeoutMs) != null) {
+                return new Result(r1.mapped, "Full Cone(全锥形，穿透成功率高)");
+            }
+        } catch (Exception ignored) {
+            // 后续探测失败不影响已取得的 NAT 映射结论
         }
 
         // Test3：向备用地址再探测，映射端口变化说明是对称型
         if (r1.otherAddress != null) {
-            byte[] tid3 = new byte[12];
-            RANDOM.nextBytes(tid3);
-            byte[] req3 = buildRequest(tid3, false);
-            socket.send(new DatagramPacket(req3, req3.length, r1.otherAddress));
-            BindingResponse r3 = receive(socket, tid3, timeoutMs);
-            if (r3 != null && !r3.mapped.equals(r1.mapped)) {
-                return new Result(r1.mapped, "Symmetric(对称型，纯STUN难以穿透，建议改用端口转发/中继)");
+            try {
+                byte[] tid3 = new byte[12];
+                RANDOM.nextBytes(tid3);
+                byte[] req3 = buildRequest(tid3, false);
+                socket.send(new DatagramPacket(req3, req3.length, r1.otherAddress));
+                BindingResponse r3 = receive(socket, tid3, timeoutMs);
+                if (r3 != null && !r3.mapped.equals(r1.mapped)) {
+                    return new Result(r1.mapped, "Symmetric(对称型，纯STUN难以穿透，建议改用端口转发/中继)");
+                }
+                return new Result(r1.mapped, "Restricted(受限锥形，配合保活与对端打洞可用)");
+            } catch (Exception ignored) {
+                // 备用地址探测失败，按保守结论返回
             }
-            return new Result(r1.mapped, "Restricted(受限锥形，配合保活与对端打洞可用)");
         }
         return new Result(r1.mapped, "Restricted?(服务器不支持RFC3489检测，按受限/对称保守处理)");
     }
