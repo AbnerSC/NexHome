@@ -45,7 +45,6 @@ FROM ${BASE_IMAGE}
 WORKDIR /app
 
 COPY --from=build /build/target/nexhome.jar app.jar
-COPY config.yaml .
 
 # JVM 参数与 pom.xml 中 MANIFEST JVM-Options 保持一致；
 # 低内存调优：Serial GC + 固定小堆（ip2region 已用 VIndexCache 按需读文件，无需大堆）
