@@ -170,7 +170,7 @@ final class StunRunner {
                     if (isStunResponseSource(pkt.getAddress(), pkt.getPort())) {
                         // 保活响应（配置的或兜底 STUN 服务器）：刷新外网映射地址（不再与保活线程竞争 receive）
                         String mapped = StunClient.parseBindingMapped(pkt.getData(), pkt.getLength());
-                        if (mapped != null) updateMapped(mapped, null);
+                        if (mapped != null) updateUdpMapped(mapped, null);
                         continue;
                     }
                     if (relayData) forwardToTarget(pkt);
@@ -303,7 +303,7 @@ final class StunRunner {
         // 同端口维护 UDP STUN 映射：展示外网地址并保活，锥形 NAT 下对端可经该映射打洞回连
         udpSocket = new DatagramSocket(localPort);
         StunClient.Result r = StunClient.detectNatType(udpSocket, stunHost, stunPort, 3000);
-        updateMapped(r == null ? null : r.mappedAddress(), r == null ? "Unknown" : r.natType());
+        updateUdpMapped(r == null ? null : r.mappedAddress(), r == null ? "Unknown" : r.natType());
         Logs.info(Logs.STUN, "任务[" + name + "] NAT类型: " + (r == null ? "Unknown" : r.natType())
                 + "，映射地址: " + (r == null ? "无" : r.mappedAddress()));
         startUdpReceiver(false);
@@ -578,6 +578,29 @@ final class StunRunner {
         updateMapped(mapped, null);
     }
 
+    /**
+     * UDP STUN 映射刷新（启动探测/保活响应）。
+     * TCP 模式下权威外网地址以 STUN/TCP 探测的映射为准（见类注释），而 UDP 映射端口与其可能不同
+     * （CGNAT 通常改写 TCP 外网端口）：若用 UDP 映射覆盖展示地址，穿透端口会在两个值之间来回跳变，
+     * 巡检自测还会打到仅 UDP 可达的端口上误判失效并触发重穿。因此已有 TCP 映射时只刷新保活时间与 NAT 类型。
+     */
+    private void updateUdpMapped(String mapped, String natType) {
+        if (!"UDP".equalsIgnoreCase(protocol) && wanTcpReady) {
+            if (mapped != null && !mapped.isBlank()) {
+                lastMappedAt = System.currentTimeMillis(); // 保活有效：供巡检判断保活是否失效，但不改动权威地址
+            }
+            if (natType != null) {
+                try {
+                    Database.update("UPDATE stun_task SET nat_type=? WHERE id=?", natType, id);
+                } catch (Exception e) {
+                    Logs.error(Logs.STUN, "更新NAT类型失败: " + e.getMessage());
+                }
+            }
+            return;
+        }
+        updateMapped(mapped, natType);
+    }
+
     /** 本机局域网 IP：UDP connect 仅选出出口网卡（不真实发包），避免通配绑定 socket 返回 0.0.0.0 */
     private String lanIp() {
         try (DatagramSocket s = new DatagramSocket()) {
@@ -744,7 +767,9 @@ final class StunRunner {
                 }
                 Logs.info(Logs.STUN, "任务[" + name + "] UPnP端口映射成功: "
                         + (wanIp == null ? "外网IP未知" : wanIp) + ":" + extPort + " -> " + lanIp + ":" + localPort);
-                if (displayIp != null) updateTcpMapped(displayIp + ":" + extPort);
+                // TCP 模式已建立权威 TCP 映射时不用 UPnP 地址覆盖（入站以 STUN/TCP 探测映射为准），
+                // 否则每次启动/重穿都会把已验证可用的穿透端口换成 UPnP 展示地址；仅在无 TCP 映射时以 UPnP 地址兜底展示
+                if (displayIp != null && !wanTcpReady) updateTcpMapped(displayIp + ":" + extPort);
             } else {
                 Logs.warn(Logs.STUN, "任务[" + name + "] UPnP端口映射失败，仅依赖STUN打洞");
             }
