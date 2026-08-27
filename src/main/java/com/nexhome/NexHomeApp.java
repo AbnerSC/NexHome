@@ -60,9 +60,11 @@ public final class NexHomeApp {
 
             Logs.info(Logs.SYS, "NexHome 启动完成，数据目录: " + AppConfig.DATA_DIR);
 
-            // 7. 优雅退出
+            // 7. 优雅退出：先释放路由器 UPnP 映射（租期 0=永久，不主动删除会一直残留），
+            //    且必须先于调度器关停，避免保活/巡检任务与删除竞争重新添加映射
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 Logs.info(Logs.SYS, "正在关闭...");
+                StunService.stopAll();
                 Tasks.shutdown();
                 Database.close();
             }));

@@ -15,6 +15,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 
@@ -41,6 +42,8 @@ import java.util.concurrent.ScheduledFuture;
  * 因此同时配合 UPnP：任务启动时 SSDP 发现路由器并经 SOAP 添加 WAN-&gt;LAN 端口映射
  * （需路由器开启 UPnP），对称/受限 NAT 下外网也能主动连入。
  * 自测失败时自动重新穿透（刷新 STUN 映射 + 重新 UPnP 映射）并复测，直到成功或任务停止。
+ * 穿透成功后启动周期巡检：定时自测通道有效性并监测保活响应，发现映射失效
+ * （自测失败/保活长时间无响应）时自动重新穿透并复测，防止长时间运行后映射静默失效。
  */
 final class StunRunner {
 
@@ -75,12 +78,18 @@ final class StunRunner {
     private volatile String tcpStunServer;
     /** 自测失败后自动重新穿透的已重试次数 */
     private int repunchCount;
+    /** 最近一次收到 STUN 绑定响应（映射刷新）的时间戳，用于判断保活是否失效 */
+    private volatile long lastMappedAt;
+    /** 周期巡检连续失败次数（巡检周期内自动重穿后复测仍失败的累计） */
+    private volatile int watchFails;
 
     private volatile boolean running;
     private DatagramSocket udpSocket;
     private ServerSocket tcpServer;
     private ScheduledFuture<?> keepaliveTask;
     private ScheduledFuture<?> punchTask;
+    /** 穿透成功后的周期有效性巡检任务 */
+    private ScheduledFuture<?> checkTask;
     /** UDP 会话表：对端地址 -> 与目标服务通信的 socket */
     private final Map<String, DatagramSocket> sessions = new ConcurrentHashMap<>();
 
@@ -98,22 +107,29 @@ final class StunRunner {
         this.upnpEnabled = intVal(task, "upnp_enabled") != 0;
     }
 
-    /** 启动穿透任务 */
+    /** 启动穿透任务（启动中途异常时释放已建立的 UPnP 映射，避免路由器残留） */
     void start() throws Exception {
         running = true; // 先置位：接收线程启动后立即依赖该标志
         punched = false;
         wanTcpReady = false;
         upnpWanAddr = null;
         repunchCount = 0;
-        if ("UDP".equalsIgnoreCase(protocol)) {
-            startUdp();
-        } else {
-            startTcp();
+        try {
+            if ("UDP".equalsIgnoreCase(protocol)) {
+                startUdp();
+            } else {
+                startTcp();
+            }
+        } catch (Exception | Error e) {
+            stop(); // 释放 socket 与已建立的 UPnP 映射，防止启动失败残留路由器映射
+            throw e;
         }
         updateStatus("RUNNING");
         Logs.info(Logs.STUN, "穿透任务[" + name + "] 已启动 (" + protocol + ")");
         // 穿透成功后测试一次，确保通道可用（TCP 连接外网IP:穿透端口，UDP 发探测包）；失败则重新穿透并复测
         Tasks.delay(2, () -> verifyLoop());
+        // 周期巡检：持续监测通道有效性，失效自动重新穿透，防止长时间运行后映射静默失效
+        startWatcher();
     }
 
     private void startUdp() throws Exception {
@@ -138,7 +154,6 @@ final class StunRunner {
      * relayData=true 时其余数据包按会话转发到内网目标（UDP 模式）。
      */
     private void startUdpReceiver(boolean relayData) throws Exception {
-        InetAddress stunAddr = InetAddress.getByName(stunHost);
         Thread receiver = new Thread(() -> {
             byte[] buf = new byte[65535];
             while (running && !udpSocket.isClosed()) {
@@ -152,8 +167,8 @@ final class StunRunner {
                         udpProbeOk = true;
                         continue;
                     }
-                    if (pkt.getAddress().equals(stunAddr) && pkt.getPort() == stunPort) {
-                        // 保活响应：刷新外网映射地址（不再与保活线程竞争 receive）
+                    if (isStunResponseSource(pkt.getAddress(), pkt.getPort())) {
+                        // 保活响应（配置的或兜底 STUN 服务器）：刷新外网映射地址（不再与保活线程竞争 receive）
                         String mapped = StunClient.parseBindingMapped(pkt.getData(), pkt.getLength());
                         if (mapped != null) updateMapped(mapped, null);
                         continue;
@@ -170,17 +185,57 @@ final class StunRunner {
         receiver.start();
     }
 
-    /** 周期保活：UDP 只发绑定请求（响应由接收线程解析）；TCP 模式额外刷新 TCP 映射 */
+    /**
+     * 周期保活：周期性刷新 NAT 映射防止超时回收。
+     * UDP 模式向配置的与兜底的 STUN 服务器发绑定请求（响应由接收线程解析刷新映射地址）；
+     * TCP 模式额外出站刷新运营商 CGNAT 上的 TCP 映射。
+     */
     private void startKeepalive() {
-        boolean tcpMode = tcpServer != null;
+        boolean tcpMode = !"UDP".equalsIgnoreCase(protocol);
         keepaliveTask = Tasks.every(keepaliveSec, keepaliveSec, () -> {
-            try {
-                StunClient.sendBindingRequest(udpSocket, stunHost, stunPort);
-            } catch (Exception e) {
-                Logs.warn(Logs.STUN, "任务[" + name + "] STUN保活失败: " + e.getMessage());
-            }
+            // UDP 绑定保活两模式都需要：UDP 模式维持映射；TCP 模式维持同端口 STUN 映射（展示与锥形回连）
+            repunchUdpMapping();
             if (tcpMode) refreshTcpMapping();
         });
+    }
+
+    /**
+     * 刷新 UDP STUN 映射（保活/重新穿透共用）：向配置的服务器与维护列表中兜底服务器
+     * 发送绑定请求（fire-and-forget），响应由接收线程解析后刷新映射地址。
+     * 配置服务器无响应时兜底服务器可恢复映射，避免单点失效导致穿透静默失效。
+     */
+    private void repunchUdpMapping() {
+        if (udpSocket == null || udpSocket.isClosed()) return;
+        for (String addr : stunServerCandidates()) {
+            int ci = addr.lastIndexOf(':');
+            try {
+                StunClient.sendBindingRequest(udpSocket, addr.substring(0, ci), Integer.parseInt(addr.substring(ci + 1)));
+            } catch (Exception e) {
+                Logs.warn(Logs.STUN, "任务[" + name + "] STUN保活失败(" + addr + "): " + e.getMessage());
+            }
+        }
+    }
+
+    /** STUN 服务器候选地址（host:port）：配置的服务器 + 维护列表中支持 TCP 的兜底服务器 */
+    private Set<String> stunServerCandidates() {
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        set.add(stunHost + ":" + stunPort);
+        for (String[] s : StunServerService.tcpServers()) set.add(s[0] + ":" + s[1]);
+        return set;
+    }
+
+    /** 入站包是否来自任一候选 STUN 服务器（保活响应判定） */
+    private boolean isStunResponseSource(InetAddress addr, int port) {
+        for (String candidate : stunServerCandidates()) {
+            int ci = candidate.lastIndexOf(':');
+            if (port != Integer.parseInt(candidate.substring(ci + 1))) continue;
+            try {
+                if (addr.equals(InetAddress.getByName(candidate.substring(0, ci)))) return true;
+            } catch (Exception ignored) {
+                // 域名解析失败：视为不匹配，继续比较其余候选
+            }
+        }
+        return false;
     }
 
     /** UDP 业务数据转发：对端 -> 目标服务；目标响应经会话 socket 回流 */
@@ -428,13 +483,10 @@ final class StunRunner {
         punched = false;
         udpProbe = null;
         upnpWanAddr = null;
-        if (upnpMapped && upnpGateway != null) {
-            UpnpClient.deletePortMapping(upnpGateway, protocol, upnpPort);
-            upnpMapped = false;
-            Logs.info(Logs.STUN, "任务[" + name + "] UPnP端口映射已移除");
-        }
+        releaseUpnpMapping();
         if (keepaliveTask != null) keepaliveTask.cancel(false);
         if (punchTask != null) punchTask.cancel(false);
+        if (checkTask != null) checkTask.cancel(false);
         if (udpSocket != null) udpSocket.close();
         if (tcpServer != null) {
             try {
@@ -455,6 +507,38 @@ final class StunRunner {
         Logs.info(Logs.STUN, "穿透任务[" + name + "] 已停止");
     }
 
+    /**
+     * 关停静默停止：释放资源但不更新任务启停状态（进程即将退出，无需再写库）。
+     */
+    void stopSilently() {
+        running = false;
+        punched = false;
+        udpProbe = null;
+        upnpWanAddr = null;
+        releaseUpnpMapping();
+        if (keepaliveTask != null) keepaliveTask.cancel(false);
+        if (punchTask != null) punchTask.cancel(false);
+        if (checkTask != null) checkTask.cancel(false);
+        if (udpSocket != null) udpSocket.close();
+        if (tcpServer != null) {
+            try {
+                tcpServer.close();
+            } catch (Exception ignored) {
+            }
+        }
+        sessions.values().forEach(DatagramSocket::close);
+        sessions.clear();
+    }
+
+    /** 释放路由器上的 UPnP 端口映射（幂等，重复调用安全） */
+    private synchronized void releaseUpnpMapping() {
+        if (upnpMapped && upnpGateway != null) {
+            UpnpClient.deletePortMapping(upnpGateway, protocol, upnpPort);
+            upnpMapped = false;
+            Logs.info(Logs.STUN, "任务[" + name + "] UPnP端口映射已移除");
+        }
+    }
+
     boolean isRunning() {
         return running;
     }
@@ -470,10 +554,13 @@ final class StunRunner {
     /** natType 为 null 时只更新映射地址 */
     private void updateMapped(String mapped, String natType) {
         try {
-            if (mapped != null && !mapped.isBlank() && !punched) {
-                punched = true;
-                Database.update("UPDATE stun_task SET punched_at=? WHERE id=?", Database.now(), id);
-                Logs.info(Logs.STUN, "任务[" + name + "] 穿透成功，外网映射地址: " + mapped);
+            if (mapped != null && !mapped.isBlank()) {
+                lastMappedAt = System.currentTimeMillis(); // 保活/穿透有效：刷新映射时间，供巡检判断保活是否失效
+                if (!punched) {
+                    punched = true;
+                    Database.update("UPDATE stun_task SET punched_at=? WHERE id=?", Database.now(), id);
+                    Logs.info(Logs.STUN, "任务[" + name + "] 穿透成功，外网映射地址: " + mapped);
+                }
             }
             if (natType == null) {
                 Database.update("UPDATE stun_task SET mapped_addr=? WHERE id=?", mapped, id);
@@ -671,8 +758,7 @@ final class StunRunner {
         try {
             int localPort = udpSocket.getLocalPort();
             if ("UDP".equalsIgnoreCase(protocol)) {
-                String mapped = StunClient.bind(udpSocket, stunHost, stunPort, 3000);
-                if (mapped != null) updateMapped(mapped, null);
+                repunchUdpMapping();
             } else {
                 refreshTcpMapping();
             }
@@ -719,6 +805,78 @@ final class StunRunner {
             repunch();
             Tasks.delay(2, this::verifyLoop);
         });
+    }
+
+    // ---------- 周期有效性巡检 ----------
+
+    /** 巡检周期：至少 60 秒，且不低于保活周期的 2 倍（保证两次保活后仍无响应才判定失效） */
+    private long checkIntervalSec() {
+        return Math.max(60, keepaliveSec * 2L);
+    }
+
+    /**
+     * 穿透成功后的周期有效性巡检：NAT 映射可能因超时、网络切换或运营商策略静默失效且无任何提示，
+     * 巡检持续监测并在失效时自动重新穿透复测，防止长时间运行后穿透失效不可用。
+     * <ul>
+     *   <li>保活无响应：连续超过 3 个保活周期未收到 STUN 绑定响应，先刷新映射再复测</li>
+     *   <li>TCP 映射缺失：建立失败时周期内重试，直到成功</li>
+     *   <li>自测失败：自动重新穿透并延迟复测；被拒绝（路由器回环策略）不重穿，属环境限制</li>
+     * </ul>
+     */
+    private void startWatcher() {
+        long sec = checkIntervalSec();
+        checkTask = Tasks.every(sec, sec, this::watchChannel);
+    }
+
+    private void watchChannel() {
+        if (!running || !punched) return;
+        try {
+            long silentMs = System.currentTimeMillis() - lastMappedAt;
+            if ("UDP".equalsIgnoreCase(protocol) && silentMs > keepaliveSec * 3000L) {
+                // 保活连续无响应：映射可能已静默失效（网络切换/STUN 服务器故障），先刷新映射再复测
+                Logs.warn(Logs.STUN, "任务[" + name + "] STUN保活 " + (silentMs / 1000)
+                        + "s 无响应，映射可能已失效，重新穿透并复测");
+                repunchUdpMapping();
+            }
+            if (!"UDP".equalsIgnoreCase(protocol) && !wanTcpReady) {
+                // TCP 映射尚未建立（启动时无可用 STUN-over-TCP 服务器），周期内重试直到成功
+                Logs.info(Logs.STUN, "任务[" + name + "] TCP映射未建立，巡检重试出站探测");
+                refreshTcpMapping();
+                return;
+            }
+            String result = str(verifyChannel(), "result");
+            if (result.startsWith("OK")) {
+                if (watchFails > 0) Logs.info(Logs.STUN, "任务[" + name + "] 巡检复测通过，穿透通道已恢复");
+                watchFails = 0;
+                return;
+            }
+            if (result.contains("refused") || result.contains("被拒绝")) {
+                // 被拒绝多为路由器回环策略限制（详见自测说明），映射本身通常正常，重新穿透无意义；保活照常维持
+                watchFails = 0;
+                return;
+            }
+            watchFails++;
+            Logs.warn(Logs.STUN, "任务[" + name + "] 巡检自测未通过(" + result + ")，自动重新穿透并复测(连续第 "
+                    + watchFails + " 次)");
+            repunch();
+            Tasks.delay(3, () -> {
+                if (!running) return;
+                try {
+                    String recheck = str(verifyChannel(), "result");
+                    if (recheck.startsWith("OK")) {
+                        Logs.info(Logs.STUN, "任务[" + name + "] 重新穿透后复测通过，通道已恢复");
+                        watchFails = 0;
+                    } else {
+                        Logs.warn(Logs.STUN, "任务[" + name + "] 重新穿透后复测仍未通过(" + recheck
+                                + ")，" + checkIntervalSec() + "s 后巡检继续尝试");
+                    }
+                } catch (Exception e) {
+                    Logs.warn(Logs.STUN, "任务[" + name + "] 巡检复测异常: " + e.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            Logs.warn(Logs.STUN, "任务[" + name + "] 周期巡检异常: " + e.getMessage());
+        }
     }
 
     private static String str(Map<String, Object> m, String k) {

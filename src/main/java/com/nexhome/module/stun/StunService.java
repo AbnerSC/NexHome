@@ -181,6 +181,18 @@ public final class StunService {
         Database.update("UPDATE stun_task SET enabled=0, status='STOPPED' WHERE id=?", id);
     }
 
+    /** 关停时停止全部任务并释放路由器 UPnP 映射（防止映射条目残留浪费路由器资源） */
+    public static void stopAll() {
+        RUNNERS.values().forEach(runner -> {
+            try {
+                runner.stopSilently();
+            } catch (Exception e) {
+                Logs.warn(Logs.STUN, "关停停止穿透任务异常: " + e.getMessage());
+            }
+        });
+        RUNNERS.clear();
+    }
+
     /** 表单校验 */
     private static void validate(JsonObject b) {
         if (JsonUtils.str(b, "name").isBlank()) throw new IllegalArgumentException("任务名称不能为空");

@@ -30,6 +30,7 @@ public final class StunServerService {
         WebServer.route("GET", "/api/stun/servers", ctx -> ctx.ok(Database.query(
                 "SELECT * FROM stun_server ORDER BY id")));
         WebServer.route("POST", "/api/stun/servers", StunServerService::create);
+        WebServer.route("POST", "/api/stun/servers/probe-tcp", StunServerService::probeTcp);
         WebServer.route("PUT", "/api/stun/servers/{id}", StunServerService::update);
         WebServer.route("DELETE", "/api/stun/servers/{id}", StunServerService::delete);
     }
@@ -91,6 +92,19 @@ public final class StunServerService {
         Database.update("DELETE FROM stun_server WHERE id=?", id);
         Logs.info(Logs.STUN, "删除STUN服务器 #" + id);
         ctx.ok("已删除");
+    }
+
+    /** 手动探测服务器是否支持 STUN-over-TCP（新增/编辑表单「探测」按钮） */
+    private static void probeTcp(Ctx ctx) throws Exception {
+        JsonObject b = ctx.body();
+        String host = JsonUtils.str(b, "host").trim();
+        int port = JsonUtils.num(b, "port", 3478);
+        if (host.isBlank()) throw new IllegalArgumentException("服务器地址不能为空");
+        if (port < 1 || port > 65535) throw new IllegalArgumentException("端口需在 1-65535 之间");
+        StunClient.TcpProbe p = StunClient.probeOverTcp(host, port, 0, 3000);
+        Logs.info(Logs.STUN, "探测 STUN-over-TCP " + host + ":" + port + " -> "
+                + (p == null ? "不支持/无响应" : "支持，映射地址 " + p.mapped()));
+        ctx.ok(Map.of("supported", p != null, "mapped", p == null ? "" : p.mapped()));
     }
 
     /** 表单校验 */
