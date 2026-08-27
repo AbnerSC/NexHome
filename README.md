@@ -1,5 +1,8 @@
 # NexHome｜联枢
 
+## GitHub
+https://github.com/AbnerSC/NexHome.git
+
 > 一站式内网节点守护工具，面向家庭 / 小型机房服务器，把内网能力安全对外打通。
 
 NexHome 是一款单进程、前后端一体化的轻量 Java 服务，内置 Web 服务器与 Web 管理界面，
