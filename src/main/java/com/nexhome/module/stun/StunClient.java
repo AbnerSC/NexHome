@@ -1,5 +1,6 @@
 package com.nexhome.module.stun;
 
+import java.io.BufferedInputStream;
 import java.io.InputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -10,7 +11,7 @@ import java.security.SecureRandom;
 import java.util.Arrays;
 
 /**
- * STUN 协议客户端（RFC 5389 Binding 请求/响应 + RFC 3489 风格 NAT 类型探测）。
+ * STUN 协议客户端（RFC 5389/8489 Binding 请求/响应 + RFC 3489/RFC 5780 风格 NAT 类型探测）。
  * <p>
  * 纯 JDK Socket 实现，不依赖第三方库。
  * <p>
@@ -72,9 +73,8 @@ public final class StunClient {
         byte[] tid = new byte[12];
         RANDOM.nextBytes(tid);
         byte[] req = buildRequest(tid, false);
-        socket.send(new DatagramPacket(req, req.length, InetAddress.getByName(stunHost), stunPort));
-
-        BindingResponse resp = receive(socket, tid, timeoutMs);
+        BindingResponse resp = exchange(socket,
+                new InetSocketAddress(InetAddress.getByName(stunHost), stunPort), req, tid, timeoutMs, 2);
         return resp == null ? null : resp.mapped;
     }
 
@@ -111,10 +111,10 @@ public final class StunClient {
             int valStart = pos + 4;
             if (valStart + attrLen > len) break;
             if (attrType == ATTR_MAPPED_ADDRESS) {
-                return parseAddress(data, valStart, null);
+                return parseAddress(data, valStart, false);
             }
             if (attrType == ATTR_XOR_MAPPED_ADDRESS) {
-                return parseAddress(data, valStart, Arrays.copyOfRange(data, 8, 20));
+                return parseAddress(data, valStart, true);
             }
             pos = valStart + ((attrLen + 3) & ~3);
         }
@@ -147,14 +147,34 @@ public final class StunClient {
             byte[] tid = new byte[12];
             RANDOM.nextBytes(tid);
             s.getOutputStream().write(buildRequest(tid, false));
-            InputStream in = s.getInputStream();
-            byte[] head = in.readNBytes(20);
-            if (head.length < 20 || readU16(head, 0) != MSG_BINDING_RESPONSE) return null;
+            // RFC 5389 §7.2.2：TCP 传输时每条 STUN 消息前有 2 字节长度帧头（值为消息体字节数，不含帧头本身）；
+            // 读数时两者兼容：优先按标准帧头解析，个别不发送帧头的实现按裸消息解析
+            BufferedInputStream in = new BufferedInputStream(s.getInputStream());
+            in.mark(22);
+            byte[] b = in.readNBytes(22);
+            if (b.length < 22) return null;
+            byte[] head;
+            int msgLen;
+            if (readU16(b, 2) == MSG_BINDING_RESPONSE && readU32(b, 6) == MAGIC_COOKIE) {
+                int frame = readU16(b, 0);
+                if (frame < 20 || frame > 65535 || (frame - 20) % 4 != 0 || readU16(b, 4) != frame - 20) return null;
+                head = Arrays.copyOfRange(b, 2, 22);
+                msgLen = readU16(head, 2);
+            } else if (readU16(b, 0) == MSG_BINDING_RESPONSE && readU32(b, 4) == MAGIC_COOKIE) {
+                in.reset();
+                head = in.readNBytes(20);
+                if (head.length < 20) return null;
+                msgLen = readU16(head, 2);
+            } else {
+                return null;
+            }
+            if (msgLen % 4 != 0) return null; // STUN 消息长度恒为 4 字节的倍数
             if (!Arrays.equals(tid, Arrays.copyOfRange(head, 8, 20))) return null;
-            byte[] attrs = in.readNBytes(readU16(head, 2));
-            byte[] full = new byte[head.length + attrs.length];
-            System.arraycopy(head, 0, full, 0, head.length);
-            System.arraycopy(attrs, 0, full, head.length, attrs.length);
+            byte[] attrs = in.readNBytes(msgLen);
+            if (attrs.length < msgLen) return null;
+            byte[] full = new byte[20 + attrs.length];
+            System.arraycopy(head, 0, full, 0, 20);
+            System.arraycopy(attrs, 0, full, 20, attrs.length);
             String mapped = extractMapped(full, full.length);
             return mapped == null ? null : new TcpProbe(mapped, bound);
         } catch (Exception e) {
@@ -163,26 +183,32 @@ public final class StunClient {
     }
 
     /**
-     * NAT 类型探测（RFC 3489 简化流程）。
+     * NAT 类型探测（RFC 3489 / RFC 5780 简化流程）。
      * <ol>
-     *   <li>Test1：普通绑定，取得映射地址</li>
+     *   <li>Test1：普通绑定，取得映射地址（RTO 重发）</li>
      *   <li>本地地址 == 映射地址 => Open Internet / 1:1 NAT</li>
-     *   <li>Test2：带 CHANGE-REQUEST 标志，有响应 => Full Cone</li>
+     *   <li>Test2：带 CHANGE-REQUEST 标志，响应来自服务器更换后的地址 => Full Cone；
+     *       同源回复说明服务器忽略该属性，继续测试</li>
      *   <li>Test3：向服务器的备用地址(OTHER-ADDRESS)再探测，映射不同 => Symmetric</li>
      *   <li>其余 => Restricted / Port Restricted；服务器不支持检测时给出保守结论</li>
      * </ol>
      */
     public static Result detectNatType(DatagramSocket socket, String stunHost, int stunPort, int timeoutMs) {
+        InetSocketAddress server;
+        try {
+            server = new InetSocketAddress(InetAddress.getByName(stunHost), stunPort);
+        } catch (Exception e) {
+            // 配置的服务器域名失效/不可达：返回未知结果，不阻断任务启动（运行期保活另有维护列表服务器兜底）
+            return new Result(null, "Unknown(STUN服务器无响应)");
+        }
+        // Test1：普通绑定，取得映射地址（RTO 重发，UDP 单次丢包不至于误判服务器无响应）
         byte[] tid1 = new byte[12];
         RANDOM.nextBytes(tid1);
         byte[] req1 = buildRequest(tid1, false);
         BindingResponse r1;
         try {
-            socket.send(new DatagramPacket(req1, req1.length,
-                    InetAddress.getByName(stunHost), stunPort));
-            r1 = receive(socket, tid1, timeoutMs);
+            r1 = exchange(socket, server, req1, tid1, timeoutMs, 2);
         } catch (Exception e) {
-            // 配置的服务器域名失效/不可达：返回未知结果，不阻断任务启动（运行期保活另有维护列表服务器兜底）
             return new Result(null, "Unknown(STUN服务器无响应)");
         }
         if (r1 == null) {
@@ -199,28 +225,28 @@ public final class StunClient {
             return new Result(r1.mapped, "端口保持型NAT(映射端口=本地端口)");
         }
 
-        // Test2：请求服务器更换 IP+端口 回复（标志位 0x06），能收到说明入站无过滤
+        // Test2：请求服务器更换 IP+端口 回复（CHANGE-REQUEST 标志位 0x06）。
+        // 只有响应确实来自更换后的地址才是 Full Cone；多数现代服务器不支持该属性会原址回复，
+        // 同源响应不能作为入站无过滤的证据（否则会被误判为 Full Cone），继续后续测试。
         byte[] tid2 = new byte[12];
         RANDOM.nextBytes(tid2);
         byte[] req2 = buildRequest(tid2, true);
         try {
-            socket.send(new DatagramPacket(req2, req2.length,
-                    InetAddress.getByName(stunHost), stunPort));
-            if (receive(socket, tid2, timeoutMs) != null) {
+            BindingResponse r2 = exchange(socket, server, req2, tid2, timeoutMs, 1);
+            if (r2 != null && !server.equals(r2.src)) {
                 return new Result(r1.mapped, "Full Cone(全锥形)");
             }
         } catch (Exception ignored) {
             // 后续探测失败不影响已取得的 NAT 映射结论
         }
 
-        // Test3：向备用地址再探测，映射端口变化说明是对称型
+        // Test3：向备用地址（OTHER-ADDRESS / CHANGED-ADDRESS，RFC 5780）再探测，映射端口变化说明是对称型
         if (r1.otherAddress != null) {
             try {
                 byte[] tid3 = new byte[12];
                 RANDOM.nextBytes(tid3);
                 byte[] req3 = buildRequest(tid3, false);
-                socket.send(new DatagramPacket(req3, req3.length, r1.otherAddress));
-                BindingResponse r3 = receive(socket, tid3, timeoutMs);
+                BindingResponse r3 = exchange(socket, r1.otherAddress, req3, tid3, timeoutMs, 1);
                 if (r3 != null && !r3.mapped.equals(r1.mapped)) {
                     return new Result(r1.mapped, "Symmetric(对称型)");
                 }
@@ -250,16 +276,35 @@ public final class StunClient {
         return buf;
     }
 
-    /** 绑定响应解析结果 */
-    private record BindingResponse(String mapped, InetSocketAddress otherAddress) {
+    /** 绑定响应解析结果（src 为响应包源地址，供 CHANGE-REQUEST 换址回复判定） */
+    private record BindingResponse(String mapped, InetSocketAddress otherAddress, InetSocketAddress src) {
     }
 
-    /** 接收并解析绑定响应（忽略事务 ID 不匹配的包），超时返回 null */
-    private static BindingResponse receive(DatagramSocket socket, byte[] tid, int timeoutMs) throws Exception {
-        socket.setSoTimeout(timeoutMs);
+    /**
+     * 请求-响应交换：按 RFC 5389 §7.2.1 的 RTO 机制重发（起始 500ms，指数退避封顶 2s），
+     * 总时长不超过 timeoutMs；全部超时返回 null。
+     */
+    private static BindingResponse exchange(DatagramSocket socket, InetSocketAddress target,
+                                            byte[] req, byte[] tid, int timeoutMs, int maxRetries) throws Exception {
         long deadline = System.currentTimeMillis() + timeoutMs;
+        int wait = 500;
+        for (int attempt = 0; ; attempt++) {
+            socket.send(new DatagramPacket(req, req.length, target));
+            long remain = deadline - System.currentTimeMillis();
+            if (remain <= 0) break;
+            BindingResponse r = receiveOnce(socket, tid, (int) Math.min(wait, remain));
+            if (r != null) return r;
+            if (attempt >= maxRetries || System.currentTimeMillis() >= deadline) break;
+            wait = Math.min(wait * 2, 2000);
+        }
+        return null;
+    }
+
+    /** 接收并解析一次绑定响应（忽略类型/事务 ID 不匹配的包），超时返回 null */
+    private static BindingResponse receiveOnce(DatagramSocket socket, byte[] tid, int waitMs) throws Exception {
+        socket.setSoTimeout(waitMs);
         byte[] buf = new byte[512];
-        while (System.currentTimeMillis() < deadline) {
+        while (true) {
             DatagramPacket pkt = new DatagramPacket(buf, buf.length);
             try {
                 socket.receive(pkt);
@@ -282,10 +327,10 @@ public final class StunClient {
                 int valStart = pos + 4;
                 if (valStart + attrLen > data.length) break;
                 switch (attrType) {
-                    case ATTR_MAPPED_ADDRESS -> mapped = parseAddress(data, valStart, null);
-                    case ATTR_XOR_MAPPED_ADDRESS -> mapped = parseAddress(data, valStart, tid);
+                    case ATTR_MAPPED_ADDRESS -> mapped = parseAddress(data, valStart, false);
+                    case ATTR_XOR_MAPPED_ADDRESS -> mapped = parseAddress(data, valStart, true);
                     case ATTR_CHANGED_ADDRESS, ATTR_OTHER_ADDRESS -> {
-                        String addr = parseAddress(data, valStart, null);
+                        String addr = parseAddress(data, valStart, false);
                         if (addr != null) {
                             String[] parts = addr.split(":");
                             other = new InetSocketAddress(parts[0], Integer.parseInt(parts[1]));
@@ -296,19 +341,24 @@ public final class StunClient {
                 }
                 pos = valStart + ((attrLen + 3) & ~3); // 属性值按 4 字节对齐
             }
-            if (mapped != null) return new BindingResponse(mapped, other);
+            if (mapped != null) {
+                return new BindingResponse(mapped, other,
+                        new InetSocketAddress(pkt.getAddress(), pkt.getPort()));
+            }
         }
-        return null;
     }
 
-    /** 解析 MAPPED-ADDRESS / XOR-MAPPED-ADDRESS（IPv4），xor 参数为 null 表示非 XOR 编码 */
-    private static String parseAddress(byte[] data, int offset, byte[] tid) {
+    /**
+     * 解析 MAPPED-ADDRESS / XOR-MAPPED-ADDRESS（IPv4）。
+     * RFC 5389 §15.2：XOR 编码仅与魔术饼干异或（端口异或高 16 位、IP 异或全 32 位），与事务 ID 无关。
+     */
+    private static String parseAddress(byte[] data, int offset, boolean xorMapped) {
         if (offset + 8 > data.length) return null;
         int family = data[offset + 1] & 0xFF;
-        if (family != 0x01) return null; // 仅处理 IPv4
+        if (family != 0x01) return null; // 仅处理 IPv4（家庭 NAT 穿透场景以 IPv4 为主）
         int port = readU16(data, offset + 2);
         int ip = readU32(data, offset + 4);
-        if (tid != null) {
+        if (xorMapped) {
             port ^= (MAGIC_COOKIE >>> 16) & 0xFFFF;
             ip ^= MAGIC_COOKIE;
         }

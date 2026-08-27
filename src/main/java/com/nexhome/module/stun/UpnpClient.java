@@ -67,7 +67,7 @@ final class UpnpClient {
         return null;
     }
 
-    /** 添加端口映射（外网端口 -> 内网客户端，租期 0=永久），失败返回 false */
+    /** 添加端口映射（外网端口 -> 内网客户端，租期 86400=1天），失败返回 false */
     static boolean addPortMapping(Gateway g, String protocol, int externalPort, int internalPort,
                                   String internalClient, String description) {
         try {
@@ -79,7 +79,7 @@ final class UpnpClient {
                             + "<NewInternalClient>" + internalClient + "</NewInternalClient>"
                             + "<NewEnabled>1</NewEnabled>"
                             + "<NewPortMappingDescription>" + description + "</NewPortMappingDescription>"
-                            + "<NewLeaseDuration>0</NewLeaseDuration>");
+                            + "<NewLeaseDuration>86400</NewLeaseDuration>");
             return true;
         } catch (Exception e) {
             Logs.warn(Logs.STUN, "UPnP AddPortMapping 失败: " + e.getMessage());

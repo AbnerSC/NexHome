@@ -106,6 +106,10 @@ final class StunRunner {
     /** UDP 会话表：对端地址 -> 与目标服务通信的 socket */
     private final Map<String, DatagramSocket> sessions = new ConcurrentHashMap<>();
 
+    /** STUN 服务器候选地址缓存（配置服务器 + 维护列表），60s 刷新：入站包判定与保活都高频使用，逐包查库成本过高 */
+    private volatile Set<String> cachedStunCandidates = Set.of();
+    private volatile long cachedCandidatesAt;
+
     StunRunner(Map<String, Object> task) {
         this.id = ((Number) task.get("id")).longValue();
         this.name = str(task, "name");
@@ -256,12 +260,17 @@ final class StunRunner {
         }
     }
 
-    /** STUN 服务器候选地址（host:port）：配置的服务器 + 维护列表中全部服务器（按维护排序兜底） */
+    /** STUN 服务器候选地址（host:port）：配置的服务器 + 维护列表中全部服务器（按维护排序兜底），结果缓存 60s */
     private Set<String> stunServerCandidates() {
-        LinkedHashSet<String> set = new LinkedHashSet<>();
-        set.add(stunHost + ":" + stunPort);
-        for (String[] s : StunServerService.allServers()) set.add(s[0] + ":" + s[1]);
-        return set;
+        long now = System.currentTimeMillis();
+        if (cachedStunCandidates.isEmpty() || now - cachedCandidatesAt > 60_000) {
+            LinkedHashSet<String> set = new LinkedHashSet<>();
+            set.add(stunHost + ":" + stunPort);
+            for (String[] s : StunServerService.allServers()) set.add(s[0] + ":" + s[1]);
+            cachedStunCandidates = Set.copyOf(set);
+            cachedCandidatesAt = now;
+        }
+        return cachedStunCandidates;
     }
 
     /** 入站包是否来自任一候选 STUN 服务器（保活响应判定） */
@@ -980,7 +989,7 @@ final class StunRunner {
         if (tcpRefreshing) return; // 保活刷新短暂关闭监听，本周期跳过自测避免误报
         try {
             long silentMs = System.currentTimeMillis() - lastMappedAt;
-            if ("UDP".equalsIgnoreCase(protocol) && silentMs > keepaliveSec * 3000L) {
+            if ("UDP".equalsIgnoreCase(protocol) && silentMs > keepaliveSec * 3_000L) {
                 // 保活连续无响应：映射可能已静默失效（网络切换/STUN 服务器故障），先刷新映射再复测
                 Logs.warn(Logs.STUN, "任务[" + name + "] STUN保活 " + (silentMs / 1000)
                         + "s 无响应，映射可能已失效，重新穿透并复测");
