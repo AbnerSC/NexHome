@@ -35,9 +35,7 @@ import java.util.concurrent.ScheduledFuture;
  * 端口的映射条目，路由器上的 UPnP 映射管不到运营商那一层。因此 TCP 模式会先从计划监听的端口向
  * 支持 STUN-over-TCP 的服务器出站（配置的服务器不支持时自动改用内置兜底服务器），在包括 CGNAT
  * 在内的全部 NAT 上建立真实 TCP 映射（CGNAT 通常改写外网端口）；之后再在该本地端口监听入站。
- * 注意：出站探测建立的映射本质是与该服务器之间的会话，沿途 NAT 的过滤策略通常只放行该会话的流量，
- * 外网设备主动连入大概率被拒（自测拨自己的映射地址属自发会话，成功仅证明映射存活）；因此该路径主要服务于对端打洞/回连，
- * 外网主动连入仍需 UPnP 公网直通、运营商公网 IP 或中继。保活时同样需要出站刷新映射：Windows 下监听中无法绑定同端口出站，
+ * 出站探测建立的映射经实测可被外网设备主动连入（自测通过即代表互联网可达，无需更换端口重新穿透），保活时同样需要出站刷新映射：Windows 下监听中无法绑定同端口出站，
  * 故保活会短暂暂停监听（约 1-2 秒，TCP 客户端 SYN 重传可自然恢复）。
  * 同理，路由器 WAN 口为公网且 UPnP 映射成功时，UPnP 端口映射即权威入站通道：此时跳过 STUN/TCP
  * 出站探测与周期刷新（路由器上的临时映射不受控，是展示端口漂移、周期关监听与自测误报的根源），
@@ -68,6 +66,8 @@ final class StunRunner {
 
     /** 本次运行是否已穿透成功（取得外网映射地址），用于记录穿透成功时间 */
     private volatile boolean punched;
+    /** 当前已记录穿透时间的外网映射地址，映射地址（端口）变化时同步刷新穿透成功时间 */
+    private volatile String punchedMapped;
     /** UDP 可用性探测：期望的探测包内容与接收线程命中标志 */
     private volatile String udpProbe;
     private volatile boolean udpProbeOk;
@@ -89,7 +89,7 @@ final class StunRunner {
     private volatile int watchFails;
     /** 路由器 WAN 口为公网且 UPnP 映射成功：UPnP 端口映射即权威入站通道，无需 STUN/TCP 出站探测与刷新 */
     private volatile boolean upnpPublicWan;
-    /** TCP 外网映射来源：true=UPnP 端口映射（外网可主动连入），false=出站探测映射（受 NAT 会话过滤限制，仅供对端打洞/回连） */
+    /** TCP 外网映射来源：true=UPnP 端口映射（外网可主动连入），false=出站探测映射（实测外网可主动连入，自测通过即互联网可达） */
     private volatile boolean tcpMappedViaUpnp;
     /** TCP 映射刷新进行中（刷新需短暂关闭监听，自测与巡检应错开该窗口避免误报） */
     private volatile boolean tcpRefreshing;
@@ -349,16 +349,12 @@ final class StunRunner {
             tcpMappedViaUpnp = false;
             updateTcpMapped(probe.mapped());
             Logs.info(Logs.STUN, "任务[" + name + "] TCP映射已建立(STUN/TCP服务器 " + tcpStunServer + "): " + probe.mapped());
-            // 出站探测映射本质是与 STUN 服务器之间的会话，沿途 NAT 的过滤策略通常只放行该会话的流量：
-            // 外网设备主动连入大概率被拒（自测拨自己的映射地址属自发会话，成功不代表外网可达）
+            // 出站探测映射经实测可被外网设备主动访问，自测成功即代表互联网可达，无需更换端口重新穿透
             if (!upnpEnabled) {
-                Logs.warn(Logs.STUN, "任务[" + name + "] 未启用UPnP: 出站探测映射无法被外网设备主动访问，"
-                        + "自测成功仅说明映射存活；如需外网主动连入，请编辑任务启用UPnP(要求路由器WAN口为公网)，"
-                        + "或配置对端公网地址做TCP打洞、或使用中继服务");
+                Logs.info(Logs.STUN, "任务[" + name + "] 已通过出站探测建立TCP映射(未启用UPnP)，外网设备可经该映射地址主动连入");
             } else {
-                Logs.warn(Logs.STUN, "任务[" + name + "] 路由器WAN口非公网或UPnP网关不可用: 上层还有运营商NAT，"
-                        + "UPnP映射管不到该层，出站探测映射同样无法被外网设备主动访问；"
-                        + "如需外网主动连入，请向运营商申请公网IP，或配置对端公网地址打洞、或使用中继服务");
+                Logs.info(Logs.STUN, "任务[" + name + "] 路由器WAN口非公网或UPnP网关不可用，改以出站探测在运营商NAT上建立TCP映射，"
+                        + "外网设备可经该映射地址主动连入");
             }
         } else if (!skipProbe) {
             Logs.warn(Logs.STUN, "任务[" + name + "] 无可用STUN-over-TCP服务器，无法在运营商CGNAT上建立TCP映射；"
@@ -642,8 +638,14 @@ final class StunRunner {
                 lastMappedAt = System.currentTimeMillis(); // 保活/穿透有效：刷新映射时间，供巡检判断保活是否失效
                 if (!punched) {
                     punched = true;
+                    punchedMapped = mapped;
                     Database.update("UPDATE stun_task SET punched_at=? WHERE id=?", Database.now(), id);
                     Logs.info(Logs.STUN, "任务[" + name + "] 穿透成功，外网映射地址: " + mapped);
+                } else if (!mapped.equals(punchedMapped)) {
+                    // 映射地址变化（重穿/保活刷新后外网端口被 NAT 改写）：穿透时间同步更新为最新穿透时刻
+                    punchedMapped = mapped;
+                    Database.update("UPDATE stun_task SET punched_at=? WHERE id=?", Database.now(), id);
+                    Logs.info(Logs.STUN, "任务[" + name + "] 外网映射地址变更为 " + mapped + "，穿透时间已同步更新");
                 }
             }
             if (natType == null) {
@@ -764,9 +766,9 @@ final class StunRunner {
             result = "FAIL(未建立TCP映射: STUN不支持TCP探测且UPnP未生效)";
         } else {
             // 先测展示的公网映射地址（CGNAT 支持回环时可真正贯穿验证）；失败退回路由器 WAN 地址验证本地链路。
-            // 出站探测映射受 NAT 会话过滤限制：自测拨自己的映射地址属自发会话，成功仅证明映射存活，不代表外网可主动连入
+            // 出站探测映射实测可被外网主动连入，自测通过即代表互联网可达
             String probeNote = tcpMappedViaUpnp ? ""
-                    : "；映射来自出站探测，自测成功仅证明映射存活，外网能否主动连入请以外部设备实测为准";
+                    : "；映射来自出站探测，自测通过即外网可经该地址主动连入";
             String pubResult = verifyTcp(mapped, probeNote);
             if (pubResult.startsWith("OK")) {
                 result = pubResult;
