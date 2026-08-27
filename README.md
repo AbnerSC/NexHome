@@ -3,6 +3,9 @@
 ## GitHub
 https://github.com/AbnerSC/NexHome.git
 
+[![GitHub Stars](https://img.shields.io/github/stars/AbnerSC/NexHome?style=flat&label=Stars)](https://github.com/AbnerSC/NexHome/stargazers)
+[![Docker Pulls](https://img.shields.io/docker/pulls/babyfly/nex-home?label=Docker%20Pulls)](https://hub.docker.com/r/babyfly/nex-home)
+
 > 一站式内网节点守护工具，面向家庭 / 小型机房服务器，把内网能力安全对外打通。
 
 NexHome 是一款单进程、前后端一体化的轻量 Java 服务，内置 Web 服务器与 Web 管理界面，
