@@ -34,8 +34,10 @@ import java.util.concurrent.ScheduledFuture;
  * <b>CGNAT 多级 NAT 场景</b>：外网主动连入要求沿途每一层 NAT（含运营商 CGNAT）都有对应
  * 端口的映射条目，路由器上的 UPnP 映射管不到运营商那一层。因此 TCP 模式会先从计划监听的端口向
  * 支持 STUN-over-TCP 的服务器出站（配置的服务器不支持时自动改用内置兜底服务器），在包括 CGNAT
- * 在内的全部 NAT 上建立真实 TCP 映射，以返回的映射地址为权威外网地址（CGNAT 通常改写外网端口）；
- * 之后再在该本地端口监听入站。保活时同样需要出站刷新映射：Windows 下监听中无法绑定同端口出站，
+ * 在内的全部 NAT 上建立真实 TCP 映射（CGNAT 通常改写外网端口）；之后再在该本地端口监听入站。
+ * 注意：出站探测建立的映射本质是与该服务器之间的会话，沿途 NAT 的过滤策略通常只放行该会话的流量，
+ * 外网设备主动连入大概率被拒（自测拨自己的映射地址属自发会话，成功仅证明映射存活）；因此该路径主要服务于对端打洞/回连，
+ * 外网主动连入仍需 UPnP 公网直通、运营商公网 IP 或中继。保活时同样需要出站刷新映射：Windows 下监听中无法绑定同端口出站，
  * 故保活会短暂暂停监听（约 1-2 秒，TCP 客户端 SYN 重传可自然恢复）。
  * 同理，路由器 WAN 口为公网且 UPnP 映射成功时，UPnP 端口映射即权威入站通道：此时跳过 STUN/TCP
  * 出站探测与周期刷新（路由器上的临时映射不受控，是展示端口漂移、周期关监听与自测误报的根源），
@@ -87,6 +89,8 @@ final class StunRunner {
     private volatile int watchFails;
     /** 路由器 WAN 口为公网且 UPnP 映射成功：UPnP 端口映射即权威入站通道，无需 STUN/TCP 出站探测与刷新 */
     private volatile boolean upnpPublicWan;
+    /** TCP 外网映射来源：true=UPnP 端口映射（外网可主动连入），false=出站探测映射（受 NAT 会话过滤限制，仅供对端打洞/回连） */
+    private volatile boolean tcpMappedViaUpnp;
     /** TCP 映射刷新进行中（刷新需短暂关闭监听，自测与巡检应错开该窗口避免误报） */
     private volatile boolean tcpRefreshing;
     /** 保活失败已告警过的服务器（失效服务器仅告警一次，避免每个保活周期重复刷屏） */
@@ -123,6 +127,7 @@ final class StunRunner {
         wanTcpReady = false;
         upnpWanAddr = null;
         upnpPublicWan = false;
+        tcpMappedViaUpnp = false;
         tcpRefreshing = false;
         repunchCount = 0;
         try {
@@ -341,8 +346,20 @@ final class StunRunner {
         int listenPort = bindPort;
         if (probe != null) {
             listenPort = probe.localPort(); // bind_port=0 时以探测实际占用端口作为监听端口
+            tcpMappedViaUpnp = false;
             updateTcpMapped(probe.mapped());
             Logs.info(Logs.STUN, "任务[" + name + "] TCP映射已建立(STUN/TCP服务器 " + tcpStunServer + "): " + probe.mapped());
+            // 出站探测映射本质是与 STUN 服务器之间的会话，沿途 NAT 的过滤策略通常只放行该会话的流量：
+            // 外网设备主动连入大概率被拒（自测拨自己的映射地址属自发会话，成功不代表外网可达）
+            if (!upnpEnabled) {
+                Logs.warn(Logs.STUN, "任务[" + name + "] 未启用UPnP: 出站探测映射无法被外网设备主动访问，"
+                        + "自测成功仅说明映射存活；如需外网主动连入，请编辑任务启用UPnP(要求路由器WAN口为公网)，"
+                        + "或配置对端公网地址做TCP打洞、或使用中继服务");
+            } else {
+                Logs.warn(Logs.STUN, "任务[" + name + "] 路由器WAN口非公网或UPnP网关不可用: 上层还有运营商NAT，"
+                        + "UPnP映射管不到该层，出站探测映射同样无法被外网设备主动访问；"
+                        + "如需外网主动连入，请向运营商申请公网IP，或配置对端公网地址打洞、或使用中继服务");
+            }
         } else if (!skipProbe) {
             Logs.warn(Logs.STUN, "任务[" + name + "] 无可用STUN-over-TCP服务器，无法在运营商CGNAT上建立TCP映射；"
                     + "仍展示UDP映射，外网主动访问需路由器端口转发且上层NAT放行");
@@ -440,6 +457,7 @@ final class StunRunner {
                 }
                 StunClient.TcpProbe probe = tcpProbe(port, 3000);
                 if (probe != null) {
+                    tcpMappedViaUpnp = false;
                     updateTcpMapped(probe.mapped());
                 } else {
                     Logs.warn(Logs.STUN, "任务[" + name + "] TCP映射保活失败(无可用STUN-over-TCP服务器)");
@@ -745,8 +763,11 @@ final class StunRunner {
             // 展示的是 UDP 映射，对 UDP 映射端口发 TCP 连接必然超时，直接给出原因
             result = "FAIL(未建立TCP映射: STUN不支持TCP探测且UPnP未生效)";
         } else {
-            // 先测展示的公网映射地址（CGNAT 支持回环时可真正贯穿验证）；失败退回路由器 WAN 地址验证本地链路
-            String pubResult = verifyTcp(mapped, "");
+            // 先测展示的公网映射地址（CGNAT 支持回环时可真正贯穿验证）；失败退回路由器 WAN 地址验证本地链路。
+            // 出站探测映射受 NAT 会话过滤限制：自测拨自己的映射地址属自发会话，成功仅证明映射存活，不代表外网可主动连入
+            String probeNote = tcpMappedViaUpnp ? ""
+                    : "；映射来自出站探测，自测成功仅证明映射存活，外网能否主动连入请以外部设备实测为准";
+            String pubResult = verifyTcp(mapped, probeNote);
             if (pubResult.startsWith("OK")) {
                 result = pubResult;
             } else if (upnpWanAddr != null) {
@@ -865,7 +886,10 @@ final class StunRunner {
                         + (wanIp == null ? "外网IP未知" : wanIp) + ":" + extPort + " -> " + lanIp + ":" + localPort);
                 // TCP 模式已建立权威 TCP 映射时不用 UPnP 地址覆盖（入站以 STUN/TCP 探测映射为准），
                 // 否则每次启动/重穿都会把已验证可用的穿透端口换成 UPnP 展示地址；仅在无 TCP 映射时以 UPnP 地址兜底展示
-                if (displayIp != null && !wanTcpReady) updateTcpMapped(displayIp + ":" + extPort);
+                if (displayIp != null && !wanTcpReady) {
+                    tcpMappedViaUpnp = true; // UPnP 映射可被外网主动访问，自测成功即代表外网可达（受路由器防火墙约束）
+                    updateTcpMapped(displayIp + ":" + extPort);
+                }
             } else {
                 Logs.warn(Logs.STUN, "任务[" + name + "] UPnP端口映射失败，仅依赖STUN打洞");
             }
