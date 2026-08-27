@@ -193,10 +193,10 @@ public final class StunClient {
         String localIp = socket.getLocalAddress().getHostAddress();
         int localPort = socket.getLocalPort();
         if (r1.mapped.equals(localIp + ":" + localPort)) {
-            return new Result(r1.mapped, "Open Internet(无NAT，穿透成功率最高)");
+            return new Result(r1.mapped, "Open Internet(无NAT)");
         }
         if (r1.mapped.endsWith(":" + localPort) && !r1.mapped.startsWith("0.0.0.0")) {
-            return new Result(r1.mapped, "端口保持型NAT(映射端口=本地端口，成功率较高；入站仍受路由器防火墙策略约束)");
+            return new Result(r1.mapped, "端口保持型NAT(映射端口=本地端口)");
         }
 
         // Test2：请求服务器更换 IP+端口 回复（标志位 0x06），能收到说明入站无过滤
@@ -207,7 +207,7 @@ public final class StunClient {
             socket.send(new DatagramPacket(req2, req2.length,
                     InetAddress.getByName(stunHost), stunPort));
             if (receive(socket, tid2, timeoutMs) != null) {
-                return new Result(r1.mapped, "Full Cone(全锥形，穿透成功率高)");
+                return new Result(r1.mapped, "Full Cone(全锥形)");
             }
         } catch (Exception ignored) {
             // 后续探测失败不影响已取得的 NAT 映射结论
@@ -222,14 +222,14 @@ public final class StunClient {
                 socket.send(new DatagramPacket(req3, req3.length, r1.otherAddress));
                 BindingResponse r3 = receive(socket, tid3, timeoutMs);
                 if (r3 != null && !r3.mapped.equals(r1.mapped)) {
-                    return new Result(r1.mapped, "Symmetric(对称型，纯STUN难以穿透，建议改用端口转发/中继)");
+                    return new Result(r1.mapped, "Symmetric(对称型)");
                 }
-                return new Result(r1.mapped, "Restricted(受限锥形，配合保活与对端打洞可用)");
+                return new Result(r1.mapped, "Restricted(受限锥形)");
             } catch (Exception ignored) {
                 // 备用地址探测失败，按保守结论返回
             }
         }
-        return new Result(r1.mapped, "Restricted?(服务器不支持RFC3489检测，按受限/对称保守处理)");
+        return new Result(r1.mapped, "Restricted(受限锥形)");
     }
 
     // ---------- 协议报文构造与解析 ----------
