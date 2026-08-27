@@ -16,7 +16,7 @@ import java.util.Arrays;
  * <p>
  * <b>NAT 类型与穿透成功率说明（界面同步展示）：</b>
  * <ul>
- *   <li>Open Internet / 1:1 NAT：外网可直达，穿透成功率最高</li>
+ *   <li>Open Internet / 端口保持型 NAT：外网可直达或映射端口不变，穿透成功率较高（入站仍受路由器防火墙策略约束）</li>
  *   <li>Full Cone（全锥形）：任意主机可发入，成功率高</li>
  *   <li>Restricted / Port Restricted（受限锥形）：需要对方先"打洞"握手，配合保活可用，成功率中等</li>
  *   <li>Symmetric（对称型）：每次出站映射端口不同，纯 STUN 无法穿透，需要中继服务器，成功率极低</li>
@@ -181,12 +181,14 @@ public final class StunClient {
             return new Result(null, "Unknown(STUN服务器无响应)");
         }
 
-        // 本机出口 == 映射地址，说明没有 NAT 或 1:1 NAT
+        // 本机出口 == 映射地址 => 无 NAT；映射端口 == 本地端口 => 端口保持型 NAT
         String localIp = socket.getLocalAddress().getHostAddress();
         int localPort = socket.getLocalPort();
-        if (r1.mapped.equals(localIp + ":" + localPort)
-                || (r1.mapped.endsWith(":" + localPort) && !r1.mapped.startsWith("0.0.0.0"))) {
-            return new Result(r1.mapped, "Open Internet / 1:1 NAT(穿透成功率最高)");
+        if (r1.mapped.equals(localIp + ":" + localPort)) {
+            return new Result(r1.mapped, "Open Internet(无NAT，穿透成功率最高)");
+        }
+        if (r1.mapped.endsWith(":" + localPort) && !r1.mapped.startsWith("0.0.0.0")) {
+            return new Result(r1.mapped, "端口保持型NAT(映射端口=本地端口，成功率较高；入站仍受路由器防火墙策略约束)");
         }
 
         // Test2：请求服务器更换 IP+端口 回复（标志位 0x06），能收到说明入站无过滤

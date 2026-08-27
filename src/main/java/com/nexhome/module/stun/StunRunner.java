@@ -55,6 +55,8 @@ final class StunRunner {
     private final int keepaliveSec;
     /** TCP 打洞对端公网地址（ip:port，可为空；为空时仅依赖入站连接） */
     private final String peerAddr;
+    /** 是否启用 UPnP 端口映射（路由器不支持 UPnP 时可关闭，避免无谓的 SSDP 发现等待） */
+    private final boolean upnpEnabled;
 
     /** 本次运行是否已穿透成功（取得外网映射地址），用于记录穿透成功时间 */
     private volatile boolean punched;
@@ -71,6 +73,8 @@ final class StunRunner {
     private volatile boolean wanTcpReady;
     /** STUN-over-TCP 探测成功的服务器（host:port），后续保活优先复用它 */
     private volatile String tcpStunServer;
+    /** 自测失败后自动重新穿透的已重试次数 */
+    private int repunchCount;
 
     private volatile boolean running;
     private DatagramSocket udpSocket;
@@ -91,6 +95,7 @@ final class StunRunner {
         this.bindPort = intVal(task, "bind_port");
         this.keepaliveSec = Math.max(10, intVal(task, "keepalive_sec"));
         this.peerAddr = str(task, "peer_addr").trim();
+        this.upnpEnabled = intVal(task, "upnp_enabled") != 0;
     }
 
     /** 启动穿透任务 */
@@ -99,6 +104,7 @@ final class StunRunner {
         punched = false;
         wanTcpReady = false;
         upnpWanAddr = null;
+        repunchCount = 0;
         if ("UDP".equalsIgnoreCase(protocol)) {
             startUdp();
         } else {
@@ -120,7 +126,8 @@ final class StunRunner {
                 + "，映射地址: " + (r == null ? "无" : r.mappedAddress()));
 
         // 配合 UPnP：在路由器上显式开放入站端口，对称/受限 NAT 下外网也可主动连入
-        applyUpnpMapping(udpSocket.getLocalPort());
+        if (upnpEnabled) applyUpnpMapping(udpSocket.getLocalPort());
+        else Logs.info(Logs.STUN, "任务[" + name + "] UPnP端口映射已按任务配置关闭，仅依赖STUN打洞");
 
         startUdpReceiver(true);
         startKeepalive();
@@ -247,7 +254,7 @@ final class StunRunner {
         startUdpReceiver(false);
 
         // 配合 UPnP：在路由器上显式开放入站端口（外网端口=本地端口，入站包经 CGNAT 翻译后以此端口到达路由器），外网也可主动连入
-        applyUpnpMapping(localPort);
+        if (upnpEnabled) applyUpnpMapping(localPort);
         startKeepalive();
         startAcceptor();
 
@@ -373,6 +380,7 @@ final class StunRunner {
         LinkedHashSet<String> candidates = new LinkedHashSet<>();
         if (tcpStunServer != null) candidates.add(tcpStunServer);
         candidates.add(stunHost + ":" + stunPort);
+        for (String[] s : StunServerService.tcpServers()) candidates.add(s[0] + ":" + s[1]);
         for (String[] s : StunClient.TCP_STUN_SERVERS) candidates.add(s[0] + ":" + s[1]);
         for (String addr : candidates) {
             int ci = addr.lastIndexOf(':');
@@ -575,8 +583,11 @@ final class StunRunner {
         try (Socket s = new Socket()) {
             s.connect(new InetSocketAddress(parts[0], Integer.parseInt(parts[1])), 3000);
             return "OK(TCP连接成功，" + (System.currentTimeMillis() - t0) + "ms" + note + ")";
+        } catch (java.net.ConnectException e) {
+            // RST 拒绝：自测走本机→路由器WAN回环，多为路由器自身拒绝（无NAT回流/拦截入站），不代表真实外网可达性
+            return "FAIL(被拒绝: 自测经路由器WAN回环, 路由器无NAT回流或拦截未请求入站时即使穿透正常也会被拒绝, 请用外部设备验证" + note + ")";
         } catch (Exception e) {
-            return "FAIL(" + e.getMessage() + ")";
+            return "FAIL(" + e.getMessage() + note + ")";
         }
     }
 
@@ -596,7 +607,7 @@ final class StunRunner {
             }
             return udpProbeOk
                     ? "OK(映射可达，" + (System.currentTimeMillis() - t0) + "ms)"
-                    : "FAIL(探测包无回音，外网可能无法主动连入)";
+                    : "FAIL(探测包无回音: 外网可能无法主动连入; 路由器无NAT回流时自测同样失败, 请用外部设备验证)";
         } catch (Exception e) {
             return "FAIL(" + e.getMessage() + ")";
         } finally {
@@ -665,24 +676,44 @@ final class StunRunner {
             } else {
                 refreshTcpMapping();
             }
-            applyUpnpMapping(localPort);
-            Logs.info(Logs.STUN, "任务[" + name + "] 重新穿透完成(STUN + UPnP)");
+            if (upnpEnabled) applyUpnpMapping(localPort);
+            Logs.info(Logs.STUN, "任务[" + name + "] 重新穿透完成(STUN" + (upnpEnabled ? " + UPnP" : "") + ")");
         } catch (Exception e) {
             Logs.warn(Logs.STUN, "任务[" + name + "] 重新穿透异常: " + e.getMessage());
         }
     }
 
-    /** 自测循环：测试一次，失败则重新穿透并复测，直到成功或任务停止 */
+    /** 自测失败后自动重新穿透的最大重试次数，超过后停止自动复测（仍可手动「自测」） */
+    private static final int MAX_AUTO_REPUNCH = 3;
+
+    /**
+     * 自测循环：测试一次，失败后按失败类型决定是否重新穿透复测。
+     * 连接被拒绝（RST）说明包被某设备主动拒绝（多为路由器自身：不支持 NAT 回流或拦截入站），
+     * 映射本身通常正常，重新穿透无意义，直接停止自动复测并提示用外部设备验证；
+     * 超时等其他失败可能是映射失效，最多自动重新穿透 {@link #MAX_AUTO_REPUNCH} 次。
+     */
     private void verifyLoop() {
         if (!running) return;
-        boolean ok = false;
+        String result = "";
         try {
-            ok = str(verifyChannel(), "result").startsWith("OK");
+            result = str(verifyChannel(), "result");
         } catch (Exception e) {
             Logs.warn(Logs.STUN, "任务[" + name + "] 可用性自测异常: " + e.getMessage());
         }
-        if (ok || !running) return;
-        Logs.info(Logs.STUN, "任务[" + name + "] 自测未通过，" + keepaliveSec + "s 后重新穿透并复测");
+        if (result.startsWith("OK") || !running) return;
+        if (result.contains("refused") || result.contains("被拒绝")) {
+            Logs.warn(Logs.STUN, "任务[" + name + "] 自测连接被拒绝：自测路径为本机→路由器WAN回环，"
+                    + "路由器不支持NAT回流(hairpin)或拦截未请求入站时，即使穿透正常也会被拒绝，重新穿透无意义，停止自动复测；"
+                    + "请用外部设备(手机流量等)访问映射地址验证真实可达性");
+            return;
+        }
+        if (++repunchCount > MAX_AUTO_REPUNCH) {
+            Logs.warn(Logs.STUN, "任务[" + name + "] 连续 " + MAX_AUTO_REPUNCH
+                    + " 次重新穿透后自测仍未通过，停止自动复测；可手动「自测」复测，或检查路由器入站策略/端口转发与主机防火墙");
+            return;
+        }
+        Logs.info(Logs.STUN, "任务[" + name + "] 自测未通过，" + keepaliveSec + "s 后重新穿透并复测(第 "
+                + repunchCount + "/" + MAX_AUTO_REPUNCH + " 次)");
         Tasks.delay(keepaliveSec, () -> {
             if (!running) return;
             repunch();

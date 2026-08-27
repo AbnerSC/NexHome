@@ -8,6 +8,7 @@ import com.nexhome.core.Tasks;
 import com.nexhome.module.cert.CertService;
 import com.nexhome.module.ddns.DdnsService;
 import com.nexhome.module.nav.NavService;
+import com.nexhome.module.stun.StunServerService;
 import com.nexhome.module.stun.StunService;
 import com.nexhome.module.wol.WolService;
 import com.nexhome.web.SystemRoutes;
@@ -43,6 +44,7 @@ public final class NexHomeApp {
             SystemRoutes.register();
             DdnsService.registerRoutes();
             StunService.registerRoutes();
+            StunServerService.registerRoutes();
             WolService.registerRoutes();
             CertService.registerRoutes();
             NavService.registerRoutes();
@@ -50,6 +52,7 @@ public final class NexHomeApp {
             // 5. 启动业务调度与后台任务
             CertService.init();      // 证书自动续期检查
             DdnsService.init();      // 恢复 DDNS 定时同步
+            StunServerService.init(); // 播种 STUN 服务器列表
             StunService.init();      // 恢复运行中的穿透任务
 
             // 6. 启动内置 Web 服务器（前端静态资源 + API 同一端口）

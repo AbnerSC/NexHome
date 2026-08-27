@@ -10,6 +10,9 @@ import com.google.gson.JsonObject;
 
 import java.net.DatagramSocket;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -53,12 +56,13 @@ public final class StunService {
                         intVal(task, "stun_port"), 3000);
                 String tcpMapped = "";
                 if ("TCP".equalsIgnoreCase(str(task, "protocol")) && intVal(task, "bind_port") > 0) {
-                    // 绑定端口固定时才能探测到对入站有效的 TCP 映射；配置服务器不支持 TCP 时尝试内置兜底服务器
+                    // 绑定端口固定时才能探测到对入站有效的 TCP 映射；配置服务器不支持 TCP 时尝试维护的 TCP 服务器与内置兜底服务器
                     int bp = intVal(task, "bind_port");
                     String m = StunClient.bindOverTcp(str(task, "stun_host"), intVal(task, "stun_port"), bp, 3000);
-                    for (int i = 0; m == null && i < StunClient.TCP_STUN_SERVERS.length; i++) {
-                        m = StunClient.bindOverTcp(StunClient.TCP_STUN_SERVERS[i][0],
-                                Integer.parseInt(StunClient.TCP_STUN_SERVERS[i][1]), bp, 3000);
+                    List<String[]> fallback = new ArrayList<>(StunServerService.tcpServers());
+                    fallback.addAll(Arrays.asList(StunClient.TCP_STUN_SERVERS));
+                    for (int i = 0; m == null && i < fallback.size(); i++) {
+                        m = StunClient.bindOverTcp(fallback.get(i)[0], Integer.parseInt(fallback.get(i)[1]), bp, 3000);
                     }
                     if (m != null) tcpMapped = m;
                 }
@@ -91,6 +95,7 @@ public final class StunService {
         ensureColumn("punched_at", "TEXT");
         ensureColumn("check_time", "TEXT");
         ensureColumn("check_result", "TEXT");
+        ensureColumn("upnp_enabled", "INTEGER NOT NULL DEFAULT 1");
     }
 
     private static void ensureColumn(String name, String type) throws SQLException {
@@ -108,12 +113,13 @@ public final class StunService {
         validate(b);
         long id = Database.insert("""
                 INSERT INTO stun_task(name, protocol, target_ip, target_port, bind_port,
-                    stun_host, stun_port, keepalive_sec, peer_addr, enabled)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    stun_host, stun_port, keepalive_sec, peer_addr, upnp_enabled, enabled)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "protocol"), JsonUtils.str(b, "target_ip"),
                 JsonUtils.num(b, "target_port", 0), JsonUtils.num(b, "bind_port", 0),
                 JsonUtils.str(b, "stun_host"), JsonUtils.num(b, "stun_port", 19302),
                 JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"),
+                JsonUtils.bool(b, "upnp_enabled", true) ? 1 : 0,
                 JsonUtils.bool(b, "enabled", false) ? 1 : 0);
         Logs.info(Logs.STUN, "新增穿透任务: " + JsonUtils.str(b, "name"));
         // 创建即要求启动的场景：前端传 enabled=1 时自动启动
@@ -130,11 +136,12 @@ public final class StunService {
         validate(b);
         Database.update("""
                 UPDATE stun_task SET name=?, protocol=?, target_ip=?, target_port=?, bind_port=?,
-                    stun_host=?, stun_port=?, keepalive_sec=?, peer_addr=? WHERE id=?""",
+                    stun_host=?, stun_port=?, keepalive_sec=?, peer_addr=?, upnp_enabled=? WHERE id=?""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "protocol"), JsonUtils.str(b, "target_ip"),
                 JsonUtils.num(b, "target_port", 0), JsonUtils.num(b, "bind_port", 0),
                 JsonUtils.str(b, "stun_host"), JsonUtils.num(b, "stun_port", 19302),
-                JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"), id);
+                JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"),
+                JsonUtils.bool(b, "upnp_enabled", true) ? 1 : 0, id);
         Logs.info(Logs.STUN, "更新穿透任务 #" + id + ": " + JsonUtils.str(b, "name"));
         // 运行中修改配置 -> 重启任务使配置生效
         if (wasRunning) {

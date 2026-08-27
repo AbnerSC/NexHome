@@ -46,10 +46,11 @@ CREATE TABLE IF NOT EXISTS ddns_task (
 );
 
 -- STUN 穿透任务表
--- protocol  : TCP / UDP
--- status    : STOPPED / RUNNING / ERROR
--- peer_addr : TCP 打洞对端公网地址（ip:port，可空）
--- punched_at  : 穿透成功时间（本次运行首次取得外网映射地址的时刻）
+-- protocol     : TCP / UDP
+-- status       : STOPPED / RUNNING / ERROR
+-- peer_addr    : TCP 打洞对端公网地址（ip:port，可空）
+-- upnp_enabled : 是否启用 UPnP 端口映射（路由器不支持 UPnP 时可关闭，避免无谓的 SSDP 发现等待）
+-- punched_at   : 穿透成功时间（本次运行首次取得外网映射地址的时刻）
 -- check_time / check_result : 可用性自测（穿透后测试一次）的时间与结果
 CREATE TABLE IF NOT EXISTS stun_task (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS stun_task (
     stun_port     INTEGER NOT NULL DEFAULT 19302,
     keepalive_sec INTEGER NOT NULL DEFAULT 25,
     peer_addr     TEXT,
+    upnp_enabled  INTEGER NOT NULL DEFAULT 1,
     enabled       INTEGER NOT NULL DEFAULT 0,
     status        TEXT NOT NULL DEFAULT 'STOPPED',
     mapped_addr   TEXT,
@@ -70,6 +72,17 @@ CREATE TABLE IF NOT EXISTS stun_task (
     check_time    TEXT,
     check_result  TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+-- STUN 服务器维护表（穿透任务新增/编辑时下拉选择）
+-- tcp_support : 是否支持 STUN-over-TCP（TCP 穿透任务需经支持 TCP 的服务器出站，在 CGNAT 上建立真实 TCP 映射）
+CREATE TABLE IF NOT EXISTS stun_server (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    host        TEXT NOT NULL,
+    port        INTEGER NOT NULL DEFAULT 3478,
+    tcp_support INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 -- WOL 唤醒设备表
