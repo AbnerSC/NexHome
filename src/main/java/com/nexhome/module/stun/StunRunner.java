@@ -35,8 +35,11 @@ import java.util.concurrent.ScheduledFuture;
  * 端口的映射条目，路由器上的 UPnP 映射管不到运营商那一层。因此 TCP 模式会先从计划监听的端口向
  * 支持 STUN-over-TCP 的服务器出站（配置的服务器不支持时自动改用内置兜底服务器），在包括 CGNAT
  * 在内的全部 NAT 上建立真实 TCP 映射（CGNAT 通常改写外网端口）；之后再在该本地端口监听入站。
- * 出站探测建立的映射经实测可被外网设备主动连入（自测通过即代表互联网可达，无需更换端口重新穿透），保活时同样需要出站刷新映射：Windows 下监听中无法绑定同端口出站，
- * 故保活会短暂暂停监听（约 1-2 秒，TCP 客户端 SYN 重传可自然恢复）。
+ * 出站探测建立的映射经实测可被外网设备主动连入（自测通过即代表互联网可达，无需更换端口重新穿透），
+ * 且该类映射的入站可达性依赖出站连接的活跃状态（连接关闭后运营商 NAT 很快回收映射、保活重建还会漂移外网端口），
+ * 因此探测连接保持打开作为保活长连接：每个保活周期复用同一连接收发 STUN 绑定报文，映射端口不漂移、监听不中断；
+ * 仅连接失效时才关闭重建（Windows 下监听中无法绑定同端口出站，重建需短暂暂停监听约 1-2 秒，
+ * 窗口内的入站 SYN 由客户端 TCP SYN 重传自然恢复）。
  * 同理，路由器 WAN 口为公网且 UPnP 映射成功时，UPnP 端口映射即权威入站通道：此时跳过 STUN/TCP
  * 出站探测与周期刷新（路由器上的临时映射不受控，是展示端口漂移、周期关监听与自测误报的根源），
  * 只有路由器 WAN 口非公网（上层还有 CGNAT）时才启用出站探测。
@@ -81,6 +84,14 @@ final class StunRunner {
     private volatile boolean wanTcpReady;
     /** STUN-over-TCP 探测成功的服务器（host:port），后续保活优先复用它 */
     private volatile String tcpStunServer;
+    /**
+     * STUN-over-TCP 保活长连接：探测连接保持打开以持续维持运营商NAT上的TCP映射
+     * （实测映射入站可达性依赖出站连接的活跃状态，连接关闭后映射很快失效）；
+     * 保活复用同一连接时外网映射端口不再漂移，用户持有的地址持续有效。
+     */
+    private volatile Socket tcpKeepAlive;
+    /** 最近一次真实外网入站连接时刻（排除本机公网回环的自测连接）：自测失败时据此避免误重穿丢弃可用映射 */
+    private volatile long lastPeerInboundAt;
     /** 自测失败后自动重新穿透的已重试次数 */
     private int repunchCount;
     /** 最近一次收到 STUN 绑定响应（映射刷新）的时间戳，用于判断保活是否失效 */
@@ -354,6 +365,8 @@ final class StunRunner {
         StunClient.TcpProbe probe = skipProbe ? null : tcpProbe(bindPort, 3000);
         int listenPort = bindPort;
         if (probe != null) {
+            // 探测连接转为保活长连接保持打开：连接在则运营商NAT上的TCP映射在，入站持续可达
+            tcpKeepAlive = probe.socket();
             listenPort = probe.localPort(); // bind_port=0 时以探测实际占用端口作为监听端口
             tcpMappedViaUpnp = false;
             updateTcpMapped(probe.mapped());
@@ -431,18 +444,37 @@ final class StunRunner {
     }
 
     /**
-     * TCP 映射保活：从监听端口出站刷新运营商 CGNAT 上的 TCP 映射（防会话超时）并更新展示地址。
-     * Windows 下监听中无法绑定同端口出站，需先短暂停止监听：探测完成后重开监听，
+     * TCP 映射保活：优先复用保活长连接刷新映射（监听不中断、外网端口不漂移），
+     * 连接失效时才重建：从监听端口出站重新探测，在运营商 CGNAT 上建立新 TCP 映射并更新展示地址。
+     * Windows 下监听中无法绑定同端口出站，重建需先短暂停止监听：探测完成后重开监听，
      * 窗口内（约 1-2 秒）入站 SYN 被丢弃，由客户端 TCP SYN 重传自然恢复。
      * <p>
-     * 刷新前先以临时端口快速预检服务器可用性：全部不可用时直接跳过（无需关闭监听），
+     * 重建前先以临时端口快速预检服务器可用性：全部不可用时直接跳过（无需关闭监听），
      * 避免服务器故障期监听被关闭数十秒导致入站中断、自测误报被拒。
      */
     private synchronized void refreshTcpMapping() {
         if (!running || tcpServer == null || upnpPublicWan) return;
-        if (tcpProbe(0, 1500) == null) { // 临时端口快速预检：服务器全不可用时无需打扰监听
+        Socket alive = tcpKeepAlive;
+        if (alive != null && alive.isConnected() && !alive.isClosed()) {
+            // 长连接存活：直接在该连接上保活，映射端口不变，循环使用中用户持有的地址持续有效
+            String mapped = StunClient.bindingOverTcp(alive, 3000);
+            if (mapped != null) {
+                tcpMappedViaUpnp = false;
+                updateTcpMapped(mapped);
+                return;
+            }
+            closeTcpKeepAlive();
+            Logs.warn(Logs.STUN, "任务[" + name + "] TCP保活连接已失效(服务器无响应)，重建出站映射");
+        }
+        StunClient.TcpProbe pre = tcpProbe(0, 1500); // 临时端口快速预检：服务器全不可用时无需打扰监听
+        if (pre == null) {
             Logs.warn(Logs.STUN, "任务[" + name + "] TCP映射保活预检失败(无可用STUN-over-TCP服务器)");
             return;
+        }
+        try {
+            pre.socket().close(); // 预检连接仅验证服务器可用性，随即关闭
+        } catch (Exception ignored) {
+            // 预检连接关闭失败不影响后续重建
         }
         tcpRefreshing = true;
         int port = tcpServer.getLocalPort();
@@ -462,6 +494,7 @@ final class StunRunner {
                 }
                 StunClient.TcpProbe probe = tcpProbe(port, 3000);
                 if (probe != null) {
+                    tcpKeepAlive = probe.socket(); // 新探测连接转为保活长连接保持打开
                     tcpMappedViaUpnp = false;
                     updateTcpMapped(probe.mapped());
                 } else {
@@ -477,6 +510,19 @@ final class StunRunner {
                 } catch (Exception e) {
                     Logs.error(Logs.STUN, "任务[" + name + "] 重建TCP监听失败: " + e.getMessage());
                 }
+            }
+        }
+    }
+
+    /** 关闭 TCP 保活长连接（幂等，重复调用安全） */
+    private void closeTcpKeepAlive() {
+        Socket s = tcpKeepAlive;
+        tcpKeepAlive = null;
+        if (s != null) {
+            try {
+                s.close();
+            } catch (Exception ignored) {
+                // 连接可能已断开，仍按成功处理
             }
         }
     }
@@ -542,6 +588,12 @@ final class StunRunner {
     private void pipeToTarget(Socket client) {
         try (client; Socket target = new Socket(targetIp, targetPort)) {
             Logs.info(Logs.STUN, "任务[" + name + "] 外网连接: " + client.getRemoteSocketAddress());
+            // 对端不是本机公网回环（自测连接源）时记录真实外网访问时刻：
+            // 作为通道实际在用的证据，自测未通过时据此避免误重穿把可用映射丢弃
+            String mappedIp = currentMappedIp();
+            if (mappedIp == null || !mappedIp.equals(client.getInetAddress().getHostAddress())) {
+                lastPeerInboundAt = System.currentTimeMillis();
+            }
             Thread t2c = new Thread(() -> copy(target, client), "stun-pipe");
             t2c.setDaemon(true);
             t2c.start();
@@ -577,6 +629,7 @@ final class StunRunner {
         if (punchTask != null) punchTask.cancel(false);
         if (checkTask != null) checkTask.cancel(false);
         if (udpSocket != null) udpSocket.close();
+        closeTcpKeepAlive();
         if (tcpServer != null) {
             try {
                 tcpServer.close();
@@ -609,6 +662,7 @@ final class StunRunner {
         if (punchTask != null) punchTask.cancel(false);
         if (checkTask != null) checkTask.cancel(false);
         if (udpSocket != null) udpSocket.close();
+        closeTcpKeepAlive();
         if (tcpServer != null) {
             try {
                 tcpServer.close();
@@ -916,6 +970,8 @@ final class StunRunner {
             if ("UDP".equalsIgnoreCase(protocol)) {
                 repunchUdpMapping();
             } else {
+                // 自测失败说明当前映射已失效：关闭保活长连接强制重建出站映射（运营商NAT分配新端口）
+                closeTcpKeepAlive();
                 refreshTcpMapping();
             }
             if (upnpEnabled) applyUpnpMapping(localPort);
@@ -947,6 +1003,13 @@ final class StunRunner {
             Logs.warn(Logs.STUN, "任务[" + name + "] 自测连接被拒绝：自测路径为本机→路由器WAN回环，"
                     + "路由器不支持NAT回流(hairpin)或拦截未请求入站时，即使穿透正常也会被拒绝，重新穿透无意义，停止自动复测；"
                     + "请用外部设备(手机流量等)访问映射地址验证真实可达性");
+            return;
+        }
+        // 自测失败但近期有真实外网入站访问：映射实际可用，失败多为本机回环自测路径受限，重穿会更换端口丢弃可用映射
+        long peerAgoMs = System.currentTimeMillis() - lastPeerInboundAt;
+        if (peerAgoMs < keepaliveSec * 6_000L) {
+            Logs.info(Logs.STUN, "任务[" + name + "] 自测未通过但 " + (peerAgoMs / 1000)
+                    + "s 前仍有真实外网访问(回环自测受限)，跳过重新穿透");
             return;
         }
         if (++repunchCount > MAX_AUTO_REPUNCH) {
@@ -1009,6 +1072,15 @@ final class StunRunner {
             }
             if (result.contains("refused") || result.contains("被拒绝")) {
                 // 被拒绝多为路由器回环策略限制（详见自测说明），映射本身通常正常，重新穿透无意义；保活照常维持
+                watchFails = 0;
+                return;
+            }
+            // 自测失败但近期有真实外网入站访问：外部设备能连入即映射实际可达，
+            // 失败多为本机回环自测路径受限，重穿只会更换端口把可用映射丢弃，跳过本次重穿
+            long peerAgoMs = System.currentTimeMillis() - lastPeerInboundAt;
+            if (peerAgoMs < keepaliveSec * 6_000L) {
+                Logs.info(Logs.STUN, "任务[" + name + "] 巡检自测未通过但 " + (peerAgoMs / 1000)
+                        + "s 前仍有真实外网访问(回环自测受限)，通道视为可用，跳过重新穿透");
                 watchFails = 0;
                 return;
             }

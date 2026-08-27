@@ -193,6 +193,13 @@ public final class StunServerService {
         if (host.isBlank()) throw new IllegalArgumentException("服务器地址不能为空");
         if (port < 1 || port > 65535) throw new IllegalArgumentException("端口需在 1-65535 之间");
         StunClient.TcpProbe p = StunClient.probeOverTcp(host, port, 0, 3000);
+        if (p != null) {
+            try {
+                p.socket().close(); // 手动探测仅验证支持性，用后即闭（长期保活由任务运行器管理）
+            } catch (Exception ignored) {
+                // 探测连接关闭失败不影响探测结果
+            }
+        }
         Logs.info(Logs.STUN, "探测 STUN-over-TCP " + host + ":" + port + " -> "
                 + (p == null ? "不支持/无响应" : "支持，映射地址 " + p.mapped()));
         ctx.ok(Map.of("supported", p != null, "mapped", p == null ? "" : p.mapped()));

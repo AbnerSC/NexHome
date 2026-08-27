@@ -1,6 +1,5 @@
 package com.nexhome.module.stun;
 
-import java.io.BufferedInputStream;
 import java.io.InputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -58,8 +57,11 @@ public final class StunClient {
     public record Result(String mappedAddress, String natType) {
     }
 
-    /** STUN-over-TCP 探测结果：外网映射地址 + 本地出站端口（绑定 0 时用于回填实际占用端口） */
-    public record TcpProbe(String mapped, int localPort) {
+    /**
+     * STUN-over-TCP 探测结果：外网映射地址 + 本地出站端口（绑定 0 时用于回填实际占用端口）
+     * + 保持打开的探测连接（需长期保活维持运营商NAT映射时由调用方持有，不用时调用方负责关闭）。
+     */
+    public record TcpProbe(String mapped, int localPort, Socket socket) {
     }
 
     private StunClient() {
@@ -122,64 +124,102 @@ public final class StunClient {
     }
 
     /**
-     * STUN-over-TCP 探测（兼容旧调用）：仅返回外网映射地址，详见 {@link #probeOverTcp}。
+     * STUN-over-TCP 探测（兼容旧调用）：仅返回外网映射地址，探测连接用后即关闭，详见 {@link #probeOverTcp}。
      */
     public static String bindOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
         TcpProbe p = probeOverTcp(stunHost, stunPort, localPort, timeoutMs);
-        return p == null ? null : p.mapped();
+        if (p == null) return null;
+        try {
+            return p.mapped();
+        } finally {
+            try {
+                p.socket().close();
+            } catch (Exception ignored) {
+                // 关闭探测连接失败不影响结果返回
+            }
+        }
     }
 
     /**
      * STUN-over-TCP 探测（RFC 5389 §7.1）：从指定本地端口向 STUN 服务器建立 TCP 连接
-     * 并发送绑定请求，返回该 TCP 出口的外网映射地址与实际本地端口。
+     * 并发送绑定请求，返回该 TCP 出口的外网映射地址、实际本地端口与<b>保持打开的探测连接</b>。
      * <p>
      * 出站连接会在沿途全部 NAT（含运营商 CGNAT）上建立真实 TCP 映射，
      * CGNAT 通常会改写外网端口，入站访问需以返回的映射地址为准。
+     * 连接不关闭：实测该类映射的入站可达性依赖出站连接的活跃状态，连接关闭后映射很快失效；
+     * 调用方应持有该连接作为保活长连接（周期复用发送绑定请求），不用时自行关闭。
      * 服务器不支持 STUN/TCP 或本地端口绑定失败时返回 null。
      */
     public static TcpProbe probeOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
-        try (Socket s = new Socket()) {
+        Socket s = new Socket();
+        try {
             s.setReuseAddress(true);
             s.bind(new InetSocketAddress(Math.max(localPort, 0)));
             int bound = s.getLocalPort();
             s.connect(new InetSocketAddress(InetAddress.getByName(stunHost), stunPort), timeoutMs);
-            s.setSoTimeout(timeoutMs);
-            byte[] tid = new byte[12];
-            RANDOM.nextBytes(tid);
-            s.getOutputStream().write(buildRequest(tid, false));
-            // RFC 5389 §7.2.2：TCP 传输时每条 STUN 消息前有 2 字节长度帧头（值为消息体字节数，不含帧头本身）；
-            // 读数时两者兼容：优先按标准帧头解析，个别不发送帧头的实现按裸消息解析
-            BufferedInputStream in = new BufferedInputStream(s.getInputStream());
-            in.mark(22);
-            byte[] b = in.readNBytes(22);
-            if (b.length < 22) return null;
-            byte[] head;
-            int msgLen;
-            if (readU16(b, 2) == MSG_BINDING_RESPONSE && readU32(b, 6) == MAGIC_COOKIE) {
-                int frame = readU16(b, 0);
-                if (frame < 20 || frame > 65535 || (frame - 20) % 4 != 0 || readU16(b, 4) != frame - 20) return null;
-                head = Arrays.copyOfRange(b, 2, 22);
-                msgLen = readU16(head, 2);
-            } else if (readU16(b, 0) == MSG_BINDING_RESPONSE && readU32(b, 4) == MAGIC_COOKIE) {
-                in.reset();
-                head = in.readNBytes(20);
-                if (head.length < 20) return null;
-                msgLen = readU16(head, 2);
-            } else {
+            String mapped = exchangeTcpBinding(s, timeoutMs);
+            if (mapped == null) {
+                s.close();
                 return null;
             }
-            if (msgLen % 4 != 0) return null; // STUN 消息长度恒为 4 字节的倍数
-            if (!Arrays.equals(tid, Arrays.copyOfRange(head, 8, 20))) return null;
-            byte[] attrs = in.readNBytes(msgLen);
-            if (attrs.length < msgLen) return null;
-            byte[] full = new byte[20 + attrs.length];
-            System.arraycopy(head, 0, full, 0, 20);
-            System.arraycopy(attrs, 0, full, 20, attrs.length);
-            String mapped = extractMapped(full, full.length);
-            return mapped == null ? null : new TcpProbe(mapped, bound);
+            return new TcpProbe(mapped, bound, s);
+        } catch (Exception e) {
+            try {
+                s.close();
+            } catch (Exception ignored) {
+                // 探测失败，关闭连接后返回
+            }
+            return null;
+        }
+    }
+
+    /**
+     * 在已建立的 STUN-over-TCP 长连接上做一次绑定交互（保活复用同一连接时外网映射端口不漂移），
+     * 返回外网映射地址；连接异常/服务器无响应时返回 null（连接本身保持，由调用方决定重连或关闭）。
+     */
+    public static String bindingOverTcp(Socket s, int timeoutMs) {
+        try {
+            return exchangeTcpBinding(s, timeoutMs);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * STUN-over-TCP 绑定交互（RFC 5389 §7.1/§7.2.2）：发送 Binding 请求并解析响应返回映射地址。
+     * 直接读底层流不做缓冲保留，同一连接上可反复调用（长连接保活）。
+     */
+    private static String exchangeTcpBinding(Socket s, int timeoutMs) throws Exception {
+        s.setSoTimeout(timeoutMs);
+        byte[] tid = new byte[12];
+        RANDOM.nextBytes(tid);
+        s.getOutputStream().write(buildRequest(tid, false));
+        // RFC 5389 §7.2.2：TCP 传输时每条 STUN 消息前有 2 字节长度帧头（值为消息体字节数，不含帧头本身）；
+        // 读数时两者兼容：优先按标准帧头解析，个别不发送帧头的实现按裸消息解析
+        InputStream in = s.getInputStream();
+        byte[] b = in.readNBytes(22);
+        if (b.length < 22) return null;
+        byte[] head;
+        int msgLen;
+        if (readU16(b, 2) == MSG_BINDING_RESPONSE && readU32(b, 6) == MAGIC_COOKIE) {
+            int frame = readU16(b, 0);
+            if (frame < 20 || frame > 65535 || (frame - 20) % 4 != 0 || readU16(b, 4) != frame - 20) return null;
+            head = Arrays.copyOfRange(b, 2, 22);
+            msgLen = readU16(head, 2);
+        } else if (readU16(b, 0) == MSG_BINDING_RESPONSE && readU32(b, 4) == MAGIC_COOKIE) {
+            head = Arrays.copyOfRange(b, 0, 20);
+            msgLen = readU16(head, 2);
+        } else {
+            return null;
+        }
+        if (msgLen % 4 != 0) return null; // STUN 消息长度恒为 4 字节的倍数
+        if (!Arrays.equals(tid, Arrays.copyOfRange(head, 8, 20))) return null;
+        byte[] attrs = in.readNBytes(msgLen);
+        if (attrs.length < msgLen) return null;
+        byte[] full = new byte[20 + attrs.length];
+        System.arraycopy(head, 0, full, 0, 20);
+        System.arraycopy(attrs, 0, full, 20, attrs.length);
+        return extractMapped(full, full.length);
     }
 
     /**
