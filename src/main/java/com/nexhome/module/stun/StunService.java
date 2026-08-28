@@ -23,6 +23,8 @@ public final class StunService {
 
     /** 任务 id -> 运行中的任务实例 */
     private static final Map<Long, StunRunner> RUNNERS = new ConcurrentHashMap<>();
+    /** 任务 id -> 启停互斥锁：并发启动（重复点击/自动恢复重叠）会导致新旧实例竞争同一端口，启停须串行 */
+    private static final Map<Long, Object> LOCKS = new ConcurrentHashMap<>();
 
     private StunService() {
     }
@@ -163,23 +165,27 @@ public final class StunService {
 
     // ---------- 启停 ----------
 
-    /** 启动任务 */
+    /** 启动任务（同任务串行：并发启动会竞争同一出站/监听端口，是端口冲突启动失败的诱因之一） */
     public static void start(long id) throws Exception {
-        Map<String, Object> task = mustGet(id);
-        stop(id); // 幂等：先停止旧实例
-        StunRunner runner = new StunRunner(task);
-        runner.start();
-        RUNNERS.put(id, runner);
-        Database.update("UPDATE stun_task SET enabled=1 WHERE id=?", id);
+        synchronized (LOCKS.computeIfAbsent(id, k -> new Object())) {
+            Map<String, Object> task = mustGet(id);
+            stop(id); // 幂等：先停止旧实例
+            StunRunner runner = new StunRunner(task);
+            runner.start();
+            RUNNERS.put(id, runner);
+            Database.update("UPDATE stun_task SET enabled=1 WHERE id=?", id);
+        }
     }
 
-    /** 停止任务 */
+    /** 停止任务（与 {@link #start} 同锁串行，避免停止释放端口与新实例绑定交错） */
     public static void stop(long id) throws SQLException {
-        StunRunner runner = RUNNERS.remove(id);
-        if (runner != null) {
-            runner.stop();
+        synchronized (LOCKS.computeIfAbsent(id, k -> new Object())) {
+            StunRunner runner = RUNNERS.remove(id);
+            if (runner != null) {
+                runner.stop();
+            }
+            Database.update("UPDATE stun_task SET enabled=0, status='STOPPED' WHERE id=?", id);
         }
-        Database.update("UPDATE stun_task SET enabled=0, status='STOPPED' WHERE id=?", id);
     }
 
     /** 关停时停止全部任务并释放路由器 UPnP 映射（防止映射条目残留浪费路由器资源） */

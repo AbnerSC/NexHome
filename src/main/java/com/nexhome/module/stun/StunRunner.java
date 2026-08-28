@@ -21,7 +21,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -124,6 +126,10 @@ final class StunRunner {
     private volatile long lastExtCheckAt;
     /** 上次公网入站验证结果（仅状态变化时打日志，避免刷屏） */
     private volatile Boolean lastExtReachable;
+    /** 备用出站 socket 同端口通配绑定容量（-1=未探测）：预绑不得超过该上限，否则顶掉监听开启机会 */
+    private volatile int spareCapacity = -1;
+    /** spareCapacity 探测时刻（结果缓存 2 分钟，避免每次弹跳都重复探测） */
+    private volatile long spareCapacityAt;
     /** 公网入站验证用 HTTP 客户端（第三方探测服务，低频调用） */
     private static final HttpClient EXT_CHECK_HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5)).build();
@@ -390,31 +396,52 @@ final class StunRunner {
                 Logs.warn(Logs.STUN, "任务[" + name + "] UPnP网关预检异常: " + e.getMessage());
             }
         }
-        // 先固定本地端口（bind_port=0 时取随机端口）：出站链路与监听共用同一本地端口，
-        // 固定本地端口使外网映射端口在链路重建间保持稳定
-        int listenPort = bindPort;
-        if (listenPort <= 0) {
-            try (ServerSocket tmp = new ServerSocket(0)) {
-                listenPort = tmp.getLocalPort();
-            }
-        }
         // 先出站探测，再监听：① 出站连接在沿途全部 NAT（含运营商 CGNAT）上建立真实 TCP 映射，
         // 返回地址即权威外网地址；② Linux 下监听存在后无法再绑定同端口出站（LISTEN 占用），
-        // 探测与备用 socket 都必须先行（链路日后重连优先用备用 socket，关监听弹跳仅为兜底）
-        if (!skipProbe) {
-            TcpPunch.Link link = punch.establish(listenPort, true);
-            if (link != null) {
-                // 预绑定备用出站 socket：链路断开时无需关监听即可重连（零入站中断）；
-                // 端点空闲超时死亡轮换时每次消耗一个，大池量拉长弹跳间隔
-                punch.openSpares(listenPort, TCP_SPARES);
-            } else {
-                Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路建立失败(STUN与公共出站端点均不可达)，"
-                        + "TCP映射未建立，巡检将按退避重试；UDP映射照常保活展示");
+        // 探测与备用 socket 都必须先行（链路日后重连优先用备用 socket，关监听弹跳仅为兜底）。
+        // 随机端口偶发被占用（备用预绑/监听开启失败）时：丢弃已建链路、换新端口整体重试，
+        // 避免一次端口冲突直接判任务死刑；固定端口冲突无替代端口，报错由用户调整配置。
+        ServerSocket listener;
+        int attempts = 0;
+        while (true) {
+            attempts++;
+            // 先固定本地端口（bind_port=0 时取随机端口）：出站链路与监听共用同一本地端口，
+            // 固定本地端口使外网映射端口在链路重建间保持稳定
+            int listenPort = bindPort;
+            if (listenPort <= 0) {
+                try (ServerSocket tmp = new ServerSocket(0)) {
+                    listenPort = tmp.getLocalPort();
+                }
             }
-        }
+            TcpPunch.Link link = null;
+            if (!skipProbe) {
+                link = punch.establish(listenPort, true);
+                if (link != null) {
+                    // 预绑定备用出站 socket：链路断开时无需关监听即可重连（零入站中断）。
+                    // 预绑数不得超过内核允许的同端口通配绑定上限（先行探测），
+                    // 否则备用绑不上还会顶掉后续监听开启；主链路已占一个名额故上限减一。
+                    // 端点空闲超时死亡轮换时每次消耗一个，大池量拉长弹跳间隔
+                    int cap = spareCapacity(listenPort);
+                    if (cap > 0) punch.openSpares(listenPort, Math.min(TCP_SPARES, cap - 1));
+                } else {
+                    Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路建立失败(STUN与公共出站端点均不可达)，"
+                            + "TCP映射未建立，巡检将按退避重试；UDP映射照常保活展示");
+                }
+            }
 
-        // 入站方向：同一本地端口监听 TCP，外网连接进来后转发到目标内网服务（HTTP 等 TCP 流量透明传输）
-        tcpServer = openTcpListener(listenPort);
+            // 入站方向：同一本地端口监听 TCP，外网连接进来后转发到目标内网服务（HTTP 等 TCP 流量透明传输）
+            try {
+                listener = openTcpListener(listenPort);
+            } catch (Exception e) {
+                punch.closeLink(); // 释放已建立的出站链路（RST 复位立即释放端口占用）
+                if (bindPort > 0 || attempts >= 3) throw e; // 固定端口无替代端口/重试耗尽：按原流程报错
+                Logs.warn(Logs.STUN, "任务[" + name + "] 端口" + listenPort + "开启监听失败(被占用)，"
+                        + "更换随机端口重试: " + e.getMessage());
+                continue; // 换新随机端口整体重试（重新出站探测，映射地址以新端口为准）
+            }
+            break;
+        }
+        tcpServer = listener;
         int localPort = tcpServer.getLocalPort();
 
         // 同端口维护 UDP STUN 映射：展示外网地址并保活，锥形 NAT 下对端可经该映射打洞回连
@@ -476,6 +503,47 @@ final class StunRunner {
         int localPort = tcpServer != null ? tcpServer.getLocalPort()
                 : (udpSocket != null ? udpSocket.getLocalPort() : 0);
         return exitIp != null && localPort > 0 ? exitIp + ":" + localPort : null;
+    }
+
+    /**
+     * 探测同端口可叠加的通配绑定上限（结果缓存 2 分钟）：逐个临时绑定未连接的通配 socket
+     * 直至内核拒绝（不同内核对同端口多通配绑定的上限不同，超限继续绑定会使后续监听开启失败）。
+     * 返回 0 表示端口当前已被占用无法绑定。
+     */
+    private int spareCapacity(int port) {
+        long now = System.currentTimeMillis();
+        if (spareCapacity >= 0 && now - spareCapacityAt < 120_000) return spareCapacity;
+        List<Socket> probes = new ArrayList<>();
+        int n = 0;
+        try {
+            while (n < TCP_SPARES) {
+                Socket s = new Socket();
+                try {
+                    s.setReuseAddress(true);
+                    s.bind(new InetSocketAddress(port));
+                } catch (Exception e) {
+                    try {
+                        s.close();
+                    } catch (Exception ignored) {
+                        // 探测结束，关闭失败无影响
+                    }
+                    break;
+                }
+                probes.add(s);
+                n++;
+            }
+        } finally {
+            for (Socket s : probes) {
+                try {
+                    s.close();
+                } catch (Exception ignored) {
+                    // 探测结束，关闭失败无影响
+                }
+            }
+        }
+        spareCapacity = n;
+        spareCapacityAt = now;
+        return n;
     }
 
     /** 在指定端口开启 TCP 监听（重试以容忍刚关闭连接的端口释放延迟） */
@@ -546,7 +614,8 @@ final class StunRunner {
                     Thread.currentThread().interrupt();
                 }
                 if (punch.establish(port, punch.allowStunNow()) != null) {
-                    punch.openSpares(port, TCP_SPARES); // 监听重开前补足备用 socket
+                    int cap = spareCapacity(port);
+                    if (cap > 0) punch.openSpares(port, Math.min(TCP_SPARES, cap - 1)); // 监听重开前补足备用 socket（同样受容量上限约束）
                 } else {
                     wanTcpReady = false;
                     Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路重建失败(STUN与公共出站端点均不可达)，"

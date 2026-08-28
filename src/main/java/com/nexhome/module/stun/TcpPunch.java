@@ -347,7 +347,11 @@ final class TcpPunch {
         }
     }
 
-    /** 预绑定备用出站 socket：必须在监听开启前完成（LISTEN 占用端口后无法再绑定出站 socket） */
+    /**
+     * 预绑定备用出站 socket：必须在监听开启前完成（LISTEN 占用端口后无法再绑定出站 socket）。
+     * 数量由调用方按内核同端口通配绑定容量上限约束（超限时首个绑定即失败，继续绑定还会顶掉监听开启机会）；
+     * 任一绑定失败即停止（端口已被占用/达到容量上限），任务降级为仅靠弹跳重建链路，不影响启动。
+     */
     void openSpares(int localPort, int count) {
         for (int i = 0; i < count; i++) {
             try {
