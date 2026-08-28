@@ -22,8 +22,8 @@ import java.util.function.Consumer;
  *       连接上不做应用层交互（TCP 握手完成即双向链路验证；域名解析按其设计走 UDP 53，
  *       不占用 TCP 连接）。端点须为非 DNS 端口的透传服务：实测运营商 CGNAT 对 53/TCP
  *       透明拦截（连接能建立但终结在 CGNAT、查询无响应），此类映射不接受入站；
- *       外网映射端口由运行器取同本地端口的 UDP STUN 映射组装展示，
- *       若自建可用的 TCP STUN 服务器可获得精确映射（公共 TCP STUN 服务稀缺，与 Lucky 等工具同路）</li>
+ *       外网映射端口无法直接探测，无 TCP 探测能力时由运行器取同本地端口的 UDP STUN 映射
+ *       尽力估计展示（实测同本地端口 TCP/UDP 外部端口并不相同，入站不保证可达）</li>
  * </ol>
  * 链路死亡时优先复用预绑定的备用出站 socket（同端口、未连接，监听开启前预绑）立即重连，
  * 实现<b>零监听中断</b>的链路重建；备用耗尽才由调用方「弹跳」（关监听→重建→重开监听）。
@@ -159,7 +159,7 @@ final class TcpPunch {
             if (System.currentTimeMillis() - probeFailAt > 300_000) {
                 // 刚进入新的退避期才告警（含首次）：避免每个保活周期重复刷屏
                 Logs.warn(Logs.STUN, "任务[" + taskName + "] 无可用STUN-over-TCP服务器，回退端口保留模式"
-                        + "(公共端点出站维持CGNAT映射，展示端口取同端口UDP STUN映射；自建TCP STUN服务器可获得精确映射)");
+                        + "(公共端点出站维持CGNAT映射，展示端口取同端口UDP STUN估计、入站不保证可达；登记可用TCP STUN服务器可获得精确映射)");
             }
             probeFailAt = System.currentTimeMillis();
         }
@@ -182,13 +182,15 @@ final class TcpPunch {
         return null;
     }
 
-    /** STUN-over-TCP 候选：上次成功服务器 → 配置服务器 → 维护列表 → 内置列表 */
+    /** STUN-over-TCP 候选：上次成功服务器 → 配置服务器 → 内置列表（实测可达优先） → 维护列表 */
     private LinkedHashSet<String> stunCandidates() {
         LinkedHashSet<String> set = new LinkedHashSet<>();
         if (tcpStunServer != null) set.add(tcpStunServer);
         set.add(stunHost + ":" + stunPort);
-        for (String[] s : StunServerService.tcpServers()) set.add(s[0] + ":" + s[1]);
+        // 内置列表按电信 CGNAT 实测可达排序，优先于维护列表：失效候选探测每个耗时数秒，
+        // 维护列表历史种子多为 3478 端口（本类运营商封锁），排在后面仅作其他网络兜底
         for (String[] s : StunClient.TCP_STUN_SERVERS) set.add(s[0] + ":" + s[1]);
+        for (String[] s : StunServerService.tcpServers()) set.add(s[0] + ":" + s[1]);
         return set;
     }
 

@@ -44,14 +44,23 @@ public final class StunClient {
     /**
      * 支持 STUN-over-TCP 的公共 STUN 服务器候选（host:port），配置的服务器仅支持 UDP 时兜底。
      * TCP 穿透优先借助支持 TCP 的 STUN 服务器出站，才能在运营商 CGNAT 上建立可探测端口的 TCP 映射。
-     * 实测部分运营商 CGNAT 封锁 3478/TCP 出站且境内无公共 TCP STUN 服务，本列表全不可用时
-     * 自动回退「端口保留模式」（出站连 {@link #KEEPALIVE_TCP_ENDPOINTS} 建立并保活 CGNAT 映射，
-     * 展示端口取同本地端口的 UDP STUN 映射）；若自建/发现可用的 TCP STUN 服务器，
-     * 可在「STUN 服务器维护」中登记（tcp_support）获得精确映射。
+     * <p>
+     * 列表顺序为电信 CGNAT 实测可达优先（裸 STUN 消息格式，2026-08 实测）：80/443 出站不被拦截；
+     * 3478/TCP 出站被本类运营商封锁，仅作其他网络兜底。实测部分运营商 CGNAT 封锁 3478/TCP 出站，
+     * 本列表全不可用时自动回退「端口保留模式」（出站连 {@link #KEEPALIVE_TCP_ENDPOINTS} 建立并保活
+     * CGNAT 映射，展示端口取同本地端口的 UDP STUN 映射，不保证可入站）；若自建/发现可用的
+     * TCP STUN 服务器，可在「STUN 服务器维护」中登记（tcp_support）获得精确映射。
      */
     public static final String[][] TCP_STUN_SERVERS = {
-            {"stun.antisip.com", "3478"},
+            {"global.turn.twilio.com", "443"},
+            {"global.turn.twilio.com", "80"},
             {"stun.nextcloud.com", "443"},
+            {"fwa.lifesizecloud.com", "443"},
+            {"stun.telnyx.com", "3478"},
+            {"stun.sonetel.com", "3478"},
+            {"stun.radiojar.com", "3478"},
+            {"stun.voip.blackberry.com", "3478"},
+            {"stun.antisip.com", "3478"},
             {"stun.nextcloud.com", "3478"},
             {"turn.cloudflare.com", "3478"},
             {"stun.freeswitch.org", "3478"},
@@ -60,8 +69,8 @@ public final class StunClient {
     /**
      * 公共出站连接端点（host:port）：无可用 STUN-over-TCP 服务器时的 TCP 穿透兜底。
      * 从本地端口出站连接端点即可在运营商 CGNAT 上建立 TCP 映射，出站长连接存活期间
-     * 映射不回收（死亡时由调用方轮换新建连接维持）。外部映射端口由调用方取同本地端口
-     * 的 UDP STUN 映射组装展示（实测本类运营商 CGNAT 对同本地端口的 TCP/UDP 分配相同外部端口）。
+     * 映射不回收（死亡时由调用方轮换新建连接维持）。外部映射端口无法直接探测，由调用方取同本地端口
+     * 的 UDP STUN 映射尽力估计展示（实测同本地端口 TCP/UDP 外部端口并不相同，入站不保证可达）。
      * <p>
      * <b>端点必须是非 DNS 端口的透传服务</b>（qq.com:443/80 等，与 Lucky 的 TCP 通道保活
      * 服务器同路）：实测运营商 CGNAT 对 53/TCP 做透明拦截——连接能建立但终结在 CGNAT 上
@@ -237,34 +246,60 @@ public final class StunClient {
     }
 
     /**
-     * STUN-over-TCP 绑定交互（RFC 5389 §7.1/§7.2.2）：发送 Binding 请求并解析响应返回映射地址。
+     * STUN-over-TCP 绑定交互（RFC 5389 §7.1）：发送 Binding 请求并解析响应返回映射地址。
      * 直接读底层流不做缓冲保留，同一连接上可反复调用（长连接保活）。
+     * <p>
+     * <b>请求帧格式先裸后帧</b>：实测 Twilio/Telnyx/Sonetel/nextcloud 等公共 STUN/TCP 服务器
+     * 只接受裸 STUN 消息（与 Natter 一致，不带帧头），按 RFC §7.2.2 加 2 字节长度帧头时静默丢弃；
+     * coturn 等标准服务器两者兼容，故先发裸消息，无响应再按 RFC 加帧头重试。响应解析兼容两种格式。
      */
     private static String exchangeTcpBinding(Socket s, int timeoutMs) throws Exception {
         s.setSoTimeout(timeoutMs);
+        String mapped;
+        try {
+            mapped = tcpBindingOnce(s, timeoutMs / 2, false);
+        } catch (java.net.SocketTimeoutException e) {
+            mapped = null; // 裸消息无响应（服务器静默丢弃），改用帧格式重试；连接本身仍存活
+        }
+        if (mapped != null) return mapped;
+        try {
+            return tcpBindingOnce(s, timeoutMs / 2, true);
+        } catch (java.net.SocketTimeoutException e) {
+            return null; // 两种帧格式均无响应：服务器不支持 STUN/TCP，由调用方换候选
+        }
+    }
+
+    /** 单次绑定交互；framed 为 true 时按 RFC 5389 §7.2.2 写 2 字节长度帧头，否则发裸消息 */
+    private static String tcpBindingOnce(Socket s, int timeoutMs, boolean framed) throws Exception {
+        s.setSoTimeout(Math.max(timeoutMs, 500));
         byte[] tid = new byte[12];
         RANDOM.nextBytes(tid);
         byte[] req = buildRequest(tid, false);
         OutputStream out = s.getOutputStream();
-        // RFC 5389 §7.2.2：TCP 传输时每条 STUN 消息前必须写 2 字节长度帧头（值为消息体字节数），
-        // 缺失时 coturn 等标准服务器无法解析请求；读数时两者兼容（个别实现不回帧头按裸消息解析）
-        out.write((req.length >>> 8) & 0xFF);
-        out.write(req.length & 0xFF);
+        if (framed) {
+            out.write((req.length >>> 8) & 0xFF);
+            out.write(req.length & 0xFF);
+        }
         out.write(req);
         out.flush();
         InputStream in = s.getInputStream();
-        byte[] b = in.readNBytes(22);
-        if (b.length < 22) return null;
+        // 先读 20 字节消息头判定帧格式（多读会把属性首字节混入头部缓冲，后续读数错位导致解析失败）
+        byte[] b = in.readNBytes(20);
+        if (b.length < 20) return null;
         byte[] head;
         int msgLen;
-        if (readU16(b, 2) == MSG_BINDING_RESPONSE && readU32(b, 6) == MAGIC_COOKIE) {
-            int frame = readU16(b, 0);
-            if (frame < 20 || frame > 65535 || (frame - 20) % 4 != 0 || readU16(b, 4) != frame - 20) return null;
-            head = Arrays.copyOfRange(b, 2, 22);
+        if (readU16(b, 0) == MSG_BINDING_RESPONSE && readU32(b, 4) == MAGIC_COOKIE) {
+            head = b; // 裸消息（Natter 式，多数公共 STUN/TCP 服务器只接受该格式）
             msgLen = readU16(head, 2);
-        } else if (readU16(b, 0) == MSG_BINDING_RESPONSE && readU32(b, 4) == MAGIC_COOKIE) {
-            head = Arrays.copyOfRange(b, 0, 20);
-            msgLen = readU16(head, 2);
+        } else if (readU16(b, 2) == MSG_BINDING_RESPONSE && readU32(b, 6) == MAGIC_COOKIE) {
+            int frame = readU16(b, 0); // RFC 5389 §7.2.2：2 字节长度帧头 + 消息体，帧值即消息长度
+            if (frame < 20 || (frame - 20) % 4 != 0) return null;
+            byte[] rest = in.readNBytes(2); // 首次读数只含帧头 + 18 字节消息头，补齐末尾 2 字节事务 ID
+            if (rest.length < 2) return null;
+            head = new byte[20];
+            System.arraycopy(b, 2, head, 0, 18);
+            System.arraycopy(rest, 0, head, 18, 2);
+            msgLen = frame;
         } else {
             return null;
         }

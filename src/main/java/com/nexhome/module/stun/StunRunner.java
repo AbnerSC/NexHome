@@ -29,20 +29,20 @@ import java.util.concurrent.ScheduledFuture;
  * <ol>
  *   <li>路由器 WAN 口为公网：UPnP 端口映射即权威入站通道（外网端口=本地端口），跳过出站探测</li>
  *   <li>存在可用 STUN-over-TCP 服务器：从本地端口出站探测取得<b>精确</b>的 TCP 映射地址</li>
- *   <li>端口保留模式（兜底，公共 TCP STUN 服务稀缺的现实下与 Lucky 等工具同路）：
+ *   <li>端口保留模式（兜底，全部 STUN/TCP 服务器不可用时的最后手段）：
  *       从本地端口出站连接公共透传端点（非 DNS 端口：53/TCP 被运营商 CGNAT 透明拦截，
  *       映射终结在 CGNAT 不接受入站）在运营商 CGNAT 上建立 TCP 映射，
  *       连接上不做应用层交互，周期检测链路存活、死亡即轮换新建连接维持映射；
- *       外部映射端口取同本地端口的 UDP STUN 映射（本类 CGNAT 对同一本地端口
- *       TCP/UDP 分配相同外部端口，Lucky 同路实证；请用外部设备验证一次）</li>
+ *       外部映射端口无法探测（实测同本地端口的 TCP/UDP 出站外部端口并不相同，
+ *       展示取同端口 UDP STUN 映射仅为尽力而为的估计，入站不保证可达）</li>
  * </ol>
  * 出站保活长连接与本地监听共用同一端口（Linux SO_REUSEADDR 允许已连接 socket 与 LISTEN socket
  * 共存）：长连接维持沿途全部 NAT 的映射不回收，外网连入由监听 accept 后管道化转发到目标服务。
  * 配置了「对端公网地址」时额外周期性从同端口主动向对端打洞（双端 NAT 建立过滤条目）。
  * <p>
  * <b>地址权威性</b>：UDP 任务与 STUN/TCP 精确映射展示真实探测的映射地址；端口保留模式展示
- * 「UDP STUN 映射地址（同本地端口）」——实测本类运营商 CGNAT 对同一本地端口的 TCP/UDP
- * 出站分配相同的外部映射端口（Lucky 同路实证：其展示的公网端口即非本地端口，外网按该端口可连入），
+ * 「UDP STUN 映射地址（同本地端口）」——实测本类运营商 CGNAT 对同一本地端口的 TCP/UDP 出站
+ * 分配的外部端口并不相同，该展示仅为无 TCP 探测能力时的尽力而为估计，入站不保证可达；
  * 优于「外部端口=本地端口」假设（该 CGNAT 会改写端口，本地端口拼装在公网不存在）；
  * UDP STUN 暂无响应时退回「出口 IP + 本地端口」占位。UPnP 仅打通家用路由器一层（对未配 DMZ 的环境有价值），运营商
  * CGNAT 层的映射端口不受 UPnP 控制，因此 WAN 非公网时绝不用 UPnP 外部端口拼装展示地址
@@ -101,7 +101,7 @@ final class StunRunner {
     private volatile long lastPeerInboundAt;
     /** 最近一次收到 STUN 绑定响应（映射刷新）的时间戳，用于判断保活是否失效 */
     private volatile long lastMappedAt;
-    /** 最近一次 UDP STUN 映射地址（ip:port）：端口保留模式据此组装展示地址（同端口 TCP/UDP 映射端口相同） */
+    /** 最近一次 UDP STUN 映射地址（ip:port）：端口保留模式据此组装展示地址（尽力而为估计，入站不保证可达） */
     private volatile String udpMappedAddr;
     /** 路由器 WAN 口为公网且 UPnP 映射成功：UPnP 端口映射即权威入站通道，无需 STUN/TCP 出站探测与刷新 */
     private volatile boolean upnpPublicWan;
@@ -375,7 +375,7 @@ final class StunRunner {
             }
         }
         // 先固定本地端口（bind_port=0 时取随机端口）：出站链路与监听共用同一本地端口，
-        // 端口保留模式展示端口取同本地端口的 UDP STUN 映射，固定本地端口可使外部展示端口稳定
+        // 固定本地端口使外网映射端口在链路重建间保持稳定
         int listenPort = bindPort;
         if (listenPort <= 0) {
             try (ServerSocket tmp = new ServerSocket(0)) {
@@ -422,7 +422,7 @@ final class StunRunner {
 
     /**
      * TCP 保活链路就绪回调（{@link TcpPunch} 建立/重建链路或映射地址变化时调用）：
-     * STUN 精确模式直接登记映射地址；端口保留模式优先按同端口 UDP STUN 映射组装展示地址，
+     * STUN 精确模式直接登记映射地址；端口保留模式优先按同端口 UDP STUN 映射组装展示地址（尽力而为），
      * UDP 映射暂无时退回「出口 IP + 本地端口」占位（待 UDP STUN 响应后由 updateUdpMapped 修正）。
      */
     private void onTcpLinkReady(TcpPunch.Link link) {
@@ -438,8 +438,8 @@ final class StunRunner {
         if (presumed != null) {
             updateTcpMapped(presumed);
             Logs.info(Logs.STUN, "任务[" + name + "] TCP出站链路已建立(出站端点 " + link.endpoint()
-                    + "，端口保留模式): " + presumed + "；映射端口取自同端口UDP STUN探测"
-                    + "(本类CGNAT对同一本地端口TCP/UDP分配相同外部端口)，请用外部设备验证一次");
+                    + "，端口保留模式): " + presumed + "；展示端口取自同端口UDP STUN探测"
+                    + "(仅尽力而为估计，外网入站不保证可达，请用外部设备验证)");
         } else {
             Logs.info(Logs.STUN, "任务[" + name + "] TCP出站链路已建立(出站端点 " + link.endpoint()
                     + "，端口保留模式)：暂无UDP STUN映射，待响应后组装展示地址");
@@ -447,8 +447,8 @@ final class StunRunner {
     }
 
     /**
-     * 端口保留模式展示地址：优先「UDP STUN 出口 IP + UDP 映射端口」（同本地端口的 TCP/UDP 出站
-     * 在本类运营商 CGNAT 上分配相同外部端口，Lucky 同路实证），UDP 映射暂无时退回「出口 IP + 本地端口」。
+     * 端口保留模式展示地址：优先「UDP STUN 出口 IP + UDP 映射端口」，UDP 映射暂无时退回「出口 IP + 本地端口」。
+     * 注意：实测同本地端口的 TCP/UDP 出站外部端口并不相同，该地址仅为无 TCP 探测能力时的尽力估计，入站不保证可达。
      */
     private String presumedAddr() {
         String udp = udpMappedAddr;
@@ -729,9 +729,9 @@ final class StunRunner {
     /**
      * UDP STUN 映射刷新（启动探测/保活响应）。
      * TCP 模式下权威外网地址以 TCP 出站映射为准（STUN/TCP 精确映射或端口保留地址），UDP 映射端口
-     * 与其可能不同（CGNAT 通常改写 UDP 外网端口）：若用 UDP 映射覆盖展示地址，穿透端口会在两个值
-     * 之间来回跳变。但端口保留模式例外：同本地端口的 TCP/UDP 出站在本类运营商 CGNAT 上分配相同
-     * 外部端口，UDP 映射恰是展示地址的端口来源，每次刷新持续修正（链路重建窗口内保留最后已知地址）。
+     * 与其通常不同（实测同本地端口 TCP/UDP 外部端口并不相同）：若用 UDP 映射覆盖展示地址，穿透端口会在两个值
+     * 之间来回跳变。但端口保留模式例外：无 TCP 探测能力时只能以同端口 UDP 映射尽力估计展示地址，
+     * 每次刷新持续修正（链路重建窗口内保留最后已知地址）。
      */
     private void updateUdpMapped(String mapped, String natType) {
         if (mapped != null && !mapped.isBlank()) udpMappedAddr = mapped;
@@ -887,7 +887,7 @@ final class StunRunner {
     /** TCP 自测通过时的结果文案（区分映射来源，便于用户判断验证方式） */
     private String okTcp(long costMs, boolean rebuilt) {
         String mode = tcpMappedViaUpnp ? "UPnP公网直通"
-                : (punch != null && punch.addrPresumed() ? "端口保留模式(映射端口取自同端口UDP STUN，请外部设备验证一次)"
+                : (punch != null && punch.addrPresumed() ? "端口保留模式(展示端口取自同端口UDP STUN估计，入站不保证可达，请外部设备验证)"
                 : "STUN精确映射");
         return "OK(TCP映射保活存活" + (rebuilt ? "，链路已重建" : "") + "[" + mode + "]，" + costMs
                 + "ms；运营商CGNAT普遍无NAT回流，端到端可达请用外部设备验证)";

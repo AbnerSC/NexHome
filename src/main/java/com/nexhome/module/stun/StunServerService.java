@@ -37,8 +37,8 @@ public final class StunServerService {
     }
 
     /** 常用公共 STUN 服务器（name, host, port, tcp_support），按展示顺序播种。
-     *  tcp_support 为运行期探测依据：境外实测支持 TCP 的标 1；境内候选标 1 供 TCP 任务优先探测，
-     *  部分运营商 CGNAT 封锁 3478/TCP 出站时探测自动跳过，不影响其余流程 */
+     *  tcp_support 为运行期探测依据：实测支持 TCP 的标 1（Twilio TURN 在电信 CGNAT 下 443/80 实测可达）；
+     *  部分运营商 CGNAT 封锁 3478/TCP 出站，此类候选探测自动跳过，不影响其余流程 */
     private static final String[][] SEED_SERVERS = {
             {"谷歌", "stun.l.google.com", "19302", "0"},
             {"Cloudflare", "stun.cloudflare.com", "3478", "0"},
@@ -46,20 +46,24 @@ public final class StunServerService {
             {"芒果TV(境内)", "stun.hitv.com", "3478", "1"},
             {"哔哩哔哩(境内)", "stun.chat.bilibili.com", "3478", "1"},
             {"Twilio", "global.stun.twilio.com", "3478", "0"},
+            {"TwilioTURN(TCP)", "global.turn.twilio.com", "443", "1"},
+            {"TwilioTURN(TCP-80)", "global.turn.twilio.com", "80", "1"},
             {"VoipStunt", "stun.voipstunt.com", "3478", "0"},
             {"Antisip(TCP)", "stun.antisip.com", "3478", "1"},
-            {"Nextcloud(TCP)", "stun.nextcloud.com", "3478", "1"},
+            {"Nextcloud(TCP)", "stun.nextcloud.com", "443", "1"},
             {"CloudflareTURN(TCP)", "turn.cloudflare.com", "3478", "1"},
             {"FreeSwitch(TCP)", "stun.freeswitch.org", "3478", "1"},
     };
 
-    /** 旧版本内置默认服务器（已停服/不支持TCP），升级时自动清除对应默认行 */
+    /** 旧版本内置默认服务器（已停服/不支持TCP/被实测取代），升级时自动清除对应默认行 */
     private static final String[][] LEGACY_SEED_ROWS = {
             {"小米", "stun.miwifi.com", "3478", "0"},
             {"谷歌", "stun.l.google.com", "19302", "0"},
             {"Antisip", "stun.antisip.com", "3478", "1"},
             {"STUNProtocol", "stun.stunprotocol.org", "3478", "1"},
             {"Sipgate", "stun.sipgate.net", "3478", "1"},
+            // Nextcloud TCP 实测仅 443 可用（3478 被本类运营商封锁），旧种子行清除后由新种子 443 行补入
+            {"Nextcloud(TCP)", "stun.nextcloud.com", "3478", "1"},
     };
 
     /**
