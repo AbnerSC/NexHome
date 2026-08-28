@@ -20,16 +20,18 @@ import java.util.function.Consumer;
  *   <li>STUN-over-TCP 服务器（配置的 + 维护列表 + 内置候选）：取得<b>精确</b>映射地址</li>
  *   <li>公共出站端点（端口保留模式兜底）：出站长连接维持运营商 CGNAT 上的 TCP 映射，
  *       连接上不做应用层交互（TCP 握手完成即双向链路验证；域名解析按其设计走 UDP 53，
- *       不占用 TCP 连接）；外网映射端口由运行器取同本地端口的 UDP STUN 映射组装展示，
+ *       不占用 TCP 连接）。端点须为非 DNS 端口的透传服务：实测运营商 CGNAT 对 53/TCP
+ *       透明拦截（连接能建立但终结在 CGNAT、查询无响应），此类映射不接受入站；
+ *       外网映射端口由运行器取同本地端口的 UDP STUN 映射组装展示，
  *       若自建可用的 TCP STUN 服务器可获得精确映射（公共 TCP STUN 服务稀缺，与 Lucky 等工具同路）</li>
  * </ol>
  * 链路死亡时优先复用预绑定的备用出站 socket（同端口、未连接，监听开启前预绑）立即重连，
  * 实现<b>零监听中断</b>的链路重建；备用耗尽才由调用方「弹跳」（关监听→重建→重开监听）。
- * STUN/TCP 候选整体失败后退避 300 秒（期间只用 DNS 端点），避免每个保活周期刷屏。
+ * STUN/TCP 候选整体失败后退避 300 秒（期间只用公共出站端点），避免每个保活周期刷屏。
  */
 final class TcpPunch {
 
-    /** 一条保活链路：连接 + 模式 + 端点 + 精确映射地址（dns 端口保留模式为 null） */
+    /** 一条保活链路：连接 + 模式 + 端点 + 精确映射地址（端口保留模式为 null） */
     record Link(Socket socket, boolean viaStun, String endpoint, String mapped) {
         Link withMapped(String m) {
             return new Link(socket, viaStun, endpoint, m);
@@ -49,7 +51,7 @@ final class TcpPunch {
     private volatile String tcpStunServer;
     /** 最近成功的出站连接端点（host:port），重建链路时优先复用 */
     private volatile String outEndpoint;
-    /** STUN/TCP 候选最近一次整体失败时刻：退避期内跳过 STUN 探测直接用 DNS 端点 */
+    /** STUN/TCP 候选最近一次整体失败时刻：退避期内跳过 STUN 探测直接用公共出站端点 */
     private volatile long probeFailAt;
     /** 链路死亡已告警标志（避免每个保活周期重复刷屏，重建成功后复位） */
     private volatile boolean downWarned;
@@ -139,7 +141,7 @@ final class TcpPunch {
 
     /**
      * 全新建立出站链路（新 socket，从指定本地端口出站）：依次尝试 STUN/TCP 候选
-     * （allowStun=false 时跳过，用于退避期），全部失败回退 DNS 端点。成功登记为当前链路
+     * （allowStun=false 时跳过，用于退避期），全部失败回退公共出站端点。成功登记为当前链路
      * 并回调 onReady；失败返回 null。本地端口必须尚未被监听占用（LISTEN 存在时无法 bind）。
      */
     synchronized Link establish(int localPort, boolean allowStun) {
@@ -157,7 +159,7 @@ final class TcpPunch {
             if (System.currentTimeMillis() - probeFailAt > 300_000) {
                 // 刚进入新的退避期才告警（含首次）：避免每个保活周期重复刷屏
                 Logs.warn(Logs.STUN, "任务[" + taskName + "] 无可用STUN-over-TCP服务器，回退端口保留模式"
-                        + "(DNS端点出站维持CGNAT映射，展示端口取同端口UDP STUN映射；自建TCP STUN服务器可获得精确映射)");
+                        + "(公共端点出站维持CGNAT映射，展示端口取同端口UDP STUN映射；自建TCP STUN服务器可获得精确映射)");
             }
             probeFailAt = System.currentTimeMillis();
         }
@@ -197,7 +199,7 @@ final class TcpPunch {
             int ci = outEndpoint.lastIndexOf(':');
             list.add(new String[]{outEndpoint.substring(0, ci), outEndpoint.substring(ci + 1)});
         }
-        for (String[] ep : StunClient.DNS_TCP_ENDPOINTS) {
+        for (String[] ep : StunClient.KEEPALIVE_TCP_ENDPOINTS) {
             if (outEndpoint == null || !outEndpoint.equals(ep[0] + ":" + ep[1])) list.add(ep);
         }
         return list;
@@ -214,7 +216,7 @@ final class TcpPunch {
 
     /**
      * 链路死亡后重连：优先消耗预绑定备用 socket（监听不中断），STUN 优先（非退避期且有过成功），
-     * 失败转 DNS 端点；每次尝试恰好消耗一个备用 socket（连接失败的 socket 无法复用），
+     * 失败转公共出站端点；每次尝试恰好消耗一个备用 socket（连接失败的 socket 无法复用），
      * 备用耗尽或全部失败返回 null（由调用方决定弹跳重建）。
      */
     synchronized Link reconnect(int localPort, boolean allowStun) {

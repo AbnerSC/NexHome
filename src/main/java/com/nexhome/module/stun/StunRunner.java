@@ -29,11 +29,12 @@ import java.util.concurrent.ScheduledFuture;
  * <ol>
  *   <li>路由器 WAN 口为公网：UPnP 端口映射即权威入站通道（外网端口=本地端口），跳过出站探测</li>
  *   <li>存在可用 STUN-over-TCP 服务器：从本地端口出站探测取得<b>精确</b>的 TCP 映射地址</li>
- *   <li>端口保留模式（兑底，公共 TCP STUN 服务稀缺的现实下与 Lucky 等工具同路）：
- *       从本地端口出站连接公共 DNS-over-TCP 端点在运营商 CGNAT 上建立 TCP 映射，
+ *   <li>端口保留模式（兜底，公共 TCP STUN 服务稀缺的现实下与 Lucky 等工具同路）：
+ *       从本地端口出站连接公共透传端点（非 DNS 端口：53/TCP 被运营商 CGNAT 透明拦截，
+ *       映射终结在 CGNAT 不接受入站）在运营商 CGNAT 上建立 TCP 映射，
  *       连接上不做应用层交互，周期检测链路存活、死亡即轮换新建连接维持映射；
- *       外部映射端口假定=本地端口（部分运营商 CGNAT 会改写 TCP 端口，属假设值，
- *       请用外部设备验证一次）</li>
+ *       外部映射端口取同本地端口的 UDP STUN 映射（本类 CGNAT 对同一本地端口
+ *       TCP/UDP 分配相同外部端口，Lucky 同路实证；请用外部设备验证一次）</li>
  * </ol>
  * 出站保活长连接与本地监听共用同一端口（Linux SO_REUSEADDR 允许已连接 socket 与 LISTEN socket
  * 共存）：长连接维持沿途全部 NAT 的映射不回收，外网连入由监听 accept 后管道化转发到目标服务。
@@ -94,7 +95,7 @@ final class StunRunner {
     private volatile String upnpWanAddr;
     /** 是否已建立 TCP 方向外网映射（STUN/TCP 精确映射、端口保留出站链路或 UPnP 公网直通），TCP 自测仅在其成立时有意义 */
     private volatile boolean wanTcpReady;
-    /** TCP 出站保活链路管理器（STUN/TCP 精确映射与 DNS 端口保留模式自动选择） */
+    /** TCP 出站保活链路管理器（STUN/TCP 精确映射与端口保留模式自动选择） */
     private TcpPunch punch;
     /** 最近一次真实外网入站连接时刻（排除本机公网回环的自测连接），日志参考 */
     private volatile long lastPeerInboundAt;
@@ -374,7 +375,7 @@ final class StunRunner {
             }
         }
         // 先固定本地端口（bind_port=0 时取随机端口）：出站链路与监听共用同一本地端口，
-        // 端口保留模式下外部映射端口=本地端口，用户配置固定端口时外部地址稳定可记
+        // 端口保留模式展示端口取同本地端口的 UDP STUN 映射，固定本地端口可使外部展示端口稳定
         int listenPort = bindPort;
         if (listenPort <= 0) {
             try (ServerSocket tmp = new ServerSocket(0)) {
@@ -383,15 +384,15 @@ final class StunRunner {
         }
         // 先出站探测，再监听：① 出站连接在沿途全部 NAT（含运营商 CGNAT）上建立真实 TCP 映射，
         // 返回地址即权威外网地址；② Linux 下监听存在后无法再绑定同端口出站（LISTEN 占用），
-        // 探测与备用 socket 都必须先行（链路日后重连优先用备用 socket，关监听弹跳仅为兑底）
+        // 探测与备用 socket 都必须先行（链路日后重连优先用备用 socket，关监听弹跳仅为兜底）
         if (!skipProbe) {
             TcpPunch.Link link = punch.establish(listenPort, true);
             if (link != null) {
                 // 预绑定备用出站 socket：链路断开时无需关监听即可重连（零入站中断）；
-                // DNS 单事务端点每保活周期消耗一个，大池量拉长弹跳间隔
+                // 端点空闲超时死亡轮换时每次消耗一个，大池量拉长弹跳间隔
                 punch.openSpares(listenPort, TCP_SPARES);
             } else {
-                Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路建立失败(STUN与DNS端点均不可达)，"
+                Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路建立失败(STUN与公共出站端点均不可达)，"
                         + "TCP映射未建立，巡检将按退避重试；UDP映射照常保活展示");
             }
         }
@@ -502,7 +503,7 @@ final class StunRunner {
      * TCP 映射保活与链路维护：优先在存活长连接上交互（STUN 绑定交互/TCP 存活检测，
      * 监听不中断、映射端口不漂移）；链路死亡时优先消耗预绑定备用 socket 重连（零监听中断），
      * 备用耗尽才「弹跳」重建（关监听→出站→重开监听，窗口约 1-3 秒，入站 SYN 由客户端
-     * TCP 重传自然恢复）。STUN/TCP 候选整体失败后退避 300 秒（期间只用 DNS 端点）。
+     * TCP 重传自然恢复）。STUN/TCP 候选整体失败后退避 300 秒（期间只用公共出站端点）。
      */
     private synchronized void refreshTcpLink() {
         if (!running || tcpServer == null || upnpPublicWan) return;
@@ -532,7 +533,7 @@ final class StunRunner {
                     punch.openSpares(port, TCP_SPARES); // 监听重开前补足备用 socket
                 } else {
                     wanTcpReady = false;
-                    Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路重建失败(STUN与DNS端点均不可达)，"
+                    Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路重建失败(STUN与公共出站端点均不可达)，"
                             + "TCP映射暂缺，巡检将退避重试；UDP映射照常保活");
                 }
             }

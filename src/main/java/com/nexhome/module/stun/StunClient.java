@@ -42,10 +42,10 @@ public final class StunClient {
     private static final SecureRandom RANDOM = new SecureRandom();
 
     /**
-     * 支持 STUN-over-TCP 的公共 STUN 服务器候选（host:port），供配置的服务器仅支持 UDP时兑底。
+     * 支持 STUN-over-TCP 的公共 STUN 服务器候选（host:port），配置的服务器仅支持 UDP 时兜底。
      * TCP 穿透优先借助支持 TCP 的 STUN 服务器出站，才能在运营商 CGNAT 上建立可探测端口的 TCP 映射。
      * 实测部分运营商 CGNAT 封锁 3478/TCP 出站且境内无公共 TCP STUN 服务，本列表全不可用时
-     * 自动回退「端口保留模式」（出站连 {@link #DNS_TCP_ENDPOINTS} 建立并保活 CGNAT 映射，
+     * 自动回退「端口保留模式」（出站连 {@link #KEEPALIVE_TCP_ENDPOINTS} 建立并保活 CGNAT 映射，
      * 展示端口取同本地端口的 UDP STUN 映射）；若自建/发现可用的 TCP STUN 服务器，
      * 可在「STUN 服务器维护」中登记（tcp_support）获得精确映射。
      */
@@ -58,19 +58,24 @@ public final class StunClient {
     };
     
     /**
-     * 公共出站连接端点（host:port）：无可用 STUN-over-TCP 服务器时的 TCP 穿透兑底。
+     * 公共出站连接端点（host:port）：无可用 STUN-over-TCP 服务器时的 TCP 穿透兜底。
      * 从本地端口出站连接端点即可在运营商 CGNAT 上建立 TCP 映射，出站长连接存活期间
      * 映射不回收（死亡时由调用方轮换新建连接维持）。外部映射端口由调用方取同本地端口
-     * 的 UDP STUN 映射组装展示（实测本类运营商 CGNAT 不保留 TCP 源端口）。
-     * 连接上不做任何应用层交互：域名解析按其设计走 UDP 53（由系统解析器承担，
-     * 不占用 TCP 连接），且实测公共 DNS 的 TCP 连接普遍为单事务（一次交互后即被
-     * 服务器关闭），查询无意义；选 DNS 服务器仅因其为最稳定、最普遍可连的公共 TCP 服务。
+     * 的 UDP STUN 映射组装展示（实测本类运营商 CGNAT 对同本地端口的 TCP/UDP 分配相同外部端口）。
+     * <p>
+     * <b>端点必须是非 DNS 端口的透传服务</b>（qq.com:443/80 等，与 Lucky 的 TCP 通道保活
+     * 服务器同路）：实测运营商 CGNAT 对 53/TCP 做透明拦截——连接能建立但终结在 CGNAT 上
+     * （合法 DNS 查询永远无响应），此类映射不接受入站，外网无法主动连入；非 DNS 端口的
+     * 连接真实穿透 CGNAT，映射方可入站。连接上不做任何应用层交互（域名解析按其设计走
+     * UDP 53，由系统解析器承担，不占用 TCP 连接）。DNS 53 端点仅列末尾，供无拦截策略的网络兜底。
      */
-    public static final String[][] DNS_TCP_ENDPOINTS = {
+    public static final String[][] KEEPALIVE_TCP_ENDPOINTS = {
+            {"qq.com", "443"},
+            {"qq.com", "80"},
+            {"www.baidu.com", "443"},
+            {"www.baidu.com", "80"},
             {"223.5.5.5", "53"},
-            {"119.29.29.29", "53"},
-            {"223.5.6.6", "53"},
-            {"114.114.114.114", "53"}
+            {"119.29.29.29", "53"}
     };
 
     /** STUN 探测结果：外网映射地址 + NAT 类型 */
@@ -208,8 +213,9 @@ public final class StunClient {
     /**
      * 公共出站端点连接（端口保留模式兜底）：从指定本地端口向端点建立 TCP 连接，连接建立
      * 即返回——出站连接在沿途全部 NAT（含运营商 CGNAT）上建立映射，TCP 三次握手完成
-     * 本身就是双向链路的验证，连接上不做任何应用层查询（域名解析按其设计走 UDP 53，
-     * 由系统解析器承担；实测公共端点的 TCP 连接普遍为单事务，查询无意义且被部分网络拦截）。
+     * 本身就是双向链路的验证，连接上不做任何应用层交互（域名解析按其设计走 UDP 53，
+     * 由系统解析器承担）。注意端点须为透传服务：53/TCP 等被运营商透明拦截的端口，
+     * 连接终结在 CGNAT 上，建立的映射不接受入站。
      * 调用方持有连接至下一保活周期（映射跟随连接存活），失败携带原因上抛
      * （连接被拒/超时等，供调用方记录端点失效原因）。
      */
