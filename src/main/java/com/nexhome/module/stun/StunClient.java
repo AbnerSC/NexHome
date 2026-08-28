@@ -67,8 +67,7 @@ public final class StunClient {
             {"223.5.5.5", "53"},
             {"119.29.29.29", "53"},
             {"223.5.6.6", "53"},
-            {"1.1.1.1", "53"},
-            {"8.8.8.8", "53"},
+            {"114.114.114.114", "53"}
     };
 
     /** STUN 探测结果：外网映射地址 + NAT 类型 */
@@ -209,14 +208,25 @@ public final class StunClient {
      * {@link #dnsTcpExchange} 维持 CGNAT 映射），失败返回 null。
      */
     public static Socket probeOverDns(String dnsHost, int dnsPort, int localPort, int timeoutMs) {
+        try {
+            return probeOverDnsEx(dnsHost, dnsPort, localPort, timeoutMs);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * {@link #probeOverDns} 的抛异常版本：失败时携带原因上抛（连接被拒/超时/查询无响应等），
+     * 供调用方记录端点失效原因（国内端点被网络策略拦截时定位关键）。
+     */
+    public static Socket probeOverDnsEx(String dnsHost, int dnsPort, int localPort, int timeoutMs) throws Exception {
         Socket s = new Socket();
         try {
             s.setReuseAddress(true);
             s.bind(new InetSocketAddress(Math.max(localPort, 0)));
             s.connect(new InetSocketAddress(InetAddress.getByName(dnsHost), dnsPort), timeoutMs);
             if (!dnsTcpExchange(s, timeoutMs)) {
-                s.close();
-                return null;
+                throw new java.io.IOException("DNS查询无响应(链路被拦截或端点异常)");
             }
             return s;
         } catch (Exception e) {
@@ -225,7 +235,7 @@ public final class StunClient {
             } catch (Exception ignored) {
                 // 探测失败，关闭连接后返回
             }
-            return null;
+            throw e;
         }
     }
 

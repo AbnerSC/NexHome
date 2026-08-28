@@ -8,6 +8,8 @@ import java.net.Socket;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.function.Consumer;
 
@@ -52,6 +54,8 @@ final class TcpPunch {
     private volatile boolean downWarned;
     /** 预绑定的备用出站 socket（同端口、REUSEADDR、未连接）：监听开启前预绑，链路断开时零中断重连 */
     private final ConcurrentLinkedDeque<Socket> spares = new ConcurrentLinkedDeque<>();
+    /** 已告警过的失效 DNS 端点（端点恢复可用后不再重复告警，避免退避重试期间刷屏） */
+    private final Set<String> warnedEndpoints = ConcurrentHashMap.newKeySet();
 
     TcpPunch(String taskName, String stunHost, int stunPort, Consumer<Link> onReady) {
         this.taskName = taskName;
@@ -119,11 +123,20 @@ final class TcpPunch {
             probeFailAt = System.currentTimeMillis();
         }
         for (String[] ep : dnsCandidates()) {
-            Socket s = StunClient.probeOverDns(ep[0], Integer.parseInt(ep[1]), localPort, 2500);
-            if (s != null) {
-                dnsEndpoint = ep[0] + ":" + ep[1];
-                return install(new Link(s, false, dnsEndpoint, null));
+            Socket s;
+            try {
+                s = StunClient.probeOverDnsEx(ep[0], Integer.parseInt(ep[1]), localPort, 2500);
+            } catch (Exception e) {
+                // 端点失效原因告警仅首次：国内端点被网络策略拦截时无法从外部观察，这是定位关键
+                if (warnedEndpoints.add(ep[0] + ":" + ep[1])) {
+                    Logs.warn(Logs.STUN, "任务[" + taskName + "] DNS保活端点不可用("
+                            + ep[0] + ":" + ep[1] + "): " + e.getMessage());
+                }
+                continue;
             }
+            dnsEndpoint = ep[0] + ":" + ep[1];
+            warnedEndpoints.remove(dnsEndpoint); // 端点恢复可用：复位告警以便下次失效再提示
+            return install(new Link(s, false, dnsEndpoint, null));
         }
         return null;
     }

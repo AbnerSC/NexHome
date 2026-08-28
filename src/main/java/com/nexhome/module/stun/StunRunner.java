@@ -703,11 +703,12 @@ final class StunRunner {
      * UDP STUN 映射刷新（启动探测/保活响应）。
      * TCP 模式下权威外网地址以 TCP 出站映射为准（STUN/TCP 精确映射或端口保留地址），UDP 映射端口
      * 与其可能不同（CGNAT 通常改写 UDP 外网端口）：若用 UDP 映射覆盖展示地址，穿透端口会在两个值
-     * 之间来回跳变。因此已有 TCP 映射时只刷新保活时间与 NAT 类型；端口保留模式尚未组装展示地址时
-     * （启动时 STUN 暂无响应），用 UDP 映射的出口 IP + 本地端口补齐。
+     * 之间来回跳变。因此已建立 TCP 映射或已穿透成功（链路重建失败窗口内保留最后已知权威地址，
+     * 避免失败期间被 UDP 映射与 UPnP 拼装地址交替覆盖）时只刷新保活时间与 NAT 类型；端口保留
+     * 模式尚未组装展示地址时（启动时 STUN 暂无响应），用 UDP 映射的出口 IP + 本地端口补齐。
      */
     private void updateUdpMapped(String mapped, String natType) {
-        if (!"UDP".equalsIgnoreCase(protocol) && wanTcpReady) {
+        if (!"UDP".equalsIgnoreCase(protocol) && (wanTcpReady || punched)) {
             if (mapped != null && !mapped.isBlank()) {
                 lastMappedAt = System.currentTimeMillis(); // 保活有效：供巡检判断保活是否失效，但不改动权威地址
                 if (punch != null && punch.addrPresumed()
@@ -795,9 +796,10 @@ final class StunRunner {
      * 不代表穿透失败，因此自测不依赖回环连通性；真实外网可达性请用外部设备（手机流量等）验证。
      */
     private Map<String, Object> verifyChannel() throws Exception {
-        // TCP 弹跳重建会短暂关闭监听（约 1-3 秒），等待其完成再自测，避免撞上窗口误报
+        // TCP 弹跳重建会短暂关闭监听（关监听→全候选出站探测→重开，候选全部超时时可达 20s+），
+        // 等待窗口须覆盖弹跳全程再自测，否则撞上关闭窗口会误报「本地TCP监听已关闭」
         if (tcpRefreshing) {
-            long deadline = System.currentTimeMillis() + 8000;
+            long deadline = System.currentTimeMillis() + 30_000;
             while (tcpRefreshing && System.currentTimeMillis() < deadline) {
                 Thread.sleep(200);
             }
