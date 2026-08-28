@@ -18,10 +18,10 @@ import java.util.function.Consumer;
  * TCP 映射的出站连接，按优先级选择通道：
  * <ol>
  *   <li>STUN-over-TCP 服务器（配置的 + 维护列表 + 内置候选）：取得<b>精确</b>映射地址</li>
- *   <li>公共出站端点（端口保留模式兜底）：周期性出站连接刷新运营商 CGNAT 上的 TCP 映射，
+ *   <li>公共出站端点（端口保留模式兜底）：出站长连接维持运营商 CGNAT 上的 TCP 映射，
  *       连接上不做应用层交互（TCP 握手完成即双向链路验证；域名解析按其设计走 UDP 53，
- *       不占用 TCP 连接），外部映射端口=本地源端口（多数运营商 CGNAT 对 TCP 保留源端口；
- *       公共 TCP STUN 服务稀缺的现实下与 Lucky 等工具同路）</li>
+ *       不占用 TCP 连接）；外网映射端口由运行器取同本地端口的 UDP STUN 映射组装展示，
+ *       若自建可用的 TCP STUN 服务器可获得精确映射（公共 TCP STUN 服务稀缺，与 Lucky 等工具同路）</li>
  * </ol>
  * 链路死亡时优先复用预绑定的备用出站 socket（同端口、未连接，监听开启前预绑）立即重连，
  * 实现<b>零监听中断</b>的链路重建；备用耗尽才由调用方「弹跳」（关监听→重建→重开监听）。
@@ -78,14 +78,14 @@ final class TcpPunch {
     /**
      * 当前链路交互一次（保活 + 存活验证）。
      * STUN 精确模式：长连接上做绑定交互（STUN 服务器支持连接复用），映射地址变化时回调。
-     * 出站端点模式（端口保留）：实测公共端点的 TCP 连接为单事务（一次交互后即被服务器
-     * 关闭），连接上不做任何应用层交互，每次保活消耗一个预绑定备用 socket 同端口新建
-     * 出站连接：连接建立（TCP 握手完成）即运营商 CGNAT 上映射的刷新与双向链路验证
-     * （端口保留模式下外部端口=本地端口，映射地址不变），旧连接 RST 废弃不占四元组；
-     * 静默替换连接（周期性换连接是该模式常态，不打日志避免刷屏），spare 耗尽或端点
-     * 不可达返回 false，由调用方走失败重建流程（弹跳补充 spare）。
+     * 出站端点模式（端口保留）：出站长连接存活即运营商 CGNAT 映射存活——先做 TCP 级存活检测
+     * （短超时读：EOF/复位=死亡，超时=存活），存活直接返回，不消耗备用 socket；检测死亡时
+     * <b>先 RST 废弃旧连接释放四元组</b>，再用预绑定备用 socket 同端口轮换新建出站连接。
+     * 若旧连接未释放就连同一端点，四元组与存活连接完全重复，内核必然拒绝（保活/自测永远失败的根源）；
+     * 端点可能为单事务/短空闲超时类型，死亡轮换是该模式常态（静默完成不打日志），
+     * spare 耗尽或端点全部不可达返回 false，由调用方走失败重建流程（弹跳补充 spare）。
      */
-    boolean keepaliveOnce() {
+    synchronized boolean keepaliveOnce() {
         Link cur = current;
         if (cur == null) return false;
         if (cur.viaStun()) {
@@ -98,15 +98,35 @@ final class TcpPunch {
             }
             return true;
         }
-        Socket spare = spares.poll();
-        if (spare == null) return false;
-        String ep = cur.endpoint();
-        int ci = ep.lastIndexOf(':');
-        Link link = connectOutbound(spare, new String[]{ep.substring(0, ci), ep.substring(ci + 1)});
-        if (link == null) return false;
-        abandon(cur.socket()); // 新连接就绪后再废弃旧连接：失败时保留现场便于排查
-        current = link;
-        return true;
+        if (isAlive(cur.socket())) return true; // 长连接存活：CGNAT 映射存活，无需轮换（映射地址不变）
+        // 链路死亡：先废弃旧连接释放四元组，再轮换新建（当前端点优先，失败依次尝试其余候选）
+        abandon(cur.socket());
+        for (String[] ep : outboundCandidates()) {
+            Socket spare = spares.poll();
+            if (spare == null) return false;
+            Link link = connectOutbound(spare, ep);
+            if (link != null) {
+                current = link;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 出站长连接的 TCP 级存活检测：短超时读，超时（无数据且无复位）=存活，EOF/IO 异常=死亡。
+     * connect-only 模式连接上无应用层流量，常态即「无数据可读」；已关闭的旧连接读立即得 EOF。
+     */
+    private static boolean isAlive(Socket s) {
+        if (s == null || s.isClosed() || !s.isConnected()) return false;
+        try {
+            s.setSoTimeout(500);
+            return s.getInputStream().read() >= 0; // 有数据到达（预期外但证明链路存活）；-1 为 EOF，链路已死
+        } catch (java.net.SocketTimeoutException e) {
+            return true; // 无数据无复位：连接存活，沿途 NAT 映射随之存活
+        } catch (Exception e) {
+            return false; // 复位/IO 异常：链路已死
+        }
     }
 
     /** 链路已死亡时的提示（每个死亡周期只告警一次，重建成功自动复位） */
@@ -137,7 +157,7 @@ final class TcpPunch {
             if (System.currentTimeMillis() - probeFailAt > 300_000) {
                 // 刚进入新的退避期才告警（含首次）：避免每个保活周期重复刷屏
                 Logs.warn(Logs.STUN, "任务[" + taskName + "] 无可用STUN-over-TCP服务器，回退端口保留模式"
-                        + "(DNS端点出站，外部映射端口=本地端口；自建TCP STUN服务器可获得精确映射)");
+                        + "(DNS端点出站维持CGNAT映射，展示端口取同端口UDP STUN映射；自建TCP STUN服务器可获得精确映射)");
             }
             probeFailAt = System.currentTimeMillis();
         }

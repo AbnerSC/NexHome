@@ -36,11 +36,15 @@ public final class StunServerService {
         WebServer.route("DELETE", "/api/stun/servers/{id}", StunServerService::delete);
     }
 
-    /** 实测可用的公共 STUN 服务器（name, host, port, tcp_support），按展示顺序播种 */
+    /** 常用公共 STUN 服务器（name, host, port, tcp_support），按展示顺序播种。
+     *  tcp_support 为运行期探测依据：境外实测支持 TCP 的标 1；境内候选标 1 供 TCP 任务优先探测，
+     *  部分运营商 CGNAT 封锁 3478/TCP 出站时探测自动跳过，不影响其余流程 */
     private static final String[][] SEED_SERVERS = {
             {"谷歌", "stun.l.google.com", "19302", "0"},
             {"Cloudflare", "stun.cloudflare.com", "3478", "0"},
-            {"小米", "stun.miwifi.com", "3478", "0"},
+            {"小米路由器(境内)", "stun.miwifi.com", "3478", "1"},
+            {"芒果TV(境内)", "stun.hitv.com", "3478", "1"},
+            {"哔哩哔哩(境内)", "stun.chat.bilibili.com", "3478", "1"},
             {"Twilio", "global.stun.twilio.com", "3478", "0"},
             {"VoipStunt", "stun.voipstunt.com", "3478", "0"},
             {"Antisip(TCP)", "stun.antisip.com", "3478", "1"},

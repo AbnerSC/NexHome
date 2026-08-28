@@ -44,9 +44,10 @@ public final class StunClient {
     /**
      * 支持 STUN-over-TCP 的公共 STUN 服务器候选（host:port），供配置的服务器仅支持 UDP时兑底。
      * TCP 穿透优先借助支持 TCP 的 STUN 服务器出站，才能在运营商 CGNAT 上建立可探测端口的 TCP 映射。
-     * 公共 TCP STUN 服务随运营调整可能全部失效：全部不可用时自动回退「端口保留模式」
-     * （出站连 {@link #DNS_TCP_ENDPOINTS} 建立并保活 CGNAT 映射，外部映射端口假定=本地源端口）；
-     * 若自建/发现可用的 TCP STUN 服务器，可在「STUN 服务器维护」中登记获得精确映射。
+     * 实测部分运营商 CGNAT 封锁 3478/TCP 出站且境内无公共 TCP STUN 服务，本列表全不可用时
+     * 自动回退「端口保留模式」（出站连 {@link #DNS_TCP_ENDPOINTS} 建立并保活 CGNAT 映射，
+     * 展示端口取同本地端口的 UDP STUN 映射）；若自建/发现可用的 TCP STUN 服务器，
+     * 可在「STUN 服务器维护」中登记（tcp_support）获得精确映射。
      */
     public static final String[][] TCP_STUN_SERVERS = {
             {"stun.antisip.com", "3478"},
@@ -58,8 +59,9 @@ public final class StunClient {
     
     /**
      * 公共出站连接端点（host:port）：无可用 STUN-over-TCP 服务器时的 TCP 穿透兑底。
-     * 从本地端口出站连接端点即可在运营商 CGNAT 上建立 TCP 映射，周期性新建出站连接
-     * 刷新映射（多数运营商 CGNAT 对 TCP 保留源端口，外部映射端口=本地端口）。
+     * 从本地端口出站连接端点即可在运营商 CGNAT 上建立 TCP 映射，出站长连接存活期间
+     * 映射不回收（死亡时由调用方轮换新建连接维持）。外部映射端口由调用方取同本地端口
+     * 的 UDP STUN 映射组装展示（实测本类运营商 CGNAT 不保留 TCP 源端口）。
      * 连接上不做任何应用层交互：域名解析按其设计走 UDP 53（由系统解析器承担，
      * 不占用 TCP 连接），且实测公共 DNS 的 TCP 连接普遍为单事务（一次交互后即被
      * 服务器关闭），查询无意义；选 DNS 服务器仅因其为最稳定、最普遍可连的公共 TCP 服务。
