@@ -1,11 +1,13 @@
 package com.nexhome.module.stun;
 
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Arrays;
 
@@ -41,16 +43,32 @@ public final class StunClient {
     private static final SecureRandom RANDOM = new SecureRandom();
 
     /**
-     * 支持 STUN-over-TCP 的公共 STUN 服务器（host:port），供配置的服务器仅支持 UDP 时兜底。
-     * TCP 穿透必须借助支持 TCP 的 STUN 服务器出站，才能在运营商 CGNAT 上建立 TCP 映射。
-     * （列表经实测验证可用；STUN-over-TCP 服务会随运营调整，失效时可在「STUN 服务器维护」中自定义）
+     * 支持 STUN-over-TCP 的公共 STUN 服务器候选（host:port），供配置的服务器仅支持 UDP时兑底。
+     * TCP 穿透优先借助支持 TCP 的 STUN 服务器出站，才能在运营商 CGNAT 上建立可探测端口的 TCP 映射。
+     * 公共 TCP STUN 服务随运营调整可能全部失效：全部不可用时自动回退「端口保留模式」
+     * （出站连 {@link #DNS_TCP_ENDPOINTS} 建立并保活 CGNAT 映射，外部映射端口假定=本地源端口）；
+     * 若自建/发现可用的 TCP STUN 服务器，可在「STUN 服务器维护」中登记获得精确映射。
      */
     public static final String[][] TCP_STUN_SERVERS = {
             {"stun.antisip.com", "3478"},
-            {"stun.nextcloud.com", "3478"},
             {"stun.nextcloud.com", "443"},
+            {"stun.nextcloud.com", "3478"},
             {"turn.cloudflare.com", "3478"},
             {"stun.freeswitch.org", "3478"},
+    };
+    
+    /**
+     * 公共 DNS-over-TCP 保活端点（host:port）：无可用 STUN-over-TCP 服务器时的 TCP 穿透兑底。
+     * 从本地端口出站连 DNS 服务器即可在运营商 CGNAT 上建立 TCP 映射，周期性 DNS 查询/响应
+     * 双向报文同时充当映射保活与链路存活验证（DNS 为最稳定的公共 TCP 服务，RFC 7766 规定
+     * TCP 传输前缀 2 字节长度）。多数运营商 CGNAT 对 TCP 保留源端口，外部映射端口=本地端口。
+     */
+    public static final String[][] DNS_TCP_ENDPOINTS = {
+            {"223.5.5.5", "53"},
+            {"119.29.29.29", "53"},
+            {"223.5.6.6", "53"},
+            {"1.1.1.1", "53"},
+            {"8.8.8.8", "53"},
     };
 
     /** STUN 探测结果：外网映射地址 + NAT 类型 */
@@ -186,6 +204,79 @@ public final class StunClient {
     }
 
     /**
+     * DNS-over-TCP 保活端点探测（端口保留模式）：从指定本地端口连接 DNS 服务器并完成一次
+     * 查询交互验证链路可用，成功返回保持打开的连接（调用方持有作为保活长连接，周期调用
+     * {@link #dnsTcpExchange} 维持 CGNAT 映射），失败返回 null。
+     */
+    public static Socket probeOverDns(String dnsHost, int dnsPort, int localPort, int timeoutMs) {
+        Socket s = new Socket();
+        try {
+            s.setReuseAddress(true);
+            s.bind(new InetSocketAddress(Math.max(localPort, 0)));
+            s.connect(new InetSocketAddress(InetAddress.getByName(dnsHost), dnsPort), timeoutMs);
+            if (!dnsTcpExchange(s, timeoutMs)) {
+                s.close();
+                return null;
+            }
+            return s;
+        } catch (Exception e) {
+            try {
+                s.close();
+            } catch (Exception ignored) {
+                // 探测失败，关闭连接后返回
+            }
+            return null;
+        }
+    }
+
+    /**
+     * 在已建立的 DNS-over-TCP 长连接上完成一次查询交互：双向报文既维持运营商 NAT 上的映射，
+     * 又验证链路存活；响应事务 ID 匹配且 QR=1 即认为成功（查询 NXDOMAIN 同样有效）。
+     */
+    public static boolean dnsTcpExchange(Socket s, int timeoutMs) {
+        try {
+            s.setSoTimeout(timeoutMs);
+            int id = RANDOM.nextInt() & 0xFFFF;
+            byte[] msg = new byte[12 + 25 + 4]; // header + qname(keepalive.nexhome.local) + QTYPE/QCLASS
+            msg[0] = (byte) (id >>> 8);
+            msg[1] = (byte) id;
+            msg[2] = 0x01; // RD=1
+            msg[5] = 1;    // QDCOUNT=1
+            int p = 12;
+            p = writeName(msg, p, "keepalive");
+            p = writeName(msg, p, "nexhome");
+            p = writeName(msg, p, "local");
+            msg[p++] = 0;  // 根标签结束
+            msg[p++] = 0; msg[p++] = 1; // QTYPE=A
+            msg[p++] = 0; msg[p++] = 1; // QCLASS=IN
+            OutputStream out = s.getOutputStream();
+            out.write((msg.length >>> 8) & 0xFF);
+            out.write(msg.length & 0xFF); // RFC 7766：TCP 传输前缀 2 字节报文长度
+            out.write(msg);
+            out.flush();
+            InputStream in = s.getInputStream();
+            int hi = in.read();
+            int lo = hi < 0 ? -1 : in.read();
+            if (lo < 0) return false;
+            int len = ((hi & 0xFF) << 8) | (lo & 0xFF);
+            if (len < 12) return false;
+            byte[] resp = in.readNBytes(len);
+            return resp.length >= 12 && (resp[0] & 0xFF) == ((id >>> 8) & 0xFF)
+                    && (resp[1] & 0xFF) == (id & 0xFF) && (resp[2] & 0x80) != 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 写入 DNS 域名标签（长度前缀 + ASCII 内容），返回写入后的位置 */
+    private static int writeName(byte[] buf, int pos, String label) {
+        byte[] b = label.getBytes(StandardCharsets.US_ASCII);
+        buf[pos++] = (byte) b.length;
+        System.arraycopy(b, 0, buf, pos, b.length);
+        return pos + b.length;
+    }
+
+    /**
      * STUN-over-TCP 绑定交互（RFC 5389 §7.1/§7.2.2）：发送 Binding 请求并解析响应返回映射地址。
      * 直接读底层流不做缓冲保留，同一连接上可反复调用（长连接保活）。
      */
@@ -193,9 +284,14 @@ public final class StunClient {
         s.setSoTimeout(timeoutMs);
         byte[] tid = new byte[12];
         RANDOM.nextBytes(tid);
-        s.getOutputStream().write(buildRequest(tid, false));
-        // RFC 5389 §7.2.2：TCP 传输时每条 STUN 消息前有 2 字节长度帧头（值为消息体字节数，不含帧头本身）；
-        // 读数时两者兼容：优先按标准帧头解析，个别不发送帧头的实现按裸消息解析
+        byte[] req = buildRequest(tid, false);
+        OutputStream out = s.getOutputStream();
+        // RFC 5389 §7.2.2：TCP 传输时每条 STUN 消息前必须写 2 字节长度帧头（值为消息体字节数），
+        // 缺失时 coturn 等标准服务器无法解析请求；读数时两者兼容（个别实现不回帧头按裸消息解析）
+        out.write((req.length >>> 8) & 0xFF);
+        out.write(req.length & 0xFF);
+        out.write(req);
+        out.flush();
         InputStream in = s.getInputStream();
         byte[] b = in.readNBytes(22);
         if (b.length < 22) return null;
