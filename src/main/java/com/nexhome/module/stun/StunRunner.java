@@ -54,6 +54,13 @@ import java.util.concurrent.ScheduledFuture;
  */
 final class StunRunner {
 
+    /**
+     * 预绑定备用出站 socket 数量：端口保留模式每保活周期消耗一个 spare 新建出站连接
+     * （连接上不做应用层交互；监听开启后 LISTEN 占用端口无法再补充），60 个 × 10 秒
+     * 保活周期 ≈ 10 分钟才需弹跳一次（关监听重绑补充，窗口秒级），入站监听中断最小化。
+     */
+    private static final int TCP_SPARES = 60;
+
     private final long id;
     private final String name;
     private final String protocol;
@@ -238,9 +245,8 @@ final class StunRunner {
      * 周期保活：周期性刷新 NAT 映射防止超时回收。
      * UDP 模式向配置的与兜底的 STUN 服务器发绑定请求（响应由接收线程解析刷新映射地址）；
      * TCP 模式额外出站刷新运营商 CGNAT 上的 TCP 映射，且交互周期收紧到 ≤10 秒：
-     * 公共 DNS 端点的 TCP 连接空闲超时普遍很短（实测 114.114.114.114 约 20 秒即回收
-     * 空闲连接，等距 20 秒的保活首次交互必撞死连接），持续有流量才能让长连接与 CGNAT
-     * 映射同时保活；即使连接仍被杀，配合废弃连接 RST 复位重连，恢复窗口也仅一个周期。
+     * 端口保留模式每周期新建出站连接（连接上不做应用层查询，域名解析始终走 UDP 53），
+     * 周期即 CGNAT 映射的刷新间隔（运营商 TCP 映射超时普遍 ≥60 秒，10 秒刷新非常充裕）。
      */
     private void startKeepalive() {
         boolean tcpMode = !"UDP".equalsIgnoreCase(protocol);
@@ -374,8 +380,9 @@ final class StunRunner {
         if (!skipProbe) {
             TcpPunch.Link link = punch.establish(listenPort, true);
             if (link != null) {
-                // 预绑定备用出站 socket：链路断开时无需关监听即可重连（零入站中断）
-                punch.openSpares(listenPort, 2);
+                // 预绑定备用出站 socket：链路断开时无需关监听即可重连（零入站中断）；
+                // DNS 单事务端点每保活周期消耗一个，大池量拉长弹跳间隔
+                punch.openSpares(listenPort, TCP_SPARES);
             } else {
                 Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路建立失败(STUN与DNS端点均不可达)，"
                         + "TCP映射未建立，巡检将按退避重试；UDP映射照常保活展示");
@@ -423,11 +430,11 @@ final class StunRunner {
                 : (udpSocket != null ? udpSocket.getLocalPort() : 0);
         if (exitIp != null && localPort > 0) {
             updateTcpMapped(exitIp + ":" + localPort);
-            Logs.info(Logs.STUN, "任务[" + name + "] TCP出站链路已建立(DNS端点 " + link.endpoint()
+            Logs.info(Logs.STUN, "任务[" + name + "] TCP出站链路已建立(出站端点 " + link.endpoint()
                     + "，端口保留模式): " + exitIp + ":" + localPort
                     + "；多数运营商CGNAT对TCP保留源端口(外部映射端口=本地端口)，请用外部设备验证一次");
         } else {
-            Logs.info(Logs.STUN, "任务[" + name + "] TCP出站链路已建立(DNS端点 " + link.endpoint()
+            Logs.info(Logs.STUN, "任务[" + name + "] TCP出站链路已建立(出站端点 " + link.endpoint()
                     + "，端口保留模式)：暂无出口IP，待STUN响应后组装展示地址");
         }
     }
@@ -500,7 +507,7 @@ final class StunRunner {
                     Thread.currentThread().interrupt();
                 }
                 if (punch.establish(port, punch.allowStunNow()) != null) {
-                    punch.openSpares(port, 2); // 监听重开前补足备用 socket
+                    punch.openSpares(port, TCP_SPARES); // 监听重开前补足备用 socket
                 } else {
                     wanTcpReady = false;
                     Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路重建失败(STUN与DNS端点均不可达)，"

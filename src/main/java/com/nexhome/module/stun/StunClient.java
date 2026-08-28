@@ -7,7 +7,6 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Arrays;
 
@@ -58,10 +57,12 @@ public final class StunClient {
     };
     
     /**
-     * 公共 DNS-over-TCP 保活端点（host:port）：无可用 STUN-over-TCP 服务器时的 TCP 穿透兑底。
-     * 从本地端口出站连 DNS 服务器即可在运营商 CGNAT 上建立 TCP 映射，周期性 DNS 查询/响应
-     * 双向报文同时充当映射保活与链路存活验证（DNS 为最稳定的公共 TCP 服务，RFC 7766 规定
-     * TCP 传输前缀 2 字节长度）。多数运营商 CGNAT 对 TCP 保留源端口，外部映射端口=本地端口。
+     * 公共出站连接端点（host:port）：无可用 STUN-over-TCP 服务器时的 TCP 穿透兑底。
+     * 从本地端口出站连接端点即可在运营商 CGNAT 上建立 TCP 映射，周期性新建出站连接
+     * 刷新映射（多数运营商 CGNAT 对 TCP 保留源端口，外部映射端口=本地端口）。
+     * 连接上不做任何应用层交互：域名解析按其设计走 UDP 53（由系统解析器承担，
+     * 不占用 TCP 连接），且实测公共 DNS 的 TCP 连接普遍为单事务（一次交互后即被
+     * 服务器关闭），查询无意义；选 DNS 服务器仅因其为最稳定、最普遍可连的公共 TCP 服务。
      */
     public static final String[][] DNS_TCP_ENDPOINTS = {
             {"223.5.5.5", "53"},
@@ -203,89 +204,28 @@ public final class StunClient {
     }
 
     /**
-     * DNS-over-TCP 保活端点探测（端口保留模式）：从指定本地端口连接 DNS 服务器并完成一次
-     * 查询交互验证链路可用，成功返回保持打开的连接（调用方持有作为保活长连接，周期调用
-     * {@link #dnsTcpExchange} 维持 CGNAT 映射），失败返回 null。
+     * 公共出站端点连接（端口保留模式兜底）：从指定本地端口向端点建立 TCP 连接，连接建立
+     * 即返回——出站连接在沿途全部 NAT（含运营商 CGNAT）上建立映射，TCP 三次握手完成
+     * 本身就是双向链路的验证，连接上不做任何应用层查询（域名解析按其设计走 UDP 53，
+     * 由系统解析器承担；实测公共端点的 TCP 连接普遍为单事务，查询无意义且被部分网络拦截）。
+     * 调用方持有连接至下一保活周期（映射跟随连接存活），失败携带原因上抛
+     * （连接被拒/超时等，供调用方记录端点失效原因）。
      */
-    public static Socket probeOverDns(String dnsHost, int dnsPort, int localPort, int timeoutMs) {
-        try {
-            return probeOverDnsEx(dnsHost, dnsPort, localPort, timeoutMs);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /**
-     * {@link #probeOverDns} 的抛异常版本：失败时携带原因上抛（连接被拒/超时/查询无响应等），
-     * 供调用方记录端点失效原因（国内端点被网络策略拦截时定位关键）。
-     */
-    public static Socket probeOverDnsEx(String dnsHost, int dnsPort, int localPort, int timeoutMs) throws Exception {
+    public static Socket connectOutboundEx(String host, int port, int localPort, int timeoutMs) throws Exception {
         Socket s = new Socket();
         try {
             s.setReuseAddress(true);
             s.bind(new InetSocketAddress(Math.max(localPort, 0)));
-            s.connect(new InetSocketAddress(InetAddress.getByName(dnsHost), dnsPort), timeoutMs);
-            if (!dnsTcpExchange(s, timeoutMs)) {
-                throw new java.io.IOException("DNS查询无响应(链路被拦截或端点异常)");
-            }
+            s.connect(new InetSocketAddress(InetAddress.getByName(host), port), timeoutMs);
             return s;
         } catch (Exception e) {
             try {
                 s.close();
             } catch (Exception ignored) {
-                // 探测失败，关闭连接后返回
+                // 连接失败，关闭 socket 后抛出
             }
             throw e;
         }
-    }
-
-    /**
-     * 在已建立的 DNS-over-TCP 长连接上完成一次查询交互：双向报文既维持运营商 NAT 上的映射，
-     * 又验证链路存活；响应事务 ID 匹配且 QR=1 即认为成功。查询域用真实存在的热门域名
-     * （各公共 DNS 必有缓存，响应快且稳定）；不要用 .local 等保留 TLD——实测部分公共
-     * DNS（如 223.5.5.5/119.29.29.29）对其 TCP 查询静默不响应，会被误判为链路失效。
-     */
-    public static boolean dnsTcpExchange(Socket s, int timeoutMs) {
-        try {
-            s.setSoTimeout(timeoutMs);
-            int id = RANDOM.nextInt() & 0xFFFF;
-            byte[] msg = new byte[12 + 12 + 4]; // header + qname(www.qq.com 含根标签) + QTYPE/QCLASS
-            msg[0] = (byte) (id >>> 8);
-            msg[1] = (byte) id;
-            msg[2] = 0x01; // RD=1
-            msg[5] = 1;    // QDCOUNT=1
-            int p = 12;
-            p = writeName(msg, p, "www");
-            p = writeName(msg, p, "qq");
-            p = writeName(msg, p, "com");
-            msg[p++] = 0;  // 根标签结束
-            msg[p++] = 0; msg[p++] = 1; // QTYPE=A
-            msg[p++] = 0; msg[p++] = 1; // QCLASS=IN
-            OutputStream out = s.getOutputStream();
-            out.write((msg.length >>> 8) & 0xFF);
-            out.write(msg.length & 0xFF); // RFC 7766：TCP 传输前缀 2 字节报文长度
-            out.write(msg);
-            out.flush();
-            InputStream in = s.getInputStream();
-            int hi = in.read();
-            int lo = hi < 0 ? -1 : in.read();
-            if (lo < 0) return false;
-            int len = ((hi & 0xFF) << 8) | (lo & 0xFF);
-            if (len < 12) return false;
-            byte[] resp = in.readNBytes(len);
-            return resp.length >= 12 && (resp[0] & 0xFF) == ((id >>> 8) & 0xFF)
-                    && (resp[1] & 0xFF) == (id & 0xFF) && (resp[2] & 0x80) != 0;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    /** 写入 DNS 域名标签（长度前缀 + ASCII 内容），返回写入后的位置 */
-    private static int writeName(byte[] buf, int pos, String label) {
-        byte[] b = label.getBytes(StandardCharsets.US_ASCII);
-        buf[pos++] = (byte) b.length;
-        System.arraycopy(b, 0, buf, pos, b.length);
-        return pos + b.length;
     }
 
     /**
