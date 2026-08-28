@@ -181,7 +181,7 @@ public final class StunClient {
      * 出站连接会在沿途全部 NAT（含运营商 CGNAT）上建立真实 TCP 映射，
      * CGNAT 通常会改写外网端口，入站访问需以返回的映射地址为准。
      * 连接不关闭：实测该类映射的入站可达性依赖出站连接的活跃状态，连接关闭后映射很快失效；
-     * 调用方应持有该连接作为保活长连接（周期复用发送绑定请求），不用时自行关闭。
+     * 调用方应持有该连接。注意公共服务器多为单事务型（响应后约 1 秒内断开），周期保活需按同本地端口轮换新建连接；不用时调用方负责关闭。
      * 服务器不支持 STUN/TCP 或本地端口绑定失败时返回 null。
      */
     public static TcpProbe probeOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
@@ -247,7 +247,9 @@ public final class StunClient {
 
     /**
      * STUN-over-TCP 绑定交互（RFC 5389 §7.1）：发送 Binding 请求并解析响应返回映射地址。
-     * 直接读底层流不做缓冲保留，同一连接上可反复调用（长连接保活）。
+     * 直接读底层流不做缓冲保留，方法本身可在同一连接上反复调用；但实测公共 STUN/TCP 服务器
+     * 多为单事务型（响应后约 1 秒内发 RST/FIN 断开，如 stun.nextcloud.com），长连接复用交互会失败，
+     * 保活须按「同本地端口轮换新建连接」模式进行（见 TcpPunch.rotateStun）。
      * <p>
      * <b>请求帧格式先裸后帧</b>：实测 Twilio/Telnyx/Sonetel/nextcloud 等公共 STUN/TCP 服务器
      * 只接受裸 STUN 消息（与 Natter 一致，不带帧头），按 RFC §7.2.2 加 2 字节长度帧头时静默丢弃；
