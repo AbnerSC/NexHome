@@ -169,7 +169,7 @@ public final class StunService {
     public static void start(long id) throws Exception {
         synchronized (LOCKS.computeIfAbsent(id, k -> new Object())) {
             Map<String, Object> task = mustGet(id);
-            stop(id); // 幂等：先停止旧实例
+            stopLocked(id); // 幂等：先停止旧实例（内联调用避免嵌套加锁，逻辑更直白）
             StunRunner runner = new StunRunner(task);
             runner.start();
             RUNNERS.put(id, runner);
@@ -180,12 +180,17 @@ public final class StunService {
     /** 停止任务（与 {@link #start} 同锁串行，避免停止释放端口与新实例绑定交错） */
     public static void stop(long id) throws SQLException {
         synchronized (LOCKS.computeIfAbsent(id, k -> new Object())) {
-            StunRunner runner = RUNNERS.remove(id);
-            if (runner != null) {
-                runner.stop();
-            }
-            Database.update("UPDATE stun_task SET enabled=0, status='STOPPED' WHERE id=?", id);
+            stopLocked(id);
         }
+    }
+
+    /** 停止本体：调用方必须已持有该任务的 {@link #LOCKS} 锁 */
+    private static void stopLocked(long id) throws SQLException {
+        StunRunner runner = RUNNERS.remove(id);
+        if (runner != null) {
+            runner.stop();
+        }
+        Database.update("UPDATE stun_task SET enabled=0, status='STOPPED' WHERE id=?", id);
     }
 
     /** 关停时停止全部任务并释放路由器 UPnP 映射（防止映射条目残留浪费路由器资源） */

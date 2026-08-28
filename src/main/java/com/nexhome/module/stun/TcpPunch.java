@@ -376,12 +376,17 @@ final class TcpPunch {
         }
     }
 
-    /** 释放全部资源（任务停止时调用；备用 socket 未连接，普通关闭即可） */
-    void closeAll() {
-        closeLink();
+    /** 废弃全部备用 socket：换本地端口重试时旧端口备用已作废，残留会被重连误用而从错误端口出站建映射 */
+    void drainSpares() {
         Socket s;
         while ((s = spares.poll()) != null) {
             closeQuietly(s);
         }
+    }
+
+    /** 释放全部资源（任务停止时调用；备用 socket 未连接，普通关闭即可） */
+    void closeAll() {
+        closeLink();
+        drainSpares();
     }
 }

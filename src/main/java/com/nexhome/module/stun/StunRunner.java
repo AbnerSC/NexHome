@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
 
 /**
@@ -128,11 +130,24 @@ final class StunRunner {
     private volatile Boolean lastExtReachable;
     /** 备用出站 socket 同端口通配绑定容量（-1=未探测）：预绑不得超过该上限，否则顶掉监听开启机会 */
     private volatile int spareCapacity = -1;
+    /** spareCapacity 对应的端口：换端口重试时必须重新探测，误用旧端口缓存会预绑超限顶掉新端口监听 */
+    private volatile int spareCapacityPort = -1;
     /** spareCapacity 探测时刻（结果缓存 2 分钟，避免每次弹跳都重复探测） */
     private volatile long spareCapacityAt;
+    /** 异步公网入站验证是否在执行（防重叠提交） */
+    private volatile boolean extCheckRunning;
     /** 公网入站验证用 HTTP 客户端（第三方探测服务，低频调用） */
     private static final HttpClient EXT_CHECK_HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5)).build();
+    /**
+     * 公网入站验证专用执行线程：第三方 API 响应可达数十秒，绝不能占用全局调度池（与保活/巡检共享 3 线程，
+     * 占用会延迟保活导致 CGNAT 映射超时被回收——穿透静默失效的直接诱因），周期验证异步执行只留上次结论。
+     */
+    private static final ExecutorService EXT_CHECK_EXEC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "stun-ext-check");
+        t.setDaemon(true);
+        return t;
+    });
 
     private volatile boolean running;
     private DatagramSocket udpSocket;
@@ -434,6 +449,7 @@ final class StunRunner {
                 listener = openTcpListener(listenPort);
             } catch (Exception e) {
                 punch.closeLink(); // 释放已建立的出站链路（RST 复位立即释放端口占用）
+                punch.drainSpares(); // 废弃旧端口的备用 socket：残留会被后续重连误用，从错误本地端口出站建映射
                 if (bindPort > 0 || attempts >= 3) throw e; // 固定端口无替代端口/重试耗尽：按原流程报错
                 Logs.warn(Logs.STUN, "任务[" + name + "] 端口" + listenPort + "开启监听失败(被占用)，"
                         + "更换随机端口重试: " + e.getMessage());
@@ -512,7 +528,7 @@ final class StunRunner {
      */
     private int spareCapacity(int port) {
         long now = System.currentTimeMillis();
-        if (spareCapacity >= 0 && now - spareCapacityAt < 120_000) return spareCapacity;
+        if (spareCapacity >= 0 && spareCapacityPort == port && now - spareCapacityAt < 120_000) return spareCapacity;
         List<Socket> probes = new ArrayList<>();
         int n = 0;
         try {
@@ -542,6 +558,7 @@ final class StunRunner {
             }
         }
         spareCapacity = n;
+        spareCapacityPort = port;
         spareCapacityAt = now;
         return n;
     }
@@ -929,23 +946,33 @@ final class StunRunner {
             result = verifyTcpKeepalive();
         }
         // 公网入站真实验证：补上「保活存活 ≠ 外网可主动连入」盲区（本机无 NAT 回流无法自验）。
-        // 仅保活存活时验证；周期自测限冷却避免频繁调用第三方服务，手动自测必验
-        if (result.startsWith("OK") && !"UDP".equalsIgnoreCase(protocol)
-                && (manual || System.currentTimeMillis() - lastExtCheckAt > 300_000)) {
-            lastExtCheckAt = System.currentTimeMillis();
-            String ext = checkExternalInbound(mapped);
-            if (ext != null) {
-                boolean reachable = "OK".equals(ext);
-                if (lastExtReachable == null || lastExtReachable != reachable) {
-                    lastExtReachable = reachable;
-                    if (reachable) {
-                        Logs.info(Logs.STUN, "任务[" + name + "] 公网入站验证通过: 第三方节点真实连接 " + mapped + " 成功");
-                    } else {
-                        Logs.warn(Logs.STUN, "任务[" + name + "] 公网入站验证失败" + ext.substring(4)
-                                + "：保活存活但外网无法连入，请检查上层NAT/运营商策略");
-                    }
+        // 仅保活存活时验证；手动自测同步验证（HTTP 线程不受调度池影响）；周期自测限冷却且必须异步：
+        // 第三方 API 可达数十秒，占用调度池会延迟保活致 CGNAT 映射超时，异步执行只留上次结论。
+        if (result.startsWith("OK") && !"UDP".equalsIgnoreCase(protocol)) {
+            long now = System.currentTimeMillis();
+            if (manual) {
+                lastExtCheckAt = now;
+                String ext = checkExternalInbound(mapped);
+                noteExtVerdict(ext);
+                if (ext != null) {
+                    result += "，公网入站验证" + ("OK".equals(ext) ? "可达" : "不可达" + ext.substring(4));
                 }
-                result += "，公网入站验证" + (reachable ? "可达" : "不可达" + ext.substring(4));
+            } else {
+                if (now - lastExtCheckAt > 300_000 && !extCheckRunning) {
+                    lastExtCheckAt = now;
+                    extCheckRunning = true;
+                    final String target = mapped;
+                    EXT_CHECK_EXEC.submit(() -> {
+                        try {
+                            noteExtVerdict(checkExternalInbound(target));
+                        } finally {
+                            extCheckRunning = false;
+                        }
+                    });
+                }
+                if (lastExtReachable != null) {
+                    result += "，公网入站验证(上次)" + (lastExtReachable ? "可达" : "不可达");
+                }
             }
         }
         String time = Database.now();
@@ -1001,6 +1028,31 @@ final class StunRunner {
                 : "STUN精确映射");
         return "OK(TCP映射保活存活" + (rebuilt ? "，链路已重建" : "") + "[" + mode + "]，" + costMs
                 + "ms；运营商CGNAT普遍无NAT回流，端到端可达以公网入站验证/外部设备为准)";
+    }
+
+    /** 公网入站验证结论处理：状态变化时记日志并缓存（null=第三方服务不可用/未完成，本轮跳过） */
+    private void noteExtVerdict(String ext) {
+        if (ext == null) return;
+        boolean reachable = "OK".equals(ext);
+        if (lastExtReachable == null || lastExtReachable != reachable) {
+            lastExtReachable = reachable;
+            if (reachable) {
+                Logs.info(Logs.STUN, "任务[" + name + "] 公网入站验证通过: 第三方节点真实连接 " + mappedAddr() + " 成功");
+            } else {
+                Logs.warn(Logs.STUN, "任务[" + name + "] 公网入站验证失败" + ext.substring(4)
+                        + "：保活存活但外网无法连入，请检查上层NAT/运营商策略");
+            }
+        }
+    }
+
+    /** 当前登记的外网映射地址（异步验证回调时取最新值记日志） */
+    private String mappedAddr() {
+        try {
+            Map<String, Object> row = Database.queryOne("SELECT mapped_addr FROM stun_task WHERE id=?", id);
+            return row == null ? "" : str(row, "mapped_addr");
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     /**
