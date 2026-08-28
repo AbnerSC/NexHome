@@ -4,6 +4,10 @@ import com.nexhome.core.Database;
 import com.nexhome.core.Logs;
 import com.nexhome.core.Tasks;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
@@ -12,6 +16,11 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -50,8 +59,8 @@ import java.util.concurrent.ScheduledFuture;
  * <p>
  * <b>可用性自测</b>：验证「映射保活存活」（UDP：STUN 绑定响应刷新；TCP：保活链路交互有响应
  * + 本地监听正常），并按 NAT 类型给出入站可达性结论。运营商 CGNAT 普遍不支持 NAT 回流(hairpin)，
- * 从本机回环连接公网映射地址必然超时，不代表穿透失败；真实外网可达性请用外部设备
- * （手机流量等）访问映射地址验证。
+ * 从本机回环连接公网映射地址必然超时，不代表穿透失败；因此 TCP 自测另周期性调用第三方探测节点
+ * 真实连接映射地址验证公网入站可达性（手动自测必验），补上「保活存活 ≠ 外网可主动连入」盲区。
  * <p>
  * <b>周期巡检</b>：仅按保活健康度触发重建（连续多个保活周期无响应才判定映射失效），
  * 不因回环自测超时反复重新穿透丢弃可用映射；TCP 映射缺失时退避重试出站探测。
@@ -111,6 +120,13 @@ final class StunRunner {
     private volatile boolean tcpRefreshing;
     /** 保活失败已告警过的服务器（失效服务器仅告警一次，避免每个保活周期重复刷屏） */
     private final Set<String> warnedKeepalive = ConcurrentHashMap.newKeySet();
+    /** 上次公网入站验证时刻（第三方探测节点真实连接）：周期自测限冷却 5 分钟，手动自测不限 */
+    private volatile long lastExtCheckAt;
+    /** 上次公网入站验证结果（仅状态变化时打日志，避免刷屏） */
+    private volatile Boolean lastExtReachable;
+    /** 公网入站验证用 HTTP 客户端（第三方探测服务，低频调用） */
+    private static final HttpClient EXT_CHECK_HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5)).build();
 
     private volatile boolean running;
     private DatagramSocket udpSocket;
@@ -805,9 +821,9 @@ final class StunRunner {
 
     // ---------- 可用性自测 ----------
 
-    /** 手动自测入口（REST 接口调用，同步执行并返回结果） */
+    /** 手动自测入口（REST 接口调用，同步执行并返回结果；必做公网入站验证，耗时数秒） */
     Map<String, Object> verifyNow() throws Exception {
-        return verifyChannel();
+        return verifyChannel(true);
     }
 
     /**
@@ -817,9 +833,14 @@ final class StunRunner {
      *   <li>TCP 任务：保活链路交互有响应且本地监听正常即存活，无响应时立即重建链路再复验</li>
      * </ul>
      * 运营商 CGNAT 普遍不支持 NAT 回流(hairpin)：从内网回环连接公网映射地址必然超时，
-     * 不代表穿透失败，因此自测不依赖回环连通性；真实外网可达性请用外部设备（手机流量等）验证。
+     * 不代表穿透失败，因此自测不依赖回环连通性；保活存活后另由第三方探测节点真实连接映射地址
+     * 验证公网入站可达性（周期自测限冷却，手动自测必验），第三方服务不可用时静默跳过。
      */
     private Map<String, Object> verifyChannel() throws Exception {
+        return verifyChannel(false);
+    }
+
+    private Map<String, Object> verifyChannel(boolean manual) throws Exception {
         // TCP 弹跳重建会短暂关闭监听（关监听→全候选出站探测→重开，候选全部超时时可达 20s+），
         // 等待窗口须覆盖弹跳全程再自测，否则撞上关闭窗口会误报「本地TCP监听已关闭」
         if (tcpRefreshing) {
@@ -837,6 +858,26 @@ final class StunRunner {
             result = verifyUdpKeepalive();
         } else {
             result = verifyTcpKeepalive();
+        }
+        // 公网入站真实验证：补上「保活存活 ≠ 外网可主动连入」盲区（本机无 NAT 回流无法自验）。
+        // 仅保活存活时验证；周期自测限冷却避免频繁调用第三方服务，手动自测必验
+        if (result.startsWith("OK") && !"UDP".equalsIgnoreCase(protocol)
+                && (manual || System.currentTimeMillis() - lastExtCheckAt > 300_000)) {
+            lastExtCheckAt = System.currentTimeMillis();
+            String ext = checkExternalInbound(mapped);
+            if (ext != null) {
+                boolean reachable = "OK".equals(ext);
+                if (lastExtReachable == null || lastExtReachable != reachable) {
+                    lastExtReachable = reachable;
+                    if (reachable) {
+                        Logs.info(Logs.STUN, "任务[" + name + "] 公网入站验证通过: 第三方节点真实连接 " + mapped + " 成功");
+                    } else {
+                        Logs.warn(Logs.STUN, "任务[" + name + "] 公网入站验证失败" + ext.substring(4)
+                                + "：保活存活但外网无法连入，请检查上层NAT/运营商策略");
+                    }
+                }
+                result += "，公网入站验证" + (reachable ? "可达" : "不可达" + ext.substring(4));
+            }
         }
         String time = Database.now();
         Database.update("UPDATE stun_task SET check_time=?, check_result=? WHERE id=?", time, result, id);
@@ -890,7 +931,79 @@ final class StunRunner {
                 : (punch != null && punch.addrPresumed() ? "端口保留模式(展示端口取自同端口UDP STUN估计，入站不保证可达，请外部设备验证)"
                 : "STUN精确映射");
         return "OK(TCP映射保活存活" + (rebuilt ? "，链路已重建" : "") + "[" + mode + "]，" + costMs
-                + "ms；运营商CGNAT普遍无NAT回流，端到端可达请用外部设备验证)";
+                + "ms；运营商CGNAT普遍无NAT回流，端到端可达以公网入站验证/外部设备为准)";
+    }
+
+    /**
+     * 公网入站可达性验证：第三方探测节点（check-host.net 免费 API）真实 TCP 连接映射地址，
+     * 验证「外网能否主动连入」（本机因 NAT 回流缺失无法自验）。提交后轮询结果（实测约 3 秒完成）：
+     * 响应为顶层节点结果表，节点值 null=仍在探测；样本对象含 address 即连接成功，含 error 即失败。
+     * 任一节点成功即视为可达；全部报错视为不可达（携带首个错误原因）；持续未完成/服务异常返回 null（本轮跳过）。
+     * 第三方服务不可用不影响主流程，自测结论退回保活存活语义。
+     */
+    private String checkExternalInbound(String mapped) {
+        try {
+            HttpResponse<String> submit = EXT_CHECK_HTTP.send(HttpRequest.newBuilder()
+                    .uri(URI.create("https://check-host.net/check-tcp?host=" + mapped))
+                    .header("Accept", "application/json").header("User-Agent", "NexHome-STUN")
+                    .timeout(Duration.ofSeconds(8)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            if (submit.statusCode() != 200) return null;
+            JsonObject root = JsonParser.parseString(submit.body()).getAsJsonObject();
+            if (!root.has("request_id")) return null;
+            String reqId = root.get("request_id").getAsString();
+            for (int round = 0; round < 3; round++) {
+                try {
+                    Thread.sleep(3000); // 实测探测约 3 秒出结果，最多轮询 3 次覆盖慢节点/排队
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+                HttpResponse<String> poll = EXT_CHECK_HTTP.send(HttpRequest.newBuilder()
+                        .uri(URI.create("https://check-host.net/check-result/" + reqId))
+                        .header("Accept", "application/json").timeout(Duration.ofSeconds(8)).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                if (poll.statusCode() != 200) return null;
+                String verdict = parseCheckResult(JsonParser.parseString(poll.body()).getAsJsonObject(), reqId);
+                if (verdict != null) return verdict;
+            }
+            return null; // 持续未完成：本轮跳过，下轮自测再验
+        } catch (Exception e) {
+            return null; // 第三方服务不可用/解析异常：静默跳过，保持原保活自测结论
+        }
+    }
+
+    /**
+     * 解析 check-host 轮询响应：结果可能包裹在 request_id 键下，也可能直接平铺在顶层（实测后者）。
+     * 全部节点仍为 null（探测中）返回 null 继续轮询；否则按样本汇总：含 address 即连接成功，含 error 即失败。
+     */
+    private static String parseCheckResult(JsonObject rroot, String reqId) {
+        JsonObject nodes = null;
+        JsonElement wrapped = rroot.get(reqId);
+        if (wrapped != null && wrapped.isJsonObject()) {
+            nodes = wrapped.getAsJsonObject();
+        } else if (rroot.size() > 0) {
+            // 实测响应直接以节点 id 为顶层键（无 request_id 包裹）；仍为 pending 时响应为空对象/全 null 由下方汇总判定
+            nodes = rroot;
+        }
+        if (nodes == null) return null;
+        boolean anyOk = false, anyDone = false;
+        String firstErr = null;
+        for (Map.Entry<String, JsonElement> e : nodes.entrySet()) {
+            JsonElement v = e.getValue();
+            if (v == null || !v.isJsonArray()) continue; // null=该节点仍在探测
+            for (JsonElement sample : v.getAsJsonArray()) {
+                if (sample == null || !sample.isJsonObject()) continue;
+                JsonObject obj = sample.getAsJsonObject();
+                if (obj.has("address")) {
+                    anyOk = true; // 含 address：探测节点真实连接成功（time 为连接耗时）
+                } else if (obj.has("error") && firstErr == null) {
+                    firstErr = obj.get("error").getAsString();
+                }
+                anyDone = true;
+            }
+        }
+        if (anyOk) return "OK";
+        return anyDone ? "FAIL(" + firstErr + ")" : null;
     }
 
     // ---------- UPnP 配合与重新穿透 ----------

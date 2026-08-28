@@ -59,8 +59,9 @@ public final class StunService {
                     // 绑定端口固定时才能探测到对入站有效的 TCP 映射；配置服务器不支持 TCP 时尝试维护的 TCP 服务器与内置兜底服务器
                     int bp = intVal(task, "bind_port");
                     String m = StunClient.bindOverTcp(str(task, "stun_host"), intVal(task, "stun_port"), bp, 3000);
-                    List<String[]> fallback = new ArrayList<>(StunServerService.tcpServers());
-                    fallback.addAll(Arrays.asList(StunClient.TCP_STUN_SERVERS));
+                    // 内置列表按电信 CGNAT 实测可达排序优先，维护列表（历史种子多为被封的 3478 端口）兜底
+                    List<String[]> fallback = new ArrayList<>(Arrays.asList(StunClient.TCP_STUN_SERVERS));
+                    fallback.addAll(StunServerService.tcpServers());
                     for (int i = 0; m == null && i < fallback.size(); i++) {
                         m = StunClient.bindOverTcp(fallback.get(i)[0], Integer.parseInt(fallback.get(i)[1]), bp, 3000);
                     }

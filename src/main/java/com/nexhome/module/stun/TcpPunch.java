@@ -1,5 +1,6 @@
 package com.nexhome.module.stun;
 
+import com.nexhome.core.Database;
 import com.nexhome.core.Logs;
 
 import java.net.InetAddress;
@@ -93,7 +94,7 @@ final class TcpPunch {
         if (cur.viaStun()) {
             if (cur.socket().isClosed() || !cur.socket().isConnected()) return false;
             String mapped = StunClient.bindingOverTcp(cur.socket(), 3000);
-            if (mapped == null) return false;
+            if (mapped == null) return rebindStunInPlace(cur);
             if (!mapped.equals(cur.mapped())) {
                 current = cur.withMapped(mapped);
                 onReady.accept(current);
@@ -111,6 +112,36 @@ final class TcpPunch {
                 current = link;
                 return true;
             }
+        }
+        return false;
+    }
+
+    /**
+     * STUN 交互单次无响应的就地自愈：同本地端口重连同一服务器重试一次。
+     * 单次无响应多为服务器侧抖动/丢包，就地恢复避免计入失败走「告警 + 消耗备用 socket」的重建流程；
+     * 本地端口必须与监听一致（CGNAT 映射挂在出站五元组上），恢复后映射端口可能漂移（回调刷新展示）。
+     * 仍失败返回 false，由调用方走备用/弹跳重建流程。
+     */
+    private boolean rebindStunInPlace(Link cur) {
+        int localPort = cur.socket().getLocalPort();
+        abandon(cur.socket());
+        current = null;
+        try {
+            Socket s = new Socket();
+            s.setReuseAddress(true);
+            s.bind(new InetSocketAddress(localPort));
+            int ci = cur.endpoint().lastIndexOf(':');
+            s.connect(new InetSocketAddress(cur.endpoint().substring(0, ci),
+                    Integer.parseInt(cur.endpoint().substring(ci + 1))), 3000);
+            String mapped = StunClient.bindingOverTcp(s, 3000);
+            if (mapped != null) {
+                current = new Link(s, true, cur.endpoint(), mapped);
+                if (!mapped.equals(cur.mapped())) onReady.accept(current); // 映射漂移：更新权威展示地址
+                return true;
+            }
+            abandon(s);
+        } catch (Exception ignored) {
+            // 重连失败：交由调用方重建流程处理
         }
         return false;
     }
@@ -153,6 +184,7 @@ final class TcpPunch {
                 if (p != null) {
                     tcpStunServer = addr;
                     probeFailAt = 0;
+                    persistStunServer(addr);
                     return install(new Link(p.socket(), true, addr, p.mapped()));
                 }
             }
@@ -182,10 +214,25 @@ final class TcpPunch {
         return null;
     }
 
-    /** STUN-over-TCP 候选：上次成功服务器 → 配置服务器 → 内置列表（实测可达优先） → 维护列表 */
+    /** 持久化最近成功的 STUN/TCP 服务器：容器/任务重启后优先复用，免去逐候选探测的启动延迟 */
+    private void persistStunServer(String addr) {
+        try {
+            Database.setConfig("stun.tcpLastServer", addr);
+        } catch (Exception ignored) {
+            // 写入失败不影响主流程：运行期内仍有内存态 tcpStunServer 兜底
+        }
+    }
+
+    /** STUN-over-TCP 候选：上次成功服务器 → 持久化的上次成功（重启快路径） → 配置服务器 → 内置列表（实测可达优先） → 维护列表 */
     private LinkedHashSet<String> stunCandidates() {
         LinkedHashSet<String> set = new LinkedHashSet<>();
         if (tcpStunServer != null) set.add(tcpStunServer);
+        try {
+            String last = Database.getConfig("stun.tcpLastServer");
+            if (last != null && last.lastIndexOf(':') > 0) set.add(last);
+        } catch (Exception ignored) {
+            // 读取失败：按常规顺序探测
+        }
         set.add(stunHost + ":" + stunPort);
         // 内置列表按电信 CGNAT 实测可达排序，优先于维护列表：失效候选探测每个耗时数秒，
         // 维护列表历史种子多为 3478 端口（本类运营商封锁），排在后面仅作其他网络兜底
