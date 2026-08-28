@@ -209,7 +209,7 @@ final class TcpPunch {
         } catch (Exception ignored) {
             // 服务器连接失败/无响应：备用 socket 作废
         }
-        closeQuietly(s);
+        abandon(s);
         return null;
     }
 
@@ -224,11 +224,30 @@ final class TcpPunch {
         } catch (Exception ignored) {
             // 端点不可达：换下一个端点
         }
-        closeQuietly(s);
+        abandon(s);
         return null;
     }
 
     private static void closeQuietly(Socket s) {
+        try {
+            s.close();
+        } catch (Exception ignored) {
+            // 关闭失败不影响后续流程
+        }
+    }
+
+    /**
+     * 废弃出站连接：SO_LINGER(0) 使 close 发 RST 复位而非 FIN 四次挥手，本端不进 TIME_WAIT。
+     * 普通 FIN 关闭会把 (本地端口, 端点) 四元组占用 60 秒（TIME_WAIT），期间以同一本地端口
+     * 重连同一端点会被内核拒绝（"Cannot assign requested address"），是链路失效后长时间
+     * 重建失败的根源；RST 复位后同端点立即可重连（端口保留模式下本地端口不变，映射地址不变）。
+     */
+    private static void abandon(Socket s) {
+        try {
+            s.setSoLinger(true, 0);
+        } catch (Exception ignored) {
+            // 连接可能已死无法设置 linger：直接关闭即可
+        }
         try {
             s.close();
         } catch (Exception ignored) {
@@ -252,29 +271,21 @@ final class TcpPunch {
         }
     }
 
-    /** 关闭当前链路（幂等），备用 socket 保留 */
+    /** 关闭当前链路（幂等，RST 复位以释放四元组），备用 socket 保留 */
     void closeLink() {
         Link cur = current;
         current = null;
         if (cur != null) {
-            try {
-                cur.socket().close();
-            } catch (Exception ignored) {
-                // 连接可能已断开，仍按成功处理
-            }
+            abandon(cur.socket());
         }
     }
 
-    /** 释放全部资源（任务停止时调用） */
+    /** 释放全部资源（任务停止时调用；备用 socket 未连接，普通关闭即可） */
     void closeAll() {
         closeLink();
         Socket s;
         while ((s = spares.poll()) != null) {
-            try {
-                s.close();
-            } catch (Exception ignored) {
-                // 备用 socket 关闭失败不影响任务
-            }
+            closeQuietly(s);
         }
     }
 }

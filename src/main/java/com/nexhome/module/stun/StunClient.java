@@ -241,21 +241,23 @@ public final class StunClient {
 
     /**
      * 在已建立的 DNS-over-TCP 长连接上完成一次查询交互：双向报文既维持运营商 NAT 上的映射，
-     * 又验证链路存活；响应事务 ID 匹配且 QR=1 即认为成功（查询 NXDOMAIN 同样有效）。
+     * 又验证链路存活；响应事务 ID 匹配且 QR=1 即认为成功。查询域用真实存在的热门域名
+     * （各公共 DNS 必有缓存，响应快且稳定）；不要用 .local 等保留 TLD——实测部分公共
+     * DNS（如 223.5.5.5/119.29.29.29）对其 TCP 查询静默不响应，会被误判为链路失效。
      */
     public static boolean dnsTcpExchange(Socket s, int timeoutMs) {
         try {
             s.setSoTimeout(timeoutMs);
             int id = RANDOM.nextInt() & 0xFFFF;
-            byte[] msg = new byte[12 + 25 + 4]; // header + qname(keepalive.nexhome.local) + QTYPE/QCLASS
+            byte[] msg = new byte[12 + 12 + 4]; // header + qname(www.qq.com 含根标签) + QTYPE/QCLASS
             msg[0] = (byte) (id >>> 8);
             msg[1] = (byte) id;
             msg[2] = 0x01; // RD=1
             msg[5] = 1;    // QDCOUNT=1
             int p = 12;
-            p = writeName(msg, p, "keepalive");
-            p = writeName(msg, p, "nexhome");
-            p = writeName(msg, p, "local");
+            p = writeName(msg, p, "www");
+            p = writeName(msg, p, "qq");
+            p = writeName(msg, p, "com");
             msg[p++] = 0;  // 根标签结束
             msg[p++] = 0; msg[p++] = 1; // QTYPE=A
             msg[p++] = 0; msg[p++] = 1; // QCLASS=IN

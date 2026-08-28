@@ -237,11 +237,15 @@ final class StunRunner {
     /**
      * 周期保活：周期性刷新 NAT 映射防止超时回收。
      * UDP 模式向配置的与兜底的 STUN 服务器发绑定请求（响应由接收线程解析刷新映射地址）；
-     * TCP 模式额外出站刷新运营商 CGNAT 上的 TCP 映射。
+     * TCP 模式额外出站刷新运营商 CGNAT 上的 TCP 映射，且交互周期收紧到 ≤10 秒：
+     * 公共 DNS 端点的 TCP 连接空闲超时普遍很短（实测 114.114.114.114 约 20 秒即回收
+     * 空闲连接，等距 20 秒的保活首次交互必撞死连接），持续有流量才能让长连接与 CGNAT
+     * 映射同时保活；即使连接仍被杀，配合废弃连接 RST 复位重连，恢复窗口也仅一个周期。
      */
     private void startKeepalive() {
         boolean tcpMode = !"UDP".equalsIgnoreCase(protocol);
-        keepaliveTask = Tasks.every(keepaliveSec, keepaliveSec, () -> {
+        int tick = tcpMode ? Math.min(keepaliveSec, 10) : keepaliveSec;
+        keepaliveTask = Tasks.every(tick, tick, () -> {
             // UDP 绑定保活两模式都需要：UDP 模式维持映射；TCP 模式维持同端口 STUN 映射（展示与锥形回连）
             repunchUdpMapping();
             // UPnP 公网直通时无需刷新 STUN/TCP 映射（刷新需短暂关监听，会造成入站中断与自测误报）
