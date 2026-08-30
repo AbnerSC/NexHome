@@ -50,7 +50,19 @@ async function renderStun() {
         <button class="btn" onclick="renderStunServers()">🛠 管理STUN服务器</button>
         <button class="btn primary" onclick="stunForm()">＋ 新增穿透任务</button></div>
       <div class="panel"><table>
-        <thead><tr><th>任务</th><th>内网目标</th><th>STUN服务器</th><th>状态</th><th>NAT类型</th><th>外网映射地址</th><th>穿透成功时间</th><th>可用性自测</th><th>操作</th></tr></thead>
+        <thead>
+            <tr>
+                <th style="width: 160px">任务</th>
+                <th style="width: 160px">内网目标</th>
+                <th style="width: 160px">STUN服务器</th>
+                <th style="width: 120px">状态</th>
+                <th style="width: 160px">NAT类型</th>
+                <th style="width: 160px">外网映射地址</th>
+                <th style="width: 180px">穿透成功时间</th>
+                <th>可用性自测</th>
+                <th style="width: 240px">操作</th>
+            </tr>
+        </thead>
         <tbody>${rows || '<tr><td colspan="9" class="muted">暂无任务</td></tr>'}</tbody>
       </table></div>`;
     setRefresh(renderStun, 5000);
