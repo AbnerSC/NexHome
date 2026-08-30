@@ -32,9 +32,12 @@ import java.util.function.Consumer;
  */
 final class TcpPunch {
 
-    /** 一条保活链路：连接 + 模式 + 端点 + 精确映射地址（端口保留模式为 null） */
-    record Link(Socket socket, boolean viaStun, String endpoint, String mapped) {
+    /** 一条保活链路：连接 + 模式 + 端点 + 精确映射地址（端口保留模式为 null）+ 建立时刻 */
+    record Link(Socket socket, boolean viaStun, String endpoint, String mapped, long at) {
     }
+
+    /** 新链路宽限期：建立/重建刚完成交互验证，期内再交互只会白白翻动连接（重建后立即自测失败的根源） */
+    private static final long FRESH_GRACE_MS = 8_000;
 
     private final String taskName;
     private final String stunHost;
@@ -77,25 +80,42 @@ final class TcpPunch {
 
     /**
      * 当前链路交互一次（保活 + 存活验证）。
-     * STUN 精确模式：<b>轮换式保活</b>——实测公共 STUN/TCP 服务器为单事务型（响应绑定请求后
-     * 约 1 秒内即发 RST/FIN 断开，2026-08 实测 stun.nextcloud.com 1 秒复位），长连接上周期
-     * 复用交互必然失败；改为每周期同本地端口废弃旧连接、新建出站连接做一次绑定交互，
-     * 刷新沿途全部 NAT 映射并取得最新精确映射。实测本类运营商 CGNAT 对同本地端口重新出站
-     * 复用同一外部端口，映射地址保持稳定。轮换失败返回 false，由调用方走备用/弹跳重建流程。
+     * 新链路宽限：建立/重建刚成功即完成过交互验证，期内直接返回存活，不重复翻动连接。
+     * STUN 精确模式：<b>存活优先</b>——先做 TCP 级存活检测（短超时读：EOF/复位=死亡，超时=存活）。
+     * 连接存活时在<b>原连接</b>上做刷新交互：映射挂在原四元组上，外部端口恒定不漂移，
+     * 发包本身即刷新沿途 NAT；服务器对二次请求无响应但连接仍存活时视为映射随连接保活；
+     * 仅当连接确已死亡（实测公共服务器多为单事务型，响应后约 1 秒内 RST/FIN 断开，
+     * 2026-08 实测 stun.nextcloud.com 1 秒复位；或网络切换）才从同本地端口轮换新建连接，
+     * 优先消耗预绑定备用 socket，备用耗尽回退新建绑定。轮换失败返回 false，由调用方走备用/弹跳重建流程。
      * 出站端点模式（端口保留）：出站长连接存活即运营商 CGNAT 映射存活——先做 TCP 级存活检测
      * （短超时读：EOF/复位=死亡，超时=存活），存活直接返回，不消耗备用 socket；检测死亡时
-     * <b>先 RST 废弃旧连接释放四元组</b>，再用预绑定备用 socket 同端口轮换新建出站连接。
+     * <b>先 RST 废弃旧连接释放四元组</b>，再用预绑定备用 socket 同端口轮换新建出站连接（备用耗尽回退新建绑定）。
      * 若旧连接未释放就连同一端点，四元组与存活连接完全重复，内核必然拒绝（保活/自测永远失败的根源）；
      * 端点可能为单事务/短空闲超时类型，死亡轮换是该模式常态（静默完成不打日志），
-     * spare 耗尽或端点全部不可达返回 false，由调用方走失败重建流程（弹跳补充 spare）。
+     * 备用与新建均失败或端点全部不可达返回 false，由调用方走失败重建流程（弹跳补充备用）。
      */
     synchronized boolean keepaliveOnce() {
         Link cur = current;
         if (cur == null) return false;
+        if (System.currentTimeMillis() - cur.at() < FRESH_GRACE_MS) return true; // 新建链路刚验证过，无需再交互
         if (cur.viaStun()) {
-            Link rotated = rotateStun(cur);
+            if (isAlive(cur.socket())) {
+                // 连接存活：在原连接上刷新交互（映射挂在原四元组上，外部端口恒定，避免重建即漂移）
+                String mapped = StunClient.bindingOverTcp(cur.socket(), 3000);
+                if (mapped != null) {
+                    current = new Link(cur.socket(), true, cur.endpoint(), mapped, cur.at());
+                    if (!mapped.equals(cur.mapped())) onReady.accept(current); // 映射漂移：更新权威展示地址
+                    return true;
+                }
+                if (isAlive(cur.socket())) return true; // 服务器不应答二次请求但连接存活：映射随连接保活，地址不变
+            }
+            // 连接已死（服务器单事务断开/网络切换）：同本地端口轮换新建连接重建映射
+            int localPort = cur.socket().getLocalPort();
+            abandon(cur.socket());
+            current = null;
+            Link rotated = rotateStun(localPort, cur.endpoint());
             if (rotated != null) {
-                current = rotated;
+                downWarned = false;
                 if (!rotated.mapped().equals(cur.mapped())) onReady.accept(rotated); // 映射漂移：更新权威展示地址
                 return true;
             }
@@ -103,11 +123,14 @@ final class TcpPunch {
         }
         if (isAlive(cur.socket())) return true; // 长连接存活：CGNAT 映射存活，无需轮换（映射地址不变）
         // 链路死亡：先废弃旧连接释放四元组，再轮换新建（当前端点优先，失败依次尝试其余候选）
+        int localPort = cur.socket().getLocalPort();
         abandon(cur.socket());
+        current = null;
         for (String[] ep : outboundCandidates()) {
             Socket spare = spares.poll();
-            if (spare == null) return false;
-            Link link = connectOutbound(spare, ep);
+            Socket s = spare != null ? spare : freshBound(localPort); // 备用耗尽：回退新建绑定，避免备用耗尽后永远失败
+            if (s == null) return false;
+            Link link = connectOutbound(s, ep);
             if (link != null) {
                 current = link;
                 return true;
@@ -117,31 +140,41 @@ final class TcpPunch {
     }
 
     /**
-     * STUN 精确模式轮换保活：先 RST 废弃旧连接释放四元组（旧连接多已被服务器杀掉，RST 仅确保释放），
-     * 再从同一本地端口新建出站连接做一次绑定交互。本地端口必须与监听一致（CGNAT 映射挂在出站五元组上）；
-     * 同本地端口重新出站时实测 CGNAT 复用同一外部端口，映射保持稳定。
-     * 失败返回 null（旧连接已废弃，由调用方走备用/弹跳重建流程）。
+     * STUN 精确模式轮换重建：旧连接死亡后从同一本地端口新建出站连接做一次绑定交互。
+     * 优先消耗预绑定备用 socket（同端口已绑好），备用耗尽回退新建绑定（受内核同端口容量约束可能失败）。
+     * 本地端口必须与监听一致（CGNAT 映射挂在出站五元组上）。失败返回 null（由调用方走重建流程）。
      */
-    private Link rotateStun(Link cur) {
-        int localPort = cur.socket().getLocalPort();
-        String endpoint = cur.endpoint();
-        abandon(cur.socket()); // 四元组相同，不先释放则新连接同端点出站会被内核拒绝
+    private Link rotateStun(int localPort, String endpoint) {
+        Socket s = spares.poll();
+        if (s == null) s = freshBound(localPort);
+        if (s == null) return null;
         try {
-            Socket s = new Socket();
-            s.setReuseAddress(true);
-            s.bind(new InetSocketAddress(localPort));
             int ci = endpoint.lastIndexOf(':');
             s.connect(new InetSocketAddress(endpoint.substring(0, ci),
                     Integer.parseInt(endpoint.substring(ci + 1))), 3000);
             String mapped = StunClient.bindingOverTcp(s, 3000);
             if (mapped != null) {
-                return new Link(s, true, endpoint, mapped);
+                Link link = new Link(s, true, endpoint, mapped, System.currentTimeMillis());
+                current = link;
+                return link;
             }
-            abandon(s);
         } catch (Exception ignored) {
             // 轮换失败：交由调用方重建流程处理（备用重连/弹跳）
         }
+        abandon(s);
         return null;
+    }
+
+    /** 新建出站 socket 并绑定指定本地端口（备用耗尽时兜底），绑定失败返回 null */
+    private static Socket freshBound(int localPort) {
+        try {
+            Socket s = new Socket();
+            s.setReuseAddress(true);
+            s.bind(new InetSocketAddress(localPort));
+            return s;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
@@ -183,7 +216,7 @@ final class TcpPunch {
                     tcpStunServer = addr;
                     probeFailAt = 0;
                     persistStunServer(addr);
-                    return install(new Link(p.socket(), true, addr, p.mapped()));
+                    return install(new Link(p.socket(), true, addr, p.mapped(), System.currentTimeMillis()));
                 }
             }
             if (System.currentTimeMillis() - probeFailAt > 300_000) {
@@ -207,7 +240,7 @@ final class TcpPunch {
             }
             outEndpoint = ep[0] + ":" + ep[1];
             warnedEndpoints.remove(outEndpoint); // 端点恢复可用：复位告警以便下次失效再提示
-            return install(new Link(s, false, outEndpoint, null));
+            return install(new Link(s, false, outEndpoint, null, System.currentTimeMillis()));
         }
         return null;
     }
@@ -292,7 +325,7 @@ final class TcpPunch {
             String mapped = StunClient.bindingOverTcp(s, 3000);
             if (mapped != null) {
                 probeFailAt = 0;
-                return new Link(s, true, tcpStunServer, mapped);
+                return new Link(s, true, tcpStunServer, mapped, System.currentTimeMillis());
             }
         } catch (Exception ignored) {
             // 服务器连接失败/无响应：备用 socket 作废
@@ -310,7 +343,7 @@ final class TcpPunch {
         try {
             s.connect(new InetSocketAddress(InetAddress.getByName(ep[0]), Integer.parseInt(ep[1])), 3000);
             outEndpoint = ep[0] + ":" + ep[1];
-            return new Link(s, false, outEndpoint, null);
+            return new Link(s, false, outEndpoint, null, System.currentTimeMillis());
         } catch (Exception ignored) {
             // 端点不可达：换下一个端点
         }

@@ -248,8 +248,8 @@ public final class StunClient {
     /**
      * STUN-over-TCP 绑定交互（RFC 5389 §7.1）：发送 Binding 请求并解析响应返回映射地址。
      * 直接读底层流不做缓冲保留，方法本身可在同一连接上反复调用；但实测公共 STUN/TCP 服务器
-     * 多为单事务型（响应后约 1 秒内发 RST/FIN 断开，如 stun.nextcloud.com），长连接复用交互会失败，
-     * 保活须按「同本地端口轮换新建连接」模式进行（见 TcpPunch.rotateStun）。
+     * 多为单事务型（响应后约 1 秒内发 RST/FIN 断开，如 stun.nextcloud.com），此类连接上复用交互会失败，
+     * 保活按「存活优先：连接存活则原连接刷新交互，死亡才同本地端口轮换新建」（见 TcpPunch.keepaliveOnce）。
      * <p>
      * <b>请求帧格式先裸后帧</b>：实测 Twilio/Telnyx/Sonetel/nextcloud 等公共 STUN/TCP 服务器
      * 只接受裸 STUN 消息（与 Natter 一致，不带帧头），按 RFC §7.2.2 加 2 字节长度帧头时静默丢弃；
@@ -271,9 +271,15 @@ public final class StunClient {
         }
     }
 
-    /** 单次绑定交互；framed 为 true 时按 RFC 5389 §7.2.2 写 2 字节长度帧头，否则发裸消息 */
+    /**
+     * 单次绑定交互；framed 为 true 时按 RFC 5389 §7.2.2 写 2 字节长度帧头，否则发裸消息。
+     * 事务 ID 不符的响应（多为迟到的上一次响应，高延迟链路上常见）不立即判无响应，
+     * 丢弃该消息保持流对齐后继续读下一条，直到匹配或超时——否则迟到响应会把紧随其后的
+     * 正确响应一起误判为「交互无响应」。
+     */
     private static String tcpBindingOnce(Socket s, int timeoutMs, boolean framed) throws Exception {
-        s.setSoTimeout(Math.max(timeoutMs, 500));
+        int so = Math.max(timeoutMs, 500);
+        s.setSoTimeout(so);
         byte[] tid = new byte[12];
         RANDOM.nextBytes(tid);
         byte[] req = buildRequest(tid, false);
@@ -285,34 +291,41 @@ public final class StunClient {
         out.write(req);
         out.flush();
         InputStream in = s.getInputStream();
-        // 先读 20 字节消息头判定帧格式（多读会把属性首字节混入头部缓冲，后续读数错位导致解析失败）
-        byte[] b = in.readNBytes(20);
-        if (b.length < 20) return null;
-        byte[] head;
-        int msgLen;
-        if (readU16(b, 0) == MSG_BINDING_RESPONSE && readU32(b, 4) == MAGIC_COOKIE) {
-            head = b; // 裸消息（Natter 式，多数公共 STUN/TCP 服务器只接受该格式）
-            msgLen = readU16(head, 2);
-        } else if (readU16(b, 2) == MSG_BINDING_RESPONSE && readU32(b, 6) == MAGIC_COOKIE) {
-            int frame = readU16(b, 0); // RFC 5389 §7.2.2：2 字节长度帧头 + 消息体，帧值即消息长度
-            if (frame < 20 || (frame - 20) % 4 != 0) return null;
-            byte[] rest = in.readNBytes(2); // 首次读数只含帧头 + 18 字节消息头，补齐末尾 2 字节事务 ID
-            if (rest.length < 2) return null;
-            head = new byte[20];
-            System.arraycopy(b, 2, head, 0, 18);
-            System.arraycopy(rest, 0, head, 18, 2);
-            msgLen = frame;
-        } else {
-            return null;
+        long deadline = System.currentTimeMillis() + so;
+        while (System.currentTimeMillis() < deadline) {
+            // 先读 20 字节消息头判定帧格式（多读会把属性首字节混入头部缓冲，后续读数错位导致解析失败）
+            byte[] b = in.readNBytes(20);
+            if (b.length < 20) return null;
+            byte[] head;
+            int msgLen;
+            if (readU16(b, 0) == MSG_BINDING_RESPONSE && readU32(b, 4) == MAGIC_COOKIE) {
+                head = b; // 裸消息（Natter 式，多数公共 STUN/TCP 服务器只接受该格式）
+                msgLen = readU16(head, 2);
+            } else if (readU16(b, 2) == MSG_BINDING_RESPONSE && readU32(b, 6) == MAGIC_COOKIE) {
+                int frame = readU16(b, 0); // RFC 5389 §7.2.2：2 字节长度帧头 + 消息体，帧值即消息长度
+                if (frame < 20 || (frame - 20) % 4 != 0) return null;
+                byte[] rest = in.readNBytes(2); // 首次读数只含帧头 + 18 字节消息头，补齐末尾 2 字节事务 ID
+                if (rest.length < 2) return null;
+                head = new byte[20];
+                System.arraycopy(b, 2, head, 0, 18);
+                System.arraycopy(rest, 0, head, 18, 2);
+                msgLen = frame;
+            } else {
+                return null;
+            }
+            if (msgLen % 4 != 0 || msgLen > 4096) return null; // STUN 消息长度恒为 4 字节倍数；超限视为异常报文防失控跳读
+            if (!Arrays.equals(tid, Arrays.copyOfRange(head, 8, 20))) {
+                in.readNBytes(msgLen); // 迟到的其他事务响应：丢弃消息体保持流对齐，继续等匹配响应
+                continue;
+            }
+            byte[] attrs = in.readNBytes(msgLen);
+            if (attrs.length < msgLen) return null;
+            byte[] full = new byte[20 + attrs.length];
+            System.arraycopy(head, 0, full, 0, 20);
+            System.arraycopy(attrs, 0, full, 20, attrs.length);
+            return extractMapped(full, full.length);
         }
-        if (msgLen % 4 != 0) return null; // STUN 消息长度恒为 4 字节的倍数
-        if (!Arrays.equals(tid, Arrays.copyOfRange(head, 8, 20))) return null;
-        byte[] attrs = in.readNBytes(msgLen);
-        if (attrs.length < msgLen) return null;
-        byte[] full = new byte[20 + attrs.length];
-        System.arraycopy(head, 0, full, 0, 20);
-        System.arraycopy(attrs, 0, full, 20, attrs.length);
-        return extractMapped(full, full.length);
+        return null;
     }
 
     /**
