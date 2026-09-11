@@ -61,6 +61,10 @@ final class TcpPunch {
     private final ConcurrentLinkedDeque<Socket> spares = new ConcurrentLinkedDeque<>();
     /** 已告警过的失效出站端点（端点恢复可用后不再重复告警，避免退避重试期间刷屏） */
     private final Set<String> warnedEndpoints = ConcurrentHashMap.newKeySet();
+    /** 单事务型 STUN/TCP 服务器（响应后即 RST 断连，链路活不过一个保活周期，映射端口随轮换漂移无法稳定入站），降权改选持久型 */
+    private final Set<String> singleTx = ConcurrentHashMap.newKeySet();
+    /** 当前链路已完成的保活交互次数：为 0 即死亡 = 单事务型服务器特征（从未存活过一个保活周期） */
+    private volatile int currentKeepalives;
 
     TcpPunch(String taskName, String stunHost, int stunPort, Consumer<Link> onReady) {
         this.taskName = taskName;
@@ -105,24 +109,38 @@ final class TcpPunch {
                 String mapped = StunClient.bindingOverTcp(cur.socket(), 3000);
                 if (mapped != null) {
                     current = new Link(cur.socket(), true, cur.endpoint(), mapped, cur.at());
+                    currentKeepalives++;
                     if (!mapped.equals(cur.mapped())) onReady.accept(current); // 映射漂移：更新权威展示地址
                     return true;
                 }
-                if (isAlive(cur.socket())) return true; // 服务器不应答二次请求但连接存活：映射随连接保活，地址不变
+                if (isAlive(cur.socket())) {
+                    currentKeepalives++;
+                    return true; // 服务器不应答二次请求但连接存活：映射随连接保活，地址不变
+                }
             }
             // 连接已死（服务器单事务断开/网络切换）：同本地端口轮换新建连接重建映射
+            if (currentKeepalives == 0) markSingleTx(cur.endpoint()); // 从未存活过一个保活周期：单事务型服务器
+            String ep = cur.endpoint();
+            if (singleTx.contains(ep)) {
+                for (String c : stunCandidates()) { ep = c; break; } // 改选持久型候选，避免反复轮换到单事务服务器
+            }
             int localPort = cur.socket().getLocalPort();
             abandon(cur.socket());
             current = null;
-            Link rotated = rotateStun(localPort, cur.endpoint());
+            Link rotated = rotateStun(localPort, ep);
             if (rotated != null) {
                 downWarned = false;
+                tcpStunServer = ep;
+                persistStunServer(ep);
                 if (!rotated.mapped().equals(cur.mapped())) onReady.accept(rotated); // 映射漂移：更新权威展示地址
                 return true;
             }
             return false; // 轮换失败（服务器不可达/无响应）：由调用方走备用/弹跳重建流程
         }
-        if (isAlive(cur.socket())) return true; // 长连接存活：CGNAT 映射存活，无需轮换（映射地址不变）
+        if (isAlive(cur.socket())) {
+            currentKeepalives++;
+            return true; // 长连接存活：CGNAT 映射存活，无需轮换（映射地址不变）
+        }
         // 链路死亡：先废弃旧连接释放四元组，再轮换新建（当前端点优先，失败依次尝试其余候选）
         int localPort = cur.socket().getLocalPort();
         abandon(cur.socket());
@@ -157,6 +175,7 @@ final class TcpPunch {
             if (mapped != null) {
                 Link link = new Link(s, true, endpoint, mapped, System.currentTimeMillis());
                 current = link;
+                currentKeepalives = 0;
                 return link;
             }
         } catch (Exception ignored) {
@@ -199,6 +218,14 @@ final class TcpPunch {
             return true; // 无数据无复位：连接存活，沿途 NAT 映射随之存活
         } catch (Exception e) {
             return false; // 复位/IO 异常：链路已死
+        }
+    }
+
+    /** 标记单事务型 STUN/TCP 服务器（首次告警）：响应后即断连，映射端口随轮换漂移无法稳定入站 */
+    private void markSingleTx(String ep) {
+        if (singleTx.add(ep)) {
+            Logs.warn(Logs.STUN, "任务[" + taskName + "] STUN/TCP服务器 " + ep
+                    + " 为单事务型(响应后即断连)，链路活不过一个保活周期、映射端口随轮换漂移无法稳定入站，降权改选持久型服务器");
         }
     }
 
@@ -277,20 +304,23 @@ final class TcpPunch {
 
     /** STUN-over-TCP 候选：上次成功服务器 → 持久化的上次成功（重启快路径） → 配置服务器 → 内置列表（实测可达优先） → 维护列表 */
     private LinkedHashSet<String> stunCandidates() {
-        LinkedHashSet<String> set = new LinkedHashSet<>();
-        if (tcpStunServer != null) set.add(tcpStunServer);
+        LinkedHashSet<String> all = new LinkedHashSet<>();
+        if (tcpStunServer != null) all.add(tcpStunServer);
         try {
             String last = Database.getConfig("stun.tcpLastServer");
-            if (last != null && last.lastIndexOf(':') > 0) set.add(last);
+            if (last != null && last.lastIndexOf(':') > 0) all.add(last);
         } catch (Exception ignored) {
             // 读取失败：按常规顺序探测
         }
-        set.add(stunHost + ":" + stunPort);
+        all.add(stunHost + ":" + stunPort);
         // 内置列表按电信 CGNAT 实测可达排序，优先于维护列表：失效候选探测每个耗时数秒，
         // 维护列表历史种子多为 3478 端口（本类运营商封锁），排在后面仅作其他网络兜底
-        for (String[] s : StunClient.TCP_STUN_SERVERS) set.add(s[0] + ":" + s[1]);
-        for (String[] s : StunServerService.tcpServers()) set.add(s[0] + ":" + s[1]);
-        return set;
+        for (String[] s : StunClient.TCP_STUN_SERVERS) all.add(s[0] + ":" + s[1]);
+        for (String[] s : StunServerService.tcpServers()) all.add(s[0] + ":" + s[1]);
+        // 单事务型服务器降权：链路活不过一个保活周期、映射端口随轮换漂移无法稳定入站，仅在无其他候选时兜底
+        LinkedHashSet<String> kept = new LinkedHashSet<>();
+        for (String a : all) if (!singleTx.contains(a)) kept.add(a);
+        return kept.isEmpty() ? all : kept;
     }
 
     /** 出站端点候选：最近成功的优先 */
@@ -311,6 +341,7 @@ final class TcpPunch {
         current = link;
         addrPresumed = !link.viaStun();
         downWarned = false;
+        currentKeepalives = 0;
         onReady.accept(link);
         return link;
     }

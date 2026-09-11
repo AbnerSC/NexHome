@@ -865,6 +865,15 @@ final class StunRunner {
      * 同一新地址连续出现两次（真实变更，如出口 IP 变化/重穿）才接受并告警一次抖动特征。
      */
     private void updateMapped(String mapped, String natType) {
+        updateMapped(mapped, natType, false);
+    }
+
+    /**
+     * @param authoritative true=TCP 权威映射（链路轮换/重建即换外部端口）：新地址即当前真相立即接受，
+     *                      不做对称型 NAT 抖动冻结——冻结会把展示/库/自测停留在已失效旧端口（公网访问失败的直接诱因）；
+     *                      false=UDP STUN 多服务器响应来源，需抖动冻结防展示跳变
+     */
+    private void updateMapped(String mapped, String natType, boolean authoritative) {
         try {
             boolean writeMapped = false;
             if (mapped != null && !mapped.isBlank()) {
@@ -878,7 +887,13 @@ final class StunRunner {
                     Logs.info(Logs.STUN, "任务[" + name + "] 穿透成功，外网映射地址: " + mapped);
                 } else if (!mapped.equals(punchedMapped)) {
                     long nowMs = System.currentTimeMillis();
-                    if (nowMs - lastMappedChangeAt < Math.max(60_000, keepaliveSec * 3_000L)) {
+                    if (authoritative) {
+                        // TCP 权威映射变更（链路轮换/重建换端口）：立即接受为当前真相，不冻结
+                        flapWarned = false;
+                        pendingMapped = null;
+                        acceptMappedChange(mapped, nowMs);
+                        writeMapped = true;
+                    } else if (nowMs - lastMappedChangeAt < Math.max(60_000, keepaliveSec * 3_000L)) {
                         // 短时间内映射地址随响应来源变化：对称型 NAT 特征，冻结展示等待地址稳定
                         if (mapped.equals(pendingMapped)) {
                             // 同一新地址连续出现两次：真实变更（出口IP变化/重穿），接受
@@ -928,7 +943,7 @@ final class StunRunner {
     /** 更新 TCP 方向外网映射（STUN/TCP 精确探测或 UPnP 公网直通），TCP 自测以此为准 */
     private void updateTcpMapped(String mapped) {
         wanTcpReady = true;
-        updateMapped(mapped, null);
+        updateMapped(mapped, null, true);
     }
 
     /**
