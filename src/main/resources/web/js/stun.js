@@ -54,10 +54,10 @@ async function renderStun() {
             <tr>
                 <th style="width: 160px">任务</th>
                 <th style="width: 160px">内网目标</th>
-                <th style="width: 160px">STUN服务器</th>
+                <th style="width: 200px">STUN服务器</th>
                 <th style="width: 120px">状态</th>
                 <th style="width: 160px">NAT类型</th>
-                <th style="width: 160px">外网映射地址</th>
+                <th style="width: 180px">外网映射地址</th>
                 <th style="width: 180px">穿透成功时间</th>
                 <th>可用性自测</th>
                 <th style="width: 240px">操作</th>

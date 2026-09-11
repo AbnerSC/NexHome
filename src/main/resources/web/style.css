@@ -172,7 +172,11 @@ body {
 }
 
 /* ---------- 表格 ---------- */
-table { width: 100%; border-collapse: collapse; }
+/* 固定布局：列宽以表头声明的 width 为准，剩余空间分给未声明宽度的列 */
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+
+/* 固定布局下列宽不随内容扩展，单元格内超长徽标（如可用性自测结果）需允许换行 */
+td .badge { white-space: normal; word-break: break-all; }
 
 th, td {
     text-align: left;
