@@ -45,7 +45,13 @@ window.ddnsToggle = async (id, enabled, interval) => {
 };
 
 window.ddnsSync = async id => {
-    try { await api('POST', `/api/ddns/tasks/${id}/sync`); toast('已触发同步'); setTimeout(renderDdns, 2000); }
+    try {
+        const msg = await api('POST', `/api/ddns/tasks/${id}/sync`);
+        toast(msg);
+        // 同步为异步执行，延迟两次刷新以展示最新同步状态（含“记录已存在”等取消写入结果）
+        setTimeout(renderDdns, 2000);
+        setTimeout(renderDdns, 6000);
+    }
     catch (e) { toast(e.message, 'err'); }
 };
 
@@ -66,8 +72,8 @@ window.ddnsForm = async (id) => {
         <div class="field"><label>任务名称 <b>*</b></label><input name="name" required value="${esc(t.name || '')}"></div>
         <div class="field"><label>服务商 <b>*</b></label>
           <select name="provider" onchange="ddnsProviderChanged(this.value)">
-            <option value="ALIYUN_DNS" ${t.provider !== 'ALIYUN_ESA' ? 'selected' : ''}>阿里云 云解析DNS</option>
-            <option value="ALIYUN_ESA" ${t.provider === 'ALIYUN_ESA' ? 'selected' : ''}>阿里云 ESA</option>
+            <option value="ALIYUN_DNS" ${t.provider !== 'ALIYUN_ESA' ? 'selected' : ''}>阿里云DNS</option>
+            <option value="ALIYUN_ESA" ${t.provider === 'ALIYUN_ESA' ? 'selected' : ''}>阿里云ESA</option>
           </select></div>
         <div class="field"><label>主域名 <b>*</b></label><input name="domain" required placeholder="example.com" value="${esc(t.domain || '')}"></div>
         <div class="field"><label>主机记录 <b>*</b></label><input name="rr" required placeholder="www 或 @" value="${esc(t.rr || '')}"></div>
@@ -82,6 +88,12 @@ window.ddnsForm = async (id) => {
           </select></div>
         <div class="field hidden" id="fNic"><label>网卡</label><select name="local_nic"><option value="">自动选择</option>${nicOpts}</select></div>
         <div class="field hidden" id="fManualIp"><label>手动 IP <b>*</b></label><input name="manual_ip" value="${esc(t.manual_ip || '')}"></div>
+        <div class="field full" id="fPreview"><label>IP 预览</label>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button type="button" class="btn" onclick="ddnsPreviewIp()">预览即将同步的 IP</button>
+            <span id="ipPreview" class="small muted">按当前 IP 来源配置解析</span>
+          </div>
+        </div>
         <div class="field"><label>AccessKey ID <b>*</b></label><input name="access_key_id" required value="${esc(t.access_key_id || '')}"></div>
         <div class="field"><label>AccessKey Secret <b>*</b></label><input name="access_key_secret" required type="password" value="${esc(t.access_key_secret || '')}"></div>
         <div class="field hidden" id="fSiteId"><label>ESA 站点 SiteId <b>*</b></label><input name="esa_site_id" value="${esc(t.esa_site_id || '')}" placeholder="数字站点ID"></div>
@@ -96,6 +108,27 @@ window.ddnsForm = async (id) => {
     window.ddnsModeChanged = m => {
         $('#fNic').classList.toggle('hidden', m !== 'LOCAL');
         $('#fManualIp').classList.toggle('hidden', m !== 'MANUAL');
+        const p = $('#ipPreview');
+        if (p) { p.className = 'small muted'; p.style.color = ''; p.textContent = '按当前 IP 来源配置解析'; }
+    };
+    window.ddnsPreviewIp = async () => {
+        const f = new FormData($('#ddnsFormEl'));
+        const p = $('#ipPreview');
+        p.className = 'small muted';
+        p.style.color = '';
+        p.textContent = '解析中…';
+        try {
+            const r = await api('POST', '/api/ddns/preview-ip', {
+                ip_mode: f.get('ip_mode') || 'PUBLIC',
+                manual_ip: f.get('manual_ip') || '',
+                local_nic: f.get('local_nic') || ''
+            });
+            p.textContent = '即将同步的 IP: ' + r.ip;
+            p.style.color = 'var(--green)';
+        } catch (e) {
+            p.textContent = e.message;
+            p.style.color = 'var(--red)';
+        }
     };
     window.ddnsProviderChanged(t.provider || 'ALIYUN_DNS');
     window.ddnsModeChanged(t.ip_mode || 'PUBLIC');
