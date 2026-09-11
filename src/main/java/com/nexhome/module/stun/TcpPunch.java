@@ -65,12 +65,31 @@ final class TcpPunch {
     private final Set<String> singleTx = ConcurrentHashMap.newKeySet();
     /** 当前链路已完成的保活交互次数：为 0 即死亡 = 单事务型服务器特征（从未存活过一个保活周期） */
     private volatile int currentKeepalives;
+    /** 单事务服务器黑名单持久化键（重启后仍生效，启动建链不再重选注定握不住映射的服务器） */
+    private static final String SINGLE_TX_KEY = "stun.tcpSingleTx";
 
     TcpPunch(String taskName, String stunHost, int stunPort, Consumer<Link> onReady) {
         this.taskName = taskName;
         this.stunHost = stunHost;
         this.stunPort = stunPort;
         this.onReady = onReady;
+        singleTx.addAll(loadPersistedSingleTx());
+    }
+
+    /** 读取持久化的单事务服务器黑名单（逗号分隔），读取失败返回空集 */
+    private static Set<String> loadPersistedSingleTx() {
+        try {
+            String v = Database.getConfig(SINGLE_TX_KEY);
+            Set<String> s = ConcurrentHashMap.newKeySet();
+            if (v != null && !v.isBlank()) {
+                for (String x : v.split(",")) {
+                    if (!x.isBlank()) s.add(x.trim());
+                }
+            }
+            return s;
+        } catch (Exception e) {
+            return Set.of();
+        }
     }
 
     /** 端口保留模式：展示地址语义为「出口IP:本地端口」（外部端口=本地源端口假设） */
@@ -221,12 +240,32 @@ final class TcpPunch {
         }
     }
 
-    /** 标记单事务型 STUN/TCP 服务器（首次告警）：响应后即断连，映射端口随轮换漂移无法稳定入站 */
+    /** 标记单事务型 STUN/TCP 服务器（首次告警）：持久化黑名单并清空最近成功记录，避免快速路径重选 */
     private void markSingleTx(String ep) {
         if (singleTx.add(ep)) {
             Logs.warn(Logs.STUN, "任务[" + taskName + "] STUN/TCP服务器 " + ep
                     + " 为单事务型(响应后即断连)，链路活不过一个保活周期、映射端口随轮换漂移无法稳定入站，降权改选持久型服务器");
+            try {
+                Database.setConfig(SINGLE_TX_KEY, String.join(",", singleTx));
+            } catch (Exception ignored) {
+                // 持久化失败不影响主流程：运行期内仍有内存态黑名单兜底
+            }
         }
+        if (ep.equals(tcpStunServer)) tcpStunServer = null;
+    }
+
+    /**
+     * 单事务判定：绑定响应后稍候再做存活检测——单事务型服务器响应后即 RST 断连（实测约 1 秒），
+     * 持久型服务器保持连接存活。只有持久型才值得作为保活链路（映射外部端口稳定、可入站）。
+     */
+    private static boolean diedQuickly(Socket s) {
+        try {
+            Thread.sleep(1600);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return !isAlive(s);
     }
 
     /** 链路已死亡时的提示（每个死亡周期只告警一次，重建成功自动复位） */
@@ -261,6 +300,13 @@ final class TcpPunch {
                 StunClient.TcpProbe p = StunClient.probeOverTcp(addr.substring(0, ci),
                         Integer.parseInt(addr.substring(ci + 1)), localPort, 2500);
                 if (p != null) {
+                    if (diedQuickly(p.socket())) {
+                        // 绑定有响应但连接随即断开：单事务服务器，注定握不住映射（建立的地址也在数秒内失效），
+                        // 拉黑换下一候选，避免每次（重）启动都先展示一个马上失效的映射地址
+                        markSingleTx(addr);
+                        abandon(p.socket());
+                        continue;
+                    }
                     tcpStunServer = addr;
                     probeFailAt = 0;
                     persistStunServer(addr);
@@ -352,7 +398,7 @@ final class TcpPunch {
      * 备用耗尽或全部失败返回 null（由调用方决定弹跳重建）。
      */
     synchronized Link reconnect(int localPort, boolean allowStun) {
-        if (allowStun && tcpStunServer != null) {
+        if (allowStun && tcpStunServer != null && !singleTx.contains(tcpStunServer)) {
             Socket spare = spares.poll();
             if (spare != null) {
                 Link link = connectStun(spare, tcpStunServer);
