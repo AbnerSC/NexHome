@@ -74,9 +74,11 @@ window.stunCmd = async (id, cmd) => {
             toast('正在探测 NAT 类型...');
             const r = await api('POST', `/api/stun/tasks/${id}/test`);
             modal('STUN 探测结果', `<p>NAT 类型：<b>${esc(r.natType)}</b></p>
-              <p style="margin-top:8px">外网映射地址(UDP)：<b>${esc(r.mapped || '无')}</b></p>
+              <p style="margin-top:8px">外网映射地址(UDP)：<b>${esc(r.mapped || '无')}</b>
+                ${r.live ? '<span class="muted small">（任务运行中，为任务实际映射地址）</span>'
+                  : '<span class="muted small">（临时端口探测结果，对称型 NAT 下与任务端口映射不同）</span>'}</p>
               ${r.tcpMapped ? `<p style="margin-top:8px">TCP 映射地址：<b>${esc(r.tcpMapped)}</b>
-                <span class="muted small">（TCP 入站以此为准）</span></p>` : ''}
+                <span class="muted small">${r.live ? '（任务运行中，为任务实际映射地址）' : '（TCP 入站以此为准）'}</span></p>` : ''}
               <p class="muted small" style="margin-top:10px">对称型 NAT 下每次探测映射端口可能不同，属正常现象；
               任务运行中不代表外网可访问，受限/对称型需端口转发或已打洞对端。</p>`);
         } else if (cmd === 'verify') {

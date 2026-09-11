@@ -52,29 +52,52 @@ public final class StunService {
         });
         // 单独探测一次：不启动任务，仅检测 NAT 类型与映射地址（TCP 任务另探测 TCP 映射）
         WebServer.route("POST", "/api/stun/tasks/{id}/test", ctx -> {
-            Map<String, Object> task = mustGet(ctx.paramLong("id"));
+            long taskId = ctx.paramLong("id");
+            Map<String, Object> task = mustGet(taskId);
+            StunRunner runner = RUNNERS.get(taskId);
+            boolean live = runner != null && runner.isRunning();
+            String liveMapped = str(task, "mapped_addr");
+            String liveNat = str(task, "nat_type");
             try (DatagramSocket s = new DatagramSocket()) {
+                // NAT 类型是网络路径属性，新开 socket 探测仍有效；映射地址则不同：临时端口的
+                // 映射在对称型 NAT 下与任务端口映射必然不同，任务运行中必须以运行器登记的
+                // 实际映射为准，否则探测结果不代表任务通道（误导用户排查方向）
                 StunClient.Result r = StunClient.detectNatType(s, str(task, "stun_host"),
                         intVal(task, "stun_port"), 3000);
+                String natType = r == null || r.mappedAddress() == null
+                        ? (liveNat.isBlank() ? "Unknown(STUN服务器无响应)" : liveNat + "(本次探测无响应，取任务记录)")
+                        : r.natType();
+                String mapped;
                 String tcpMapped = "";
-                if ("TCP".equalsIgnoreCase(str(task, "protocol")) && intVal(task, "bind_port") > 0) {
-                    // 绑定端口固定时才能探测到对入站有效的 TCP 映射；配置服务器不支持 TCP 时尝试维护的 TCP 服务器与内置兜底服务器
-                    int bp = intVal(task, "bind_port");
-                    String m = StunClient.bindOverTcp(str(task, "stun_host"), intVal(task, "stun_port"), bp, 3000);
-                    // 内置列表按电信 CGNAT 实测可达排序优先，维护列表（历史种子多为被封的 3478 端口）兜底
-                    List<String[]> fallback = new ArrayList<>(Arrays.asList(StunClient.TCP_STUN_SERVERS));
-                    fallback.addAll(StunServerService.tcpServers());
-                    for (int i = 0; m == null && i < fallback.size(); i++) {
-                        m = StunClient.bindOverTcp(fallback.get(i)[0], Integer.parseInt(fallback.get(i)[1]), bp, 3000);
+                if (live) {
+                    mapped = liveMapped; // 任务运行中：实际映射（权威）
+                    if ("TCP".equalsIgnoreCase(str(task, "protocol"))) tcpMapped = liveMapped;
+                } else {
+                    mapped = r == null || r.mappedAddress() == null ? "" : r.mappedAddress();
+                    if ("TCP".equalsIgnoreCase(str(task, "protocol")) && intVal(task, "bind_port") > 0) {
+                        // 仅未运行时才做同端口 TCP 探测：运行中监听与出站链路占用该本地端口，
+                        // 再从该端口出站是对称型 CGNAT 下的另一条映射（外部端口可能不同），
+                        // 探测结果不代表任务通道；绑定时才能探测到对入站有效的 TCP 映射，
+                        // 配置服务器不支持 TCP 时尝试维护列表与内置兑底
+                        int bp = intVal(task, "bind_port");
+                        String m = StunClient.bindOverTcp(str(task, "stun_host"), intVal(task, "stun_port"), bp, 3000);
+                        // 内置列表按电信 CGNAT 实测可达排序优先，维护列表（历史种子多为被封的 3478 端口）兑底
+                        List<String[]> fallback = new ArrayList<>(Arrays.asList(StunClient.TCP_STUN_SERVERS));
+                        fallback.addAll(StunServerService.tcpServers());
+                        for (int i = 0; m == null && i < fallback.size(); i++) {
+                            m = StunClient.bindOverTcp(fallback.get(i)[0], Integer.parseInt(fallback.get(i)[1]), bp, 3000);
+                        }
+                        if (m != null) tcpMapped = m;
                     }
-                    if (m != null) tcpMapped = m;
                 }
                 Logs.info(Logs.STUN, "手动探测任务[" + task.get("name") + "] 结果: "
-                        + (r == null ? "无响应" : r.natType() + " / " + r.mappedAddress())
+                        + (live ? "任务运行中，取实际映射 " + liveMapped
+                                : (r == null ? "无响应" : r.natType() + " / " + r.mappedAddress()))
                         + (tcpMapped.isEmpty() ? "" : " / TCP映射: " + tcpMapped));
                 ctx.ok(Map.of(
-                        "mapped", r == null || r.mappedAddress() == null ? "" : r.mappedAddress(),
-                        "natType", r == null ? "Unknown(STUN服务器无响应)" : r.natType(),
+                        "live", live,
+                        "mapped", mapped == null ? "" : mapped,
+                        "natType", natType,
                         "tcpMapped", tcpMapped));
             }
         });

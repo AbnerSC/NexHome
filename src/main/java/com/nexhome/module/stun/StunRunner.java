@@ -20,6 +20,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -116,6 +117,12 @@ final class StunRunner {
     private volatile long lastMappedAt;
     /** 最近一次 UDP STUN 映射地址（ip:port）：端口保留模式据此组装展示地址（尽力而为估计，入站不保证可达） */
     private volatile String udpMappedAddr;
+    /** 最近一次接受映射地址变更的时刻：短时间内随响应来源反复变化视为对称型 NAT 抖动，冻结展示 */
+    private volatile long lastMappedChangeAt;
+    /** 抖动期间最近一次出现的候选地址：同一新地址连续出现两次才接受为真实变更 */
+    private volatile String pendingMapped;
+    /** 已告警过映射地址抖动（对称型 NAT 特征），避免刷屏 */
+    private volatile boolean flapWarned;
     /** 路由器 WAN 口为公网且 UPnP 映射成功：UPnP 端口映射即权威入站通道，无需 STUN/TCP 出站探测与刷新 */
     private volatile boolean upnpPublicWan;
     /** TCP 外网映射来源：true=UPnP 端口映射（外网可主动连入），false=出站探测映射（实测外网可主动连入，自测通过即互联网可达） */
@@ -145,6 +152,17 @@ final class StunRunner {
      */
     private static final ExecutorService EXT_CHECK_EXEC = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "stun-ext-check");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /**
+     * TCP 链路弹跳重建专用线程：弹跳需逐候选探测出站链路（被封锁/失效候选每个都要等满超时，
+     * 总耗时可达数十秒），在共享调度池同步执行会饿死同池的高频保活任务（CGNAT 映射因超时
+     * 被回收——穿透静默失效的直接诱因），与 {@link #EXT_CHECK_EXEC} 同理移出共享池。
+     */
+    private static final ExecutorService TCP_REBUILD_EXEC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "stun-tcp-rebuild");
         t.setDaemon(true);
         return t;
     });
@@ -431,7 +449,9 @@ final class StunRunner {
             }
             TcpPunch.Link link = null;
             if (!skipProbe) {
-                link = punch.establish(listenPort, true);
+                // 预算 60s：被封锁候选逐个等满超时可达数分钟，超出预算直接回退公共出站端点，
+                // 避免任务启动（HTTP 线程）长时间无响应
+                link = punch.establish(listenPort, true, 60_000);
                 if (link != null) {
                     // 预绑定备用出站 socket：链路断开时无需关监听即可重连（零入站中断）。
                     // 预绑数不得超过内核允许的同端口通配绑定上限（先行探测），
@@ -604,52 +624,90 @@ final class StunRunner {
     /**
      * TCP 映射保活与链路维护：优先在保活周期内完成链路刷新（STUN 精确模式存活时原连接刷新交互/
      * 死亡才轮换新建，监听不中断）；链路死亡时优先消耗预绑定备用 socket 重连（零监听中断），
-     * 备用耗尽才「弹跳」重建（关监听→出站→重开监听，窗口约 1-3 秒，入站 SYN 由客户端
-     * TCP 重传自然恢复）。STUN/TCP 候选整体失败后退避 300 秒（期间只用公共出站端点）。
+     * 备用耗尽才「弹跳」重建（异步，见 {@link #bounceRebuild}）。STUN/TCP 候选整体失败后
+     * 退避 300 秒（期间只用公共出站端点）。
      */
     private synchronized void refreshTcpLink() {
-        if (!running || tcpServer == null || upnpPublicWan) return;
+        if (!running || tcpServer == null || upnpPublicWan || tcpRefreshing) return;
         if (punch.keepaliveOnce()) return; // 长连接交互保活成功：监听不中断、映射端口不漂移
         // 链路死亡（服务器断开/网络切换）：优先消耗预绑定备用 socket 重连（零监听中断）
         int port = tcpServer.getLocalPort();
         punch.noteLinkDownIfNeeded();
         punch.closeLink();
         if (punch.reconnect(port, punch.allowStunNow()) != null) return;
-        // 备用耗尽：弹跳重建（短暂关闭监听）
+        // 备用耗尽：弹跳重建（异步提交，避免逐候选探测长时间占用共享调度池）
+        bounceRebuild(port);
+    }
+
+    /**
+     * 弹跳重建（在 {@link #TCP_REBUILD_EXEC} 上异步执行）：关闭监听释放本地端口后，
+     * 在端口空闲的窗口内立即预绑定备用 socket 并马上重开监听——入站中断从「全候选探测完」
+     * （被封锁候选逐个等满超时可达分钟级）收敛到亚秒级；随后用预绑定 socket 逐候选重建
+     * 出站链路（见 TcpPunch.reconnectAll），不再需要端口空闲。无预绑容量（同端口仅容单个
+     * 绑定，如 Windows）时退回旧流程：监听保持关闭、establish 以短预算重建后再重开
+     * （中断窗口受预算约束）。
+     */
+    private void bounceRebuild(int port) {
         tcpRefreshing = true;
-        boolean bounced = false;
-        try {
+        TCP_REBUILD_EXEC.submit(() -> {
+            boolean listenerReopened = false;
             try {
-                tcpServer.close();
-                bounced = true;
-            } catch (Exception e) {
-                Logs.warn(Logs.STUN, "任务[" + name + "] 关闭TCP监听失败，跳过本次链路重建: " + e.getMessage());
-            }
-            if (bounced) {
+                if (!running) return;
+                try {
+                    tcpServer.close();
+                } catch (Exception e) {
+                    Logs.warn(Logs.STUN, "任务[" + name + "] 关闭TCP监听失败，跳过本次链路重建: " + e.getMessage());
+                    return;
+                }
                 try {
                     Thread.sleep(300); // 等待端口释放
-                } catch (InterruptedException ignored) {
+                } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    return;
                 }
-                if (punch.establish(port, punch.allowStunNow()) != null) {
-                    int cap = spareCapacity(port);
-                    if (cap > 0) punch.openSpares(port, Math.min(TCP_SPARES, cap - 1)); // 监听重开前补足备用 socket（同样受容量上限约束）
+                if (!running) return;
+                // 端口空闲窗口内预绑备用 socket（弹跳时主链路已废弃，全额容量可用）
+                int cap = spareCapacity(port);
+                int want = Math.min(TCP_SPARES, Math.max(cap, 0));
+                if (want > 0) punch.openSpares(port, want);
+                if (want > 0) {
+                    // 立即重开监听：入站中断收敛到亚秒级；重建走预绑定 socket，与监听互不抢占端口
+                    reopenListener(port);
+                    listenerReopened = true;
+                    if (!running) return;
+                    if (punch.reconnectAll(port, punch.allowStunNow()) == null) {
+                        wanTcpReady = false;
+                        Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路重建失败(STUN与公共出站端点均不可达)，"
+                                + "TCP映射暂缺，巡检将退避重试；UDP映射照常保活");
+                    }
                 } else {
-                    wanTcpReady = false;
-                    Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路重建失败(STUN与公共出站端点均不可达)，"
-                            + "TCP映射暂缺，巡检将退避重试；UDP映射照常保活");
+                    // 无预绑容量：只能在无监听状态下重建（短预算约束中断窗口），完成后立即重开监听
+                    if (punch.establish(port, punch.allowStunNow(), 15_000) == null) {
+                        wanTcpReady = false;
+                        Logs.warn(Logs.STUN, "任务[" + name + "] TCP出站链路重建失败(STUN与公共出站端点均不可达)，"
+                                + "TCP映射暂缺，巡检将退避重试；UDP映射照常保活");
+                    }
+                    if (running) {
+                        reopenListener(port);
+                        listenerReopened = true;
+                    }
                 }
-            }
-        } finally {
-            tcpRefreshing = false;
-            if (running && bounced) {
-                try {
-                    tcpServer = openTcpListener(port);
-                    startAcceptor();
-                } catch (Exception e) {
-                    Logs.error(Logs.STUN, "任务[" + name + "] 重建TCP监听失败: " + e.getMessage());
+            } finally {
+                if (!listenerReopened && running && tcpServer != null && tcpServer.isClosed()) {
+                    reopenListener(port); // 异常路径兑底：尽力恢复监听，避免重建失败后监听永久丢失
                 }
+                tcpRefreshing = false;
             }
+        });
+    }
+
+    /** 重开 TCP 监听并重启接收线程（弹跳重建后调用） */
+    private void reopenListener(int port) {
+        try {
+            tcpServer = openTcpListener(port);
+            startAcceptor();
+        } catch (Exception e) {
+            Logs.error(Logs.STUN, "任务[" + name + "] 重建TCP监听失败: " + e.getMessage());
         }
     }
 
@@ -665,23 +723,23 @@ final class StunRunner {
      */
     private void punchToPeer(InetSocketAddress peer) {
         if (!running) return;
-        Socket punch = new Socket();
+        Socket punchSock = new Socket();
         try {
-            punch.setReuseAddress(true);
+            punchSock.setReuseAddress(true);
             try {
                 // 与监听同端口绑定：锥形 NAT 下对端可直接回连该映射端口（同时打开也可建立连接）
-                punch.bind(new InetSocketAddress(tcpServer.getLocalPort()));
+                punchSock.bind(new InetSocketAddress(tcpServer.getLocalPort()));
             } catch (Exception ignored) {
                 // 同端口绑定受限时退回随机端口，主动连接方向仍可建立数据通道
             }
-            punch.connect(peer, 3000);
+            punchSock.connect(peer, 3000);
             Logs.info(Logs.STUN, "任务[" + name + "] TCP打洞成功，与对端 " + peer + " 建立转发通道");
-            Thread pipe = new Thread(() -> pipeToTarget(punch), "stun-punch-" + id);
+            Thread pipe = new Thread(() -> pipeToTarget(punchSock), "stun-punch-" + id);
             pipe.setDaemon(true);
             pipe.start();
         } catch (Exception e) {
             try {
-                punch.close();
+                punchSock.close();
             } catch (Exception ignored) {
             }
             Logs.warn(Logs.STUN, "任务[" + name + "] TCP打洞未成功(" + peer + "): " + e.getMessage());
@@ -796,31 +854,75 @@ final class StunRunner {
         }
     }
 
-    /** natType 为 null 时只更新映射地址 */
+    /**
+     * natType 为 null 时只更新映射地址。
+     * <p>
+     * 写库去重：保活每周期会收到多个 STUN 服务器的响应（每个都走到这里），地址未变化时
+     * 不再写库/打日志（原来每周期十余次无谓写库，既占数据库锁也造成前端展示抖动）。
+     * <p>
+     * 对称型 NAT 抖动冻结：对称型 NAT 对不同服务器分配不同外部端口，多个服务器的响应会
+     * 让地址每周期跳变（展示/穿透时间反复变更+日志刷屏）。短时间内地址反复变化时冻结展示，
+     * 同一新地址连续出现两次（真实变更，如出口 IP 变化/重穿）才接受并告警一次抖动特征。
+     */
     private void updateMapped(String mapped, String natType) {
         try {
+            boolean writeMapped = false;
             if (mapped != null && !mapped.isBlank()) {
                 lastMappedAt = System.currentTimeMillis(); // 保活/穿透有效：刷新映射时间，供巡检判断保活是否失效
                 if (!punched) {
                     punched = true;
                     punchedMapped = mapped;
+                    lastMappedChangeAt = lastMappedAt;
+                    writeMapped = true;
                     Database.update("UPDATE stun_task SET punched_at=? WHERE id=?", Database.now(), id);
                     Logs.info(Logs.STUN, "任务[" + name + "] 穿透成功，外网映射地址: " + mapped);
                 } else if (!mapped.equals(punchedMapped)) {
-                    // 映射地址变化（重穿/保活刷新后外网端口被 NAT 改写）：穿透时间同步更新为最新穿透时刻
-                    punchedMapped = mapped;
-                    Database.update("UPDATE stun_task SET punched_at=? WHERE id=?", Database.now(), id);
-                    Logs.info(Logs.STUN, "任务[" + name + "] 外网映射地址变更为 " + mapped + "，穿透时间已同步更新");
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - lastMappedChangeAt < Math.max(60_000, keepaliveSec * 3_000L)) {
+                        // 短时间内映射地址随响应来源变化：对称型 NAT 特征，冻结展示等待地址稳定
+                        if (mapped.equals(pendingMapped)) {
+                            // 同一新地址连续出现两次：真实变更（出口IP变化/重穿），接受
+                            flapWarned = false;
+                            pendingMapped = null;
+                            acceptMappedChange(mapped, nowMs);
+                            writeMapped = true;
+                        } else {
+                            pendingMapped = mapped;
+                            if (!flapWarned) {
+                                flapWarned = true;
+                                Logs.warn(Logs.STUN, "任务[" + name + "] 映射地址随STUN服务器不同而变化"
+                                        + "(对称型NAT特征)，展示地址保持为 " + punchedMapped
+                                        + "；对称型NAT纯STUN无法稳定穿透，请用端口转发/UPnP");
+                            }
+                        }
+                    } else {
+                        flapWarned = false;
+                        pendingMapped = null;
+                        acceptMappedChange(mapped, nowMs);
+                        writeMapped = true;
+                    }
                 }
             }
-            if (natType == null) {
+            if (natType != null) {
+                if (writeMapped || mapped == null || mapped.isBlank()) {
+                    Database.update("UPDATE stun_task SET mapped_addr=?, nat_type=? WHERE id=?", mapped, natType, id);
+                } else {
+                    Database.update("UPDATE stun_task SET nat_type=? WHERE id=?", natType, id);
+                }
+            } else if (writeMapped) {
                 Database.update("UPDATE stun_task SET mapped_addr=? WHERE id=?", mapped, id);
-            } else {
-                Database.update("UPDATE stun_task SET mapped_addr=?, nat_type=? WHERE id=?", mapped, natType, id);
             }
         } catch (Exception e) {
             Logs.error(Logs.STUN, "更新映射状态失败: " + e.getMessage());
         }
+    }
+
+    /** 接受映射地址真实变更：更新穿透成功时间并记日志（地址（端口）变化即重新穿透） */
+    private void acceptMappedChange(String mapped, long nowMs) throws SQLException {
+        punchedMapped = mapped;
+        lastMappedChangeAt = nowMs;
+        Database.update("UPDATE stun_task SET punched_at=? WHERE id=?", Database.now(), id);
+        Logs.info(Logs.STUN, "任务[" + name + "] 外网映射地址变更为 " + mapped + "，穿透时间已同步更新");
     }
 
     /** 更新 TCP 方向外网映射（STUN/TCP 精确探测或 UPnP 公网直通），TCP 自测以此为准 */
@@ -928,9 +1030,10 @@ final class StunRunner {
     }
 
     private Map<String, Object> verifyChannel(boolean manual) throws Exception {
-        // TCP 弹跳重建会短暂关闭监听（关监听→全候选出站探测→重开，候选全部超时时可达 20s+），
-        // 等待窗口须覆盖弹跳全程再自测，否则撞上关闭窗口会误报「本地TCP监听已关闭」
-        if (tcpRefreshing) {
+        // TCP 弹跳重建会短暂关闭监听（关监听→预绑→重开→全候选出站探测，候选全部超时时可达数十秒），
+        // 手动自测的等待窗口须覆盖弹跳全程再自测，否则撞上关闭窗口会误报「本地TCP监听已关闭」；
+        // 周期自测不等待（不能在共享调度池里睡眠等重建），由 verifyTcpKeepalive 按「重建中」返回
+        if (tcpRefreshing && manual) {
             long deadline = System.currentTimeMillis() + 30_000;
             while (tcpRefreshing && System.currentTimeMillis() < deadline) {
                 Thread.sleep(200);
@@ -944,12 +1047,17 @@ final class StunRunner {
         } else if ("UDP".equalsIgnoreCase(protocol)) {
             result = verifyUdpKeepalive();
         } else {
-            result = verifyTcpKeepalive();
+            result = verifyTcpKeepalive(manual);
         }
         // 公网入站真实验证：补上「保活存活 ≠ 外网可主动连入」盲区（本机无 NAT 回流无法自验）。
         // 仅保活存活时验证；手动自测同步验证（HTTP 线程不受调度池影响）；周期自测限冷却且必须异步：
         // 第三方 API 可达数十秒，占用调度池会延迟保活致 CGNAT 映射超时，异步执行只留上次结论。
         if (result.startsWith("OK") && !"UDP".equalsIgnoreCase(protocol)) {
+            // TCP 自测过程中链路可能已重建并刷新映射地址：公网入站验证以最新登记地址为准，
+            // 否则验证的还是自测前的旧地址，结果不代表当前通道
+            Map<String, Object> rowNow = Database.queryOne("SELECT mapped_addr FROM stun_task WHERE id=?", id);
+            String latest = rowNow == null ? null : str(rowNow, "mapped_addr");
+            if (latest != null && !latest.isBlank()) mapped = latest;
             long now = System.currentTimeMillis();
             if (manual) {
                 lastExtCheckAt = now;
@@ -1003,10 +1111,15 @@ final class StunRunner {
     }
 
     /**
-     * TCP 自测：保活链路存活 + 本地监听正常即映射存活；无响应时立即重建链路再复验，
+     * TCP 自测：保活链路存活 + 本地监听正常即映射存活；无响应时立即触发重建再复验，
      * 重建成功即视为存活（新建链路在宽限期内不要求再次交互，避免「重建成功→立即再交互→又失败」的误报循环）。
+     * 弹跳重建已异步化：手动自测等待重建完成（候选探测可长达数十秒）再复验；周期自测不等待
+     * （不能在共享调度池里睡眠等重建），按「重建中」返回，下轮自测复验。
      */
-    private String verifyTcpKeepalive() {
+    private String verifyTcpKeepalive(boolean manual) {
+        if (tcpRefreshing) {
+            return "重建中(TCP链路弹跳重建进行中，重建完成后自动复验)";
+        }
         if (!wanTcpReady) {
             return "FAIL(TCP映射未建立：STUN-over-TCP服务器不可用且端口保留出站链路未建成，巡检自动重试)";
         }
@@ -1017,13 +1130,29 @@ final class StunRunner {
         if (punch.keepaliveOnce()) {
             return okTcp(System.currentTimeMillis() - t0, false);
         }
-        // 链路交互无响应（服务器断开/网络切换）：立即重建（多数经预绑定备用socket零监听中断完成），
+        // 链路交互无响应（服务器断开/网络切换）：立即触发重建（多数经预绑定备用socket零监听中断完成），
         // 重建成功后新建链路在宽限期内即视为存活，不再强制立即交互一次（新链路刚完成交互验证）
         refreshTcpLink();
+        if (!tcpRefreshing && wanTcpReady && punch.keepaliveOnce()) {
+            return okTcp(System.currentTimeMillis() - t0, true); // 快速路径（备用socket）重建成功
+        }
+        if (!manual) {
+            // 周期自测不等待弹跳：按重建中返回（前端黄色展示），下轮自测复验
+            return "重建中(TCP保活链路无响应，已触发弹跳重建，重建完成后自动复验)";
+        }
+        long deadline = System.currentTimeMillis() + 60_000;
+        while (tcpRefreshing && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
         if (wanTcpReady && punch.keepaliveOnce()) {
             return okTcp(System.currentTimeMillis() - t0, true);
         }
-        return "FAIL(TCP保活链路无响应且重建失败：保活调度与巡检将按退避持续重试)";
+        return "FAIL(TCP保活链路无响应且重建未成功：保活调度与巡检将按退避持续重试)";
     }
 
     /** TCP 自测通过时的结果文案（区分映射来源，便于用户判断验证方式） */
@@ -1238,6 +1367,9 @@ final class StunRunner {
                 return;
             }
             String result = str(verifyChannel(), "result");
+            if (result.startsWith("重建中")) {
+                return; // 弹跳重建异步进行中：本轮跳过，重建完成后下轮自测复验，不计失败
+            }
             if (result.startsWith("OK")) {
                 if (watchFails > 0) Logs.info(Logs.STUN, "任务[" + name + "] 巡检复测通过，穿透通道已恢复");
                 watchFails = 0;

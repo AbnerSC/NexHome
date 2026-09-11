@@ -3,6 +3,7 @@ package com.nexhome.module.stun;
 import com.nexhome.core.Database;
 import com.nexhome.core.Logs;
 
+import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -185,7 +186,15 @@ final class TcpPunch {
         if (s == null || s.isClosed() || !s.isConnected()) return false;
         try {
             s.setSoTimeout(500);
-            return s.getInputStream().read() >= 0; // 有数据到达（预期外但证明链路存活）；-1 为 EOF，链路已死
+            InputStream in = s.getInputStream();
+            if (in.read() < 0) return false; // -1 为 EOF，链路已死
+            // 有数据到达（多为迟到的上一事务响应，预期外但证明链路存活）：全部读掉保持流对齐，
+            // 只吞 1 字节会使后续绑定交互的报文头解析错位（被误判为交互无响应）
+            int avail;
+            while ((avail = in.available()) > 0) {
+                if (in.readNBytes(avail).length < avail) break;
+            }
+            return true;
         } catch (java.net.SocketTimeoutException e) {
             return true; // 无数据无复位：连接存活，沿途 NAT 映射随之存活
         } catch (Exception e) {
@@ -207,8 +216,20 @@ final class TcpPunch {
      * 并回调 onReady；失败返回 null。本地端口必须尚未被监听占用（LISTEN 存在时无法 bind）。
      */
     synchronized Link establish(int localPort, boolean allowStun) {
+        return establish(localPort, allowStun, Long.MAX_VALUE);
+    }
+
+    /**
+     * 全新建立出站链路，语义同 {@link #establish(int, boolean)}，另加时间预算：
+     * STUN/TCP 候选逐个探测（被封锁/失效候选每个都要等满连接与交互超时，全表 20+ 个候选
+     * 总耗时可达数分钟），超预算即跳出候选循环直接回退公共出站端点（仅 6 个、耗时有界），
+     * 避免把弹跳窗口与调用线程拖到分钟级。
+     */
+    synchronized Link establish(int localPort, boolean allowStun, long budgetMs) {
+        long deadline = System.currentTimeMillis() + budgetMs;
         if (allowStun) {
             for (String addr : stunCandidates()) {
+                if (System.currentTimeMillis() >= deadline) break; // 预算耗尽：不再逐个等超时，直接回退公共端点
                 int ci = addr.lastIndexOf(':');
                 StunClient.TcpProbe p = StunClient.probeOverTcp(addr.substring(0, ci),
                         Integer.parseInt(addr.substring(ci + 1)), localPort, 2500);
@@ -303,7 +324,7 @@ final class TcpPunch {
         if (allowStun && tcpStunServer != null) {
             Socket spare = spares.poll();
             if (spare != null) {
-                Link link = connectStun(spare);
+                Link link = connectStun(spare, tcpStunServer);
                 if (link != null) return install(link);
             }
         }
@@ -316,16 +337,46 @@ final class TcpPunch {
         return null;
     }
 
-    /** 用预绑定 socket 重连最近成功的 STUN/TCP 服务器：失败返回 null（socket 已关闭作废） */
-    private Link connectStun(Socket s) {
+    /**
+     * 弹跳后用预绑定备用 socket 逐候选彻底重建：依次尝试全部 STUN/TCP 候选（非退避期）与
+     * 公共出站端点，每次尝试恰好消耗一个备用 socket（失败作废）。与 {@link #reconnect} 的区别：
+     * reconnect 仅尝试最近成功的 STUN 服务器（快速路径），本方法遍历全部候选——弹跳刚在
+     * 监听重开前的端口空闲窗口内完成预绑、备用充足，适合做一次彻底重建而不再占用监听端口。
+     * 备用耗尽或全部失败返回 null（由调用方在下次弹跳时重新预绑再试）。
+     */
+    synchronized Link reconnectAll(int localPort, boolean allowStun) {
+        if (allowStun) {
+            for (String addr : stunCandidates()) {
+                Socket spare = spares.poll();
+                if (spare == null) return null;
+                Link link = connectStun(spare, addr);
+                if (link != null) {
+                    tcpStunServer = addr;
+                    persistStunServer(addr);
+                    return install(link);
+                }
+            }
+            probeFailAt = System.currentTimeMillis(); // 全部候选失败：进入退避期，快速路径期间不再逐个探测
+        }
+        for (String[] ep : outboundCandidates()) {
+            Socket spare = spares.poll();
+            if (spare == null) return null;
+            Link link = connectOutbound(spare, ep);
+            if (link != null) return install(link);
+        }
+        return null;
+    }
+
+    /** 用预绑定 socket 重连指定 STUN/TCP 服务器：失败返回 null（socket 已关闭作废） */
+    private Link connectStun(Socket s, String server) {
         try {
-            int ci = tcpStunServer.lastIndexOf(':');
-            s.connect(new InetSocketAddress(tcpStunServer.substring(0, ci),
-                    Integer.parseInt(tcpStunServer.substring(ci + 1))), 3000);
+            int ci = server.lastIndexOf(':');
+            s.connect(new InetSocketAddress(server.substring(0, ci),
+                    Integer.parseInt(server.substring(ci + 1))), 3000);
             String mapped = StunClient.bindingOverTcp(s, 3000);
             if (mapped != null) {
                 probeFailAt = 0;
-                return new Link(s, true, tcpStunServer, mapped, System.currentTimeMillis());
+                return new Link(s, true, server, mapped, System.currentTimeMillis());
             }
         } catch (Exception ignored) {
             // 服务器连接失败/无响应：备用 socket 作废
