@@ -45,6 +45,7 @@ public final class StunServerService {
             {"小米路由器(境内)", "stun.miwifi.com", "3478", "1"},
             {"芒果TV(境内)", "stun.hitv.com", "3478", "1"},
             {"哔哩哔哩(境内)", "stun.chat.bilibili.com", "3478", "1"},
+            {"华为云裸(社区)", "124.70.180.79", "3478", "1"},
             {"Twilio", "global.stun.twilio.com", "3478", "0"},
             {"TwilioTURN(TCP)", "global.turn.twilio.com", "443", "1"},
             {"TwilioTURN(TCP-80)", "global.turn.twilio.com", "80", "1"},
