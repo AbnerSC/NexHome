@@ -136,6 +136,7 @@ async function checkLogin() {
 function showLogin() {
     $('#mainView').classList.add('hidden');
     $('#loginView').classList.remove('hidden');
+    stopSysMetrics();
 }
 
 async function enterApp() {
@@ -143,6 +144,7 @@ async function enterApp() {
     $('#mainView').classList.remove('hidden');
     setPage('home');
     loadSysInfo();
+    startSysMetrics();
 }
 
 $('#loginForm').addEventListener('submit', async e => {
@@ -171,6 +173,64 @@ async function loadSysInfo() {
         const i = await api('GET', '/api/system/info');
         $('#sysInfo').textContent = `v${i.version} · Java ${i.javaVersion} · 内存 ${i.usedMemoryMB}MB`;
     } catch (e) { /* ignore */ }
+}
+
+/* ---------------- 顶栏系统监控（CPU / 内存 / 虚拟内存） ---------------- */
+
+let metricsTimer = null;      // 独立定时器：不受页面切换 setRefresh 影响
+
+/** MB -> 人类可读（≥1GB 显示一位小数 GB，否则取整 MB） */
+function fmtMB(mb) {
+    return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
+}
+
+/** 负载着色：≥85% 红、≥60% 橙、其余默认蓝 */
+function loadClass(p) { return p >= 85 ? 'err' : p >= 60 ? 'warn' : ''; }
+
+async function loadSysMetrics() {
+    try {
+        const m = await api('GET', '/api/system/metrics');
+        const memPct = m.memTotalMB > 0 ? Math.round(m.memUsedMB * 100 / m.memTotalMB) : 0;
+        const swapPct = m.swapTotalMB > 0 ? Math.round(m.swapUsedMB * 100 / m.swapTotalMB) : 0;
+        const cpuTxt = m.cpuLoad >= 0 ? m.cpuLoad + '%' : '--';
+        const cpuBar = m.cpuLoad >= 0 ? m.cpuLoad : 0;
+        $('#sysMetrics').innerHTML = `
+            <div class="metric" title="CPU 使用率 ${cpuTxt}，共 ${m.cores} 核">
+                <span class="metric-icon">⚙️</span>
+                <span class="metric-name">CPU</span>
+                <span class="metric-value">${cpuTxt}</span>
+                <span class="metric-bar ${loadClass(m.cpuLoad)}"><i style="width:${cpuBar}%"></i></span>
+                <span class="metric-sub">${m.cores} 核</span>
+            </div>
+            <div class="metric" title="内存：${fmtMB(m.memUsedMB)} / ${fmtMB(m.memTotalMB)}（使用率 ${memPct}%）">
+                <span class="metric-icon">🧠</span>
+                <span class="metric-name">内存</span>
+                <span class="metric-value">${memPct}%</span>
+                <span class="metric-bar ${loadClass(memPct)}"><i style="width:${memPct}%"></i></span>
+                <span class="metric-sub">${fmtMB(m.memUsedMB)}/${fmtMB(m.memTotalMB)}</span>
+            </div>
+            <div class="metric" title="${m.swapTotalMB > 0
+                ? `虚拟内存：${fmtMB(m.swapUsedMB)} / ${fmtMB(m.swapTotalMB)}（使用率 ${swapPct}%）`
+                : '系统未启用虚拟内存（Swap）'}">
+                <span class="metric-icon">💾</span>
+                <span class="metric-name">虚拟内存</span>
+                ${m.swapTotalMB > 0 ? `
+                <span class="metric-value">${swapPct}%</span>
+                <span class="metric-bar ${loadClass(swapPct)}"><i style="width:${swapPct}%"></i></span>
+                <span class="metric-sub">${fmtMB(m.swapUsedMB)}/${fmtMB(m.swapTotalMB)}</span>`
+                : '<span class="metric-sub">未启用</span>'}
+            </div>`;
+    } catch (e) { /* 静默失败，不影响主功能 */ }
+}
+
+/** 启动顶栏系统监控：立即加载一次，之后每 5 秒刷新 */
+function startSysMetrics() {
+    loadSysMetrics();
+    if (!metricsTimer) metricsTimer = setInterval(loadSysMetrics, 5000);
+}
+
+function stopSysMetrics() {
+    if (metricsTimer) { clearInterval(metricsTimer); metricsTimer = null; }
 }
 
 /* ---------------- 页面路由 ---------------- */

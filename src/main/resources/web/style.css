@@ -111,6 +111,52 @@ body {
 
 .topbar h2 { font-size: 17px; }
 
+/* ---------- 顶栏系统监控（CPU / 内存 / 虚拟内存） ---------- */
+.sys-metrics {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px 26px;
+    margin: 0 20px;
+}
+
+.metric {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: default;
+}
+
+.metric-icon { font-size: 15px; line-height: 1; }
+.metric-name { color: var(--muted); }
+.metric-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+.metric-sub { color: var(--muted); }
+
+/* 迷你进度条：宽度随刷新平滑过渡，颜色随负载变化 */
+.metric-bar {
+    width: 56px;
+    height: 6px;
+    background: #e8edf5;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.metric-bar i {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: 4px;
+    background: var(--primary);
+    transition: width .6s ease;
+}
+
+.metric-bar.warn i { background: var(--orange); }
+.metric-bar.err i { background: var(--red); }
+
 .page-body { padding: 20px 24px; flex: 1; }
 
 /* ---------- 通用组件 ---------- */
@@ -428,8 +474,16 @@ tr:hover td { background: #f8fafc; }
 .pager { display: flex; gap: 8px; align-items: center; margin-top: 12px; justify-content: flex-end; }
 
 /* ---------- 响应式 ---------- */
+@media (max-width: 1200px) {
+    /* 窄屏隐藏监控附加信息，保留核心数值与进度条 */
+    .metric-sub { display: none; }
+}
+
 @media (max-width: 860px) {
     .layout { flex-direction: column; }
+    .topbar { flex-wrap: wrap; }
+    /* 窄屏下监控条换行到顶栏下一行，避免挤压标题与按钮 */
+    .sys-metrics { order: 3; width: 100%; justify-content: flex-start; margin: 10px 0 0; }
     .sidebar { width: 100%; flex-direction: row; align-items: center; overflow-x: auto; }
     .sidebar nav { display: flex; padding: 6px; }
     .nav-item { white-space: nowrap; margin: 0 2px; }
