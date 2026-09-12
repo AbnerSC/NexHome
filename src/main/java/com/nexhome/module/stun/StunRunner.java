@@ -63,9 +63,11 @@ import java.util.concurrent.ScheduledFuture;
  * （该拼装地址在公网并不存在，是展示与自测双双失败的根源）。
  * <p>
  * <b>可用性自测</b>：验证「映射保活存活」（UDP：STUN 绑定响应刷新；TCP：保活链路存活或刚重建成功
- * + 本地监听正常），并按 NAT 类型给出入站可达性结论。运营商 CGNAT 普遍不支持 NAT 回流(hairpin)，
- * 从本机回环连接公网映射地址必然超时，不代表穿透失败；因此 TCP 自测另周期性调用第三方探测节点
- * 真实连接映射地址验证公网入站可达性（手动自测必验），补上「保活存活 ≠ 外网可主动连入」盲区。
+ * + 本地监听正常），并按 NAT 类型给出入站可达性结论。TCP 自测另验「公网入站可达」：
+ * 优先本机直连穿透出的公网 IP:端口——实测多数路由器/运营商 NAT 支持回流(hairpin)，局域网访问
+ * 公网映射会被送回本机监听，连接成功即证明外网可主动连入（毫秒级完成且不依赖外部服务）；
+ * 确有无回流的网络直连失败不代表映射不可用，退回第三方探测节点真实连接映射地址验证
+ * （手动自测必验），补上「保活存活 ≠ 外网可主动连入」盲区。
  * <p>
  * <b>周期巡检</b>：仅按保活健康度触发重建（连续多个保活周期无响应才判定映射失效），
  * 不因回环自测超时反复重新穿透丢弃可用映射；TCP 映射缺失时退避重试出站探测。
@@ -113,6 +115,8 @@ final class StunRunner {
     private TcpPunch punch;
     /** 最近一次真实外网入站连接时刻（排除本机公网回环的自测连接），日志参考 */
     private volatile long lastPeerInboundAt;
+    /** 本机直连公网映射探测窗口截止时刻：窗口内 accept 的回环连接不记为真实外网访问证据 */
+    private volatile long selfProbeUntil;
     /** 最近一次收到 STUN 绑定响应（映射刷新）的时间戳，用于判断保活是否失效 */
     private volatile long lastMappedAt;
     /** 最近一次 UDP STUN 映射地址（ip:port）：端口保留模式据此组装展示地址（尽力而为估计，入站不保证可达） */
@@ -131,7 +135,7 @@ final class StunRunner {
     private volatile boolean tcpRefreshing;
     /** 保活失败已告警过的服务器（失效服务器仅告警一次，避免每个保活周期重复刷屏） */
     private final Set<String> warnedKeepalive = ConcurrentHashMap.newKeySet();
-    /** 上次公网入站验证时刻（第三方探测节点真实连接）：周期自测限冷却 5 分钟，手动自测不限 */
+    /** 上次第三方公网入站验证时刻：本机直连验证不占冷却（毫秒级），周期第三方验证限冷却 5 分钟，手动不限 */
     private volatile long lastExtCheckAt;
     /** 上次公网入站验证结果（仅状态变化时打日志，避免刷屏） */
     private volatile Boolean lastExtReachable;
@@ -750,10 +754,13 @@ final class StunRunner {
     private void pipeToTarget(Socket client) {
         try (client; Socket target = new Socket(targetIp, targetPort)) {
             Logs.info(Logs.STUN, "任务[" + name + "] 外网连接: " + client.getRemoteSocketAddress());
-            // 对端不是本机公网回环（自测连接源）时记录真实外网访问时刻：
-            // 作为通道实际在用的证据，自测未通过时据此避免误重穿把可用映射丢弃
+            // 对端不是自测回环连接时记录真实外网访问时刻：作为通道实际在用的证据，
+            // 自测未通过时据此避免误重穿把可用映射丢弃。自测回环判定：本机直连公网映射的
+            // 探测窗口内（源经回流改写，LAN IP/路由器 IP/公网出口 IP 均有可能），
+            // 或源地址即当前映射出口 IP（旧路径兜底）
+            boolean selfProbe = System.currentTimeMillis() < selfProbeUntil;
             String mappedIp = currentMappedIp();
-            if (mappedIp == null || !mappedIp.equals(client.getInetAddress().getHostAddress())) {
+            if (!selfProbe && (mappedIp == null || !mappedIp.equals(client.getInetAddress().getHostAddress()))) {
                 lastPeerInboundAt = System.currentTimeMillis();
             }
             Thread t2c = new Thread(() -> copy(target, client), "stun-pipe");
@@ -1036,9 +1043,10 @@ final class StunRunner {
      *   <li>UDP 任务：向候选 STUN 服务器发绑定请求，接收线程在超时内收到响应（映射刷新）即存活</li>
      *   <li>TCP 任务：保活链路交互有响应且本地监听正常即存活，无响应时立即重建链路再复验</li>
      * </ul>
-     * 运营商 CGNAT 普遍不支持 NAT 回流(hairpin)：从内网回环连接公网映射地址必然超时，
-     * 不代表穿透失败，因此自测不依赖回环连通性；保活存活后另由第三方探测节点真实连接映射地址
-     * 验证公网入站可达性（周期自测限冷却，手动自测必验），第三方服务不可用时静默跳过。
+     * 公网入站验证不影响保活结论：优先本机直连公网映射地址（支持 NAT 回流的网络连接会被送回本机，
+     * 成功即证明外网可主动连入）；直连失败的网络（确有无回流环境）不代表映射不可用，
+     * 退回第三方探测节点真实连接映射地址验证（周期自测限冷却，手动自测必验），
+     * 第三方服务不可用时静默跳过。
      */
     private Map<String, Object> verifyChannel() throws Exception {
         return verifyChannel(false);
@@ -1064,8 +1072,11 @@ final class StunRunner {
         } else {
             result = verifyTcpKeepalive(manual);
         }
-        // 公网入站真实验证：补上「保活存活 ≠ 外网可主动连入」盲区（本机无 NAT 回流无法自验）。
-        // 仅保活存活时验证；手动自测同步验证（HTTP 线程不受调度池影响）；周期自测限冷却且必须异步：
+        // 公网入站真实验证：补上「保活存活 ≠ 外网可主动连入」盲区。优先本机直连公网映射地址——
+        // 实测多数路由器/运营商 NAT 支持回流(hairpin)，局域网访问公网映射会被送回本机监听，
+        // 连接成功即证明外网可主动连入（毫秒级完成且不依赖外部服务）。
+        // 直连失败不代表映射不可用（确有无回流的网络连接到 WAN 侧即被丢弃），退回第三方探测节点验证：
+        // 手动自测同步验证（HTTP 线程不受调度池影响）；周期自测限冷却且必须异步：
         // 第三方 API 可达数十秒，占用调度池会延迟保活致 CGNAT 映射超时，异步执行只留上次结论。
         if (result.startsWith("OK") && !"UDP".equalsIgnoreCase(protocol)) {
             // TCP 自测过程中链路可能已重建并刷新映射地址：公网入站验证以最新登记地址为准，
@@ -1073,29 +1084,34 @@ final class StunRunner {
             Map<String, Object> rowNow = Database.queryOne("SELECT mapped_addr FROM stun_task WHERE id=?", id);
             String latest = rowNow == null ? null : str(rowNow, "mapped_addr");
             if (latest != null && !latest.isBlank()) mapped = latest;
-            long now = System.currentTimeMillis();
-            if (manual) {
-                lastExtCheckAt = now;
-                String ext = checkExternalInbound(mapped);
-                noteExtVerdict(ext);
-                if (ext != null) {
-                    result += "，公网入站验证" + ("OK".equals(ext) ? "可达" : "不可达" + ext.substring(4));
-                }
+            if (probeLocalInbound(mapped)) {
+                noteExtVerdict("OK", true);
+                result += "，公网入站验证可达(本机直连公网映射成功)";
             } else {
-                if (now - lastExtCheckAt > 300_000 && !extCheckRunning) {
+                long now = System.currentTimeMillis();
+                if (manual) {
                     lastExtCheckAt = now;
-                    extCheckRunning = true;
-                    final String target = mapped;
-                    EXT_CHECK_EXEC.submit(() -> {
-                        try {
-                            noteExtVerdict(checkExternalInbound(target));
-                        } finally {
-                            extCheckRunning = false;
-                        }
-                    });
-                }
-                if (lastExtReachable != null) {
-                    result += "，公网入站验证(上次)" + (lastExtReachable ? "可达" : "不可达");
+                    String ext = checkExternalInbound(mapped);
+                    noteExtVerdict(ext, false);
+                    if (ext != null) {
+                        result += "，公网入站验证" + ("OK".equals(ext) ? "可达" : "不可达" + ext.substring(4));
+                    }
+                } else {
+                    if (now - lastExtCheckAt > 300_000 && !extCheckRunning) {
+                        lastExtCheckAt = now;
+                        extCheckRunning = true;
+                        final String target = mapped;
+                        EXT_CHECK_EXEC.submit(() -> {
+                            try {
+                                noteExtVerdict(checkExternalInbound(target), false);
+                            } finally {
+                                extCheckRunning = false;
+                            }
+                        });
+                    }
+                    if (lastExtReachable != null) {
+                        result += "，公网入站验证(上次)" + (lastExtReachable ? "可达" : "不可达");
+                    }
                 }
             }
         }
@@ -1173,24 +1189,45 @@ final class StunRunner {
     /** TCP 自测通过时的结果文案（区分映射来源，便于用户判断验证方式） */
     private String okTcp(long costMs, boolean rebuilt) {
         String mode = tcpMappedViaUpnp ? "UPnP公网直通"
-                : (punch != null && punch.addrPresumed() ? "端口保留模式(展示端口取自同端口UDP STUN估计，入站不保证可达，请外部设备验证)"
+                : (punch != null && punch.addrPresumed() ? "端口保留模式(展示端口取自同端口UDP STUN估计，入站不保证可达，以公网入站验证为准)"
                 : "STUN精确映射");
         return "OK(TCP映射保活存活" + (rebuilt ? "，链路已重建" : "") + "[" + mode + "]，" + costMs
-                + "ms；运营商CGNAT普遍无NAT回流，端到端可达以公网入站验证/外部设备为准)";
+                + "ms；端到端可达以公网入站验证为准：本机直连公网映射优先，无回流网络退第三方节点/外部设备)";
     }
 
     /** 公网入站验证结论处理：状态变化时记日志并缓存（null=第三方服务不可用/未完成，本轮跳过） */
-    private void noteExtVerdict(String ext) {
+    private void noteExtVerdict(String ext, boolean local) {
         if (ext == null) return;
         boolean reachable = "OK".equals(ext);
         if (lastExtReachable == null || lastExtReachable != reachable) {
             lastExtReachable = reachable;
             if (reachable) {
-                Logs.info(Logs.STUN, "任务[" + name + "] 公网入站验证通过: 第三方节点真实连接 " + mappedAddr() + " 成功");
+                Logs.info(Logs.STUN, "任务[" + name + "] 公网入站验证通过: "
+                        + (local ? "本机直连公网映射地址 " : "第三方节点真实连接 ") + mappedAddr() + " 成功");
             } else {
                 Logs.warn(Logs.STUN, "任务[" + name + "] 公网入站验证失败" + ext.substring(4)
                         + "：保活存活但外网无法连入，请检查上层NAT/运营商策略");
             }
+        }
+    }
+
+    /**
+     * 本机直连公网映射地址探测入站可达性：实测多数路由器/运营商 NAT 支持回流(hairpin)，
+     * 局域网内直连穿透出的公网 IP:端口 会被送回本机监听端口，TCP 连接成功即证明
+     * 「外网可主动连入」——毫秒级完成且不依赖外部服务。
+     * 失败（拒绝/超时）不代表映射不可用：确有无回流的网络连接到 WAN 侧即被丢弃，
+     * 由调用方退回第三方探测节点验证。探测窗口内的回环 accept 不记为真实外网访问证据。
+     */
+    private boolean probeLocalInbound(String mapped) {
+        int ci = mapped.lastIndexOf(':');
+        if (ci <= 0) return false;
+        selfProbeUntil = System.currentTimeMillis() + 15_000;
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress(mapped.substring(0, ci),
+                    Integer.parseInt(mapped.substring(ci + 1))), 4000);
+            return true;
+        } catch (Exception e) {
+            return false; // 无回流网络/映射暂不可达：交由调用方退回第三方节点验证
         }
     }
 
@@ -1205,8 +1242,9 @@ final class StunRunner {
     }
 
     /**
-     * 公网入站可达性验证：第三方探测节点（check-host.net 免费 API）真实 TCP 连接映射地址，
-     * 验证「外网能否主动连入」（本机因 NAT 回流缺失无法自验）。提交后轮询结果（实测约 3 秒完成）：
+     * 公网入站可达性验证（本机直连失败后的兜底）：第三方探测节点（check-host.net 免费 API）
+     * 真实 TCP 连接映射地址，验证「外网能否主动连入」（无回流网络本机直连无法自验）。
+     * 提交后轮询结果（实测约 3 秒完成）：
      * 响应为顶层节点结果表，节点值 null=仍在探测；样本对象含 address 即连接成功，含 error 即失败。
      * 任一节点成功即视为可达；全部报错视为不可达（携带首个错误原因）；持续未完成/服务异常返回 null（本轮跳过）。
      * 第三方服务不可用不影响主流程，自测结论退回保活存活语义。
