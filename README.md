@@ -55,13 +55,13 @@ java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
 
 ## 四、功能说明
 
-### 1. DDNS 域名同步
+### 1. DDNS 域名同步【可用】
 - 服务商：阿里云 **云解析 DNS**、阿里云 **ESA**（边缘安全加速），均为官方 OpenAPI 直连
 - IP 来源三种模式：**公网接口自动获取**（多接口容错）/ **本机网卡**（可指定网卡）/ **手动输入**
 - 可配置域名、主机记录、记录类型（A/AAAA）、TTL、同步间隔；支持定时自动同步与手动触发
 - 同步结果（成功/失败、当前 IP、时间）实时展示并写入日志
 
-### 2. STUN 端口穿透（通道承载 UDP / TCP / HTTP 数据传输）
+### 2. STUN 端口穿透【可用】
 - 标准 STUN 协议（RFC 5389）实现 Binding 请求，建立/保活 NAT 映射，展示映射后的外网地址端口；保活响应实时刷新映射地址
 - 内置 RFC 3489 风格 NAT 类型探测（Full Cone / Restricted / Symmetric），界面展示穿透成功率说明
 - **UDP 任务**：外网发入映射端口的数据包按会话转发到内网目标服务，响应原路返回，可承载任意 UDP 业务数据
@@ -74,11 +74,11 @@ java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
   Full Cone 可直接访问；受限锥形仅允许已打洞对端；对称型（Symmetric）纯 STUN 无法穿透，
   此时建议路由器端口转发或改用中继方案（TCP 任务经出站探测建立的映射不受此限，见上）。另请确认主机防火墙已放行监听端口（Windows 需允许 Java 入站连接）
 
-### 3. WOL 网络唤醒
+### 3. WOL 网络唤醒【开发中】
 - 管理多台机器（名称 / MAC / 广播地址 / 端口），一键唤醒与批量唤醒，全部操作记入日志
 - 底层实现：向广播地址连发 3 次 UDP 魔术包（6×0xFF + MAC×16）
 
-### 4. SSL 证书申请与自动续期
+### 4. SSL 证书申请与自动续期【开发中】
 - 服务商：**Let's Encrypt**（免凭证）、**ZeroSSL**（需 EAB 凭证，见下文）
 - 验证方式：**HTTP01** 全自动（需公网可访问本机 80 端口，可用路由器转发到本服务端口）；
   **DNS01** 半自动（界面给出需添加的 TXT 记录，添加后点击"完成验证"）
@@ -86,7 +86,7 @@ java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
 - 证书详情（域名/颁发者/有效期/指纹）查看；私钥、证书、证书链（PEM）下载
 - 证书文件保存于 `data/certs/task-{id}/`，ACME 账号密钥保存于 `data/certs/acme/`
 
-### 5. 网站导航
+### 5. 网站导航【开发中】
 - 每个条目同时配置 **内网地址 + 外网地址** 两套访问入口
 - 前端自动识别访问来源（内网 IP 段 / 公网）智能优先选择地址，也支持手动切换
 - 卡片式展示，支持增删改、启停、权重排序与拖拽排序
@@ -108,20 +108,7 @@ java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
 > 安全提示：AccessKey 等密钥保存在本地 SQLite（`data/nexhome.db`）中，请妥善保管该文件与 `data/` 目录；
 > 证书私钥文件（`*.key.pem`）下载后请勿泄露。
 
-## 六、目录结构
-
-```
-运行目录/
-├── nexhome.jar              # 程序（含前端资源）
-├── nexhome.properties       # 端口等基础配置（自动生成）
-└── data/
-    ├── nexhome.db           # SQLite 数据库（配置/任务/日志）
-    └── certs/               # ACME 账号密钥与证书文件
-        ├── acme/{letsencrypt|zerossl}/account.pem
-        └── task-{id}/domain.key.pem | cert.pem | fullchain.pem
-```
-
-## 七、常见问题
+## 六、常见问题
 
 1. **忘记登录密码**：停止程序，删除 `data/nexhome.db` 中 `app_config` 表的 `auth.password` 行（或整库备份后删除），重启将重置为默认密码 `admin`（注意会丢失全部配置）。
 2. **HTTP01 证书申请失败**：确认域名已解析到本机公网 IP，且公网 80 端口能转发到本服务端口；否则改用 DNS01。
