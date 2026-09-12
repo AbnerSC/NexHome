@@ -94,7 +94,7 @@ window.stunCmd = async (id, cmd) => {
 };
 
 window.stunDelete = async id => {
-    if (!confirm('确定删除该穿透任务？')) return;
+    if (!(await confirmBox({ title: '删除穿透任务', message: '确定删除该穿透任务？', confirmText: '删除', danger: true }))) return;
     try { await api('DELETE', '/api/stun/tasks/' + id); toast('已删除'); renderStun(); }
     catch (e) { toast(e.message, 'err'); }
 };
@@ -250,7 +250,7 @@ window.stunServerForm = async (id) => {
 };
 
 window.stunServerDelete = async id => {
-    if (!confirm('确定删除该 STUN 服务器？已创建的穿透任务不受影响。')) return;
+    if (!(await confirmBox({ title: '删除 STUN 服务器', message: '确定删除该 STUN 服务器？已创建的穿透任务不受影响。', confirmText: '删除', danger: true }))) return;
     try { await api('DELETE', '/api/stun/servers/' + id); toast('已删除'); renderStunServers(); }
     catch (e) { toast(e.message, 'err'); }
 };

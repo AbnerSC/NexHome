@@ -143,7 +143,7 @@ window.navForm = async (id) => {
 };
 
 window.navDelete = async id => {
-    if (!confirm('确定删除该导航条目？')) return;
+    if (!(await confirmBox({ title: '删除导航条目', message: '确定删除该导航条目？', confirmText: '删除', danger: true }))) return;
     try { await api('DELETE', '/api/nav/items/' + id); toast('已删除'); renderHome(); }
     catch (e) { toast(e.message, 'err'); }
 };

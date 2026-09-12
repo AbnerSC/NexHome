@@ -56,8 +56,19 @@ window.ddnsSync = async id => {
 };
 
 window.ddnsDelete = async id => {
-    if (!confirm('确定删除该同步任务？')) return;
-    try { await api('DELETE', '/api/ddns/tasks/' + id); toast('已删除'); renderDdns(); }
+    if (!(await confirmBox({ title: '删除同步任务', message: '确定删除该同步任务？', confirmText: '删除', danger: true }))) return;
+    // 询问是否一并删除 DNS 服务商上的远程解析记录
+    const remote = await confirmBox({
+        title: '删除远程解析记录',
+        message: '是否同时删除远程服务商上的解析记录？\n\n【删除远程】同步删除远程解析记录\n【仅删本地】仅删除本地任务，保留远程记录',
+        confirmText: '删除远程',
+        cancelText: '仅删本地',
+        danger: true
+    });
+    try {
+        const msg = await api('DELETE', '/api/ddns/tasks/' + id + '?remote=' + remote);
+        toast(msg); renderDdns();
+    }
     catch (e) { toast(e.message, 'err'); }
 };
 

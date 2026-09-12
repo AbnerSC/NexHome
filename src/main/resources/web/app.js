@@ -53,6 +53,62 @@ function modal(title, bodyHtml) {
 
 function closeModal() { $('#modalMask').classList.add('hidden'); }
 
+/**
+ * 全局确认弹窗，替代原生 confirm，风格与主题一致。
+ * 后续所有需要“确定/取消”交互的场景都应使用本方法。
+ * @param {string|Object} opts 传字符串时视为提示内容；或配置对象
+ *   { title, message, confirmText, cancelText, danger }
+ * @returns {Promise<boolean>} 点击确认返回 true；取消、点击遮罩或按 Esc 返回 false
+ * 用法：if (!(await confirmBox({ message: '确定删除？', danger: true }))) return;
+ */
+function confirmBox(opts) {
+    if (typeof opts === 'string') opts = { message: opts };
+    const {
+        title = '操作确认',
+        message = '',
+        confirmText = '确定',
+        cancelText = '取消',
+        danger = false,
+    } = opts;
+
+    const mask = $('#confirmMask');
+    const box = mask.querySelector('.confirm-box');
+    const okBtn = $('#confirmOk');
+    const cancelBtn = $('#confirmCancel');
+
+    $('#confirmTitle').textContent = title;
+    $('#confirmMsg').textContent = message;
+    $('#confirmIcon').textContent = danger ? '⚠️' : '❔';
+    okBtn.textContent = confirmText;
+    cancelBtn.textContent = cancelText;
+    box.classList.toggle('danger', danger);
+
+    mask.classList.remove('hidden');
+    okBtn.focus();
+
+    return new Promise(resolve => {
+        const done = result => {
+            mask.classList.add('hidden');
+            okBtn.removeEventListener('click', onOk);
+            cancelBtn.removeEventListener('click', onCancel);
+            mask.removeEventListener('mousedown', onMask);
+            document.removeEventListener('keydown', onKey, true);
+            resolve(result);
+        };
+        const onOk = () => done(true);
+        const onCancel = () => done(false);
+        const onMask = e => { if (e.target === mask) done(false); };
+        const onKey = e => {
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(false); }
+            else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); done(true); }
+        };
+        okBtn.addEventListener('click', onOk);
+        cancelBtn.addEventListener('click', onCancel);
+        mask.addEventListener('mousedown', onMask);
+        document.addEventListener('keydown', onKey, true);
+    });
+}
+
 function badge(text, cls) { return `<span class="badge ${cls}">${esc(text)}</span>`; }
 
 function statusBadge(status) {

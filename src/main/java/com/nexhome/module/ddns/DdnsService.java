@@ -121,10 +121,47 @@ public final class DdnsService {
     private static void delete(Ctx ctx) throws Exception {
         long id = ctx.paramLong("id");
         Map<String, Object> task = mustGet(id);
+        // 默认同步删除远程解析记录，可通过 ?remote=false 仅删除本地任务
+        boolean remote = !"false".equalsIgnoreCase(ctx.query("remote"));
+        String remoteMsg = remote ? deleteRemoteRecord(task) : "（未删除远程解析记录）";
         cancel(id);
         Database.update("DELETE FROM ddns_task WHERE id=?", id);
-        Logs.info(Logs.DDNS, "删除同步任务 #" + id + ": " + task.get("name"));
-        ctx.ok("已删除");
+        Logs.info(Logs.DDNS, "删除同步任务 #" + id + ": " + task.get("name") + " " + remoteMsg);
+        ctx.ok("已删除 " + remoteMsg);
+    }
+
+    /**
+     * 删除任务对应的远程解析记录（尽力而为，失败不阻断本地删除）。
+     * <p>
+     * 优先使用缓存的 RecordId，缺失时回查线上记录；记录已不存在视为删除成功。
+     *
+     * @return 面向用户的删除结果描述
+     */
+    private static String deleteRemoteRecord(Map<String, Object> task) {
+        String fullDomain = fullRecordName(str(task, "rr"), str(task, "domain"));
+        try {
+            String recordId = str(task, "record_id");
+            if (recordId.isBlank()) {
+                // 缓存缺失（如从未同步成功）：回查线上记录定位 RecordId
+                JsonObject online = findOnlineRecord(task, fullDomain);
+                if (online == null) return "（远程无 " + fullDomain + " 解析记录，无需删除）";
+                recordId = recordIdOf(task, online);
+            }
+            String ak = str(task, "access_key_id"), sk = str(task, "access_key_secret");
+            if ("ALIYUN_DNS".equals(str(task, "provider"))) {
+                AliyunClient.dnsDeleteRecord(ak, sk, recordId);
+            } else {
+                AliyunClient.esaDeleteRecord(ak, sk, recordId);
+            }
+            return "（已删除远程解析记录 " + fullDomain + "）";
+        } catch (Exception e) {
+            // 记录已不存在（如被手动删除）视为删除成功
+            if (e instanceof AliyunApiException ae && ae.code.contains("NotFound")) {
+                return "（远程解析记录已不存在）";
+            }
+            Logs.error(Logs.DDNS, "删除远程解析记录失败[" + fullDomain + "]: " + e);
+            return "（远程解析记录删除失败: " + e.getMessage() + "）";
+        }
     }
 
     /** 表单必填与取值合法性校验 */

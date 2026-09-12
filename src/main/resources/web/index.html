@@ -58,6 +58,19 @@
     </div>
 </div>
 
+<!-- 全局确认弹窗（替代原生 confirm，由 app.js 的 confirmBox() 驱动） -->
+<div id="confirmMask" class="confirm-mask hidden">
+    <div class="confirm-box" role="dialog" aria-modal="true">
+        <div class="confirm-icon" id="confirmIcon">❔</div>
+        <div class="confirm-title" id="confirmTitle">操作确认</div>
+        <div class="confirm-msg" id="confirmMsg"></div>
+        <div class="confirm-actions">
+            <button type="button" class="btn" id="confirmCancel">取消</button>
+            <button type="button" class="btn primary" id="confirmOk">确定</button>
+        </div>
+    </div>
+</div>
+
 <!-- 轻提示 -->
 <div id="toast" class="toast hidden"></div>
 

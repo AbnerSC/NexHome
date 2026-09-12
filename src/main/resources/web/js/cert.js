@@ -109,7 +109,7 @@ window.certDownload = id => {
 };
 
 window.certDelete = async id => {
-    if (!confirm('确定删除该证书任务？磁盘上的证书文件也会被清理。')) return;
+    if (!(await confirmBox({ title: '删除证书任务', message: '确定删除该证书任务？磁盘上的证书文件也会被清理。', confirmText: '删除', danger: true }))) return;
     try { await api('DELETE', '/api/cert/tasks/' + id); toast('已删除'); renderCert(); }
     catch (e) { toast(e.message, 'err'); }
 };

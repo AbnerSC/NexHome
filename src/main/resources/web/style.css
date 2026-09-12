@@ -284,6 +284,63 @@ tr:hover td { background: #f8fafc; }
 .modal-close:hover { color: var(--red); }
 .modal-body { padding: 18px; }
 
+/* ---------- 全局确认弹窗（替代原生 confirm） ---------- */
+.confirm-mask {
+    position: fixed; inset: 0;
+    background: rgba(15, 23, 42, .5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    z-index: 300;
+    animation: confirm-fade .15s ease;
+}
+
+.confirm-box {
+    background: var(--panel);
+    border-radius: 14px;
+    width: 400px;
+    max-width: 100%;
+    padding: 26px 24px 20px;
+    text-align: center;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .3);
+    animation: confirm-pop .18s cubic-bezier(.34, 1.56, .64, 1);
+}
+
+.confirm-icon {
+    width: 52px; height: 52px;
+    margin: 0 auto 14px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 26px;
+    background: #eff6ff;
+}
+.confirm-box.danger .confirm-icon { background: #fef2f2; }
+
+.confirm-title { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+
+.confirm-msg {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.7;
+    white-space: pre-line;      /* 保留调用方传入的 \n 换行 */
+    margin-bottom: 20px;
+    word-break: break-word;
+}
+
+.confirm-actions { display: flex; gap: 10px; justify-content: center; }
+.confirm-actions .btn { min-width: 96px; justify-content: center; padding: 9px 14px; }
+.confirm-box.danger #confirmOk { background: var(--red); border-color: var(--red); }
+.confirm-box.danger #confirmOk:hover { background: #b91c1c; border-color: #b91c1c; color: #fff; }
+
+@keyframes confirm-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes confirm-pop {
+    from { opacity: 0; transform: scale(.9) translateY(-8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
 /* ---------- Toast ---------- */
 .toast {
     position: fixed;

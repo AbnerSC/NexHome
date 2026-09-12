@@ -95,6 +95,14 @@ public final class AliyunClient {
         checkDnsError(resp);
     }
 
+    /** 删除解析记录（云解析 DNS） */
+    public static void dnsDeleteRecord(String ak, String sk, String recordId) throws Exception {
+        JsonObject resp = dnsCall(ak, sk, Map.of(
+                "Action", "DeleteDomainRecord",
+                "RecordId", recordId));
+        checkDnsError(resp);
+    }
+
     private static void checkDnsError(JsonObject resp) {
         if (resp.has("Code")) {
             throw new IllegalStateException("阿里云DNS错误[" + resp.get("Code").getAsString() + "]: "
@@ -164,6 +172,13 @@ public final class AliyunClient {
                 "Type", type,
                 "Data.Value", value,
                 "Ttl", String.valueOf(ttl)));
+        checkEsaError(resp);
+    }
+
+    /** 删除 ESA 解析记录 */
+    public static void esaDeleteRecord(String ak, String sk, String recordId) throws Exception {
+        JsonObject resp = esaCall(ak, sk, "DeleteRecord", Map.of(
+                "RecordId", recordId));
         checkEsaError(resp);
     }
 
