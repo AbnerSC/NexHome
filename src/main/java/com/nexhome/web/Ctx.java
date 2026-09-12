@@ -2,106 +2,81 @@ package com.nexhome.web;
 
 import com.google.gson.JsonObject;
 import com.nexhome.core.JsonUtils;
-import com.sun.net.httpserver.HttpExchange;
+import io.javalin.http.Context;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * HTTP 请求上下文：封装 JDK 内置 HttpServer 的 HttpExchange，
- * 提供 JSON 响应、文件下载、查询参数、请求体解析等便捷方法。
+ * HTTP 请求上下文门面：封装 Javalin 的 {@link Context}，
+ * 对外提供项目统一的 JSON 响应（{ok,data} / {ok,error}）、文件下载、
+ * 查询参数、请求体解析等便捷方法，使各业务模块与底层 Web 框架解耦。
  */
 public final class Ctx {
 
-    private final HttpExchange ex;
-    private final Map<String, String> pathParams;
-    private String bodyCache;
+    private static final String JSON = "application/json; charset=utf-8";
 
-    public Ctx(HttpExchange ex, Map<String, String> pathParams) {
-        this.ex = ex;
-        this.pathParams = pathParams;
+    private final Context ctx;
+
+    public Ctx(Context ctx) {
+        this.ctx = ctx;
     }
 
-    /** 获取底层 HttpExchange（用于路由命中后携带路径参数重新包装） */
-    public HttpExchange exchange() {
-        return ex;
+    /** 获取底层 Javalin 上下文 */
+    public Context javalin() {
+        return ctx;
     }
 
     public String method() {
-        return ex.getRequestMethod();
+        return ctx.method().name();
     }
 
     public String path() {
-        return ex.getRequestURI().getPath();
+        return ctx.path();
     }
 
-    /** 路径参数，如 /api/ddns/tasks/{id} 中的 id */
+    /** 路径参数，如 /api/ddns/tasks/{id} 中的 id；不存在返回 null */
     public String param(String name) {
-        return pathParams.get(name);
+        return ctx.pathParamMap().get(name);
     }
 
     public long paramLong(String name) {
-        return Long.parseLong(pathParams.getOrDefault(name, "0"));
+        String v = param(name);
+        return v == null ? 0L : Long.parseLong(v);
     }
 
-    /** 查询参数 */
+    /** 查询参数，不存在返回 null */
     public String query(String name) {
-        String q = ex.getRequestURI().getRawQuery();
-        if (q == null) return null;
-        for (String pair : q.split("&")) {
-            int i = pair.indexOf('=');
-            String k = i < 0 ? pair : pair.substring(0, i);
-            if (k.equals(name)) {
-                return i < 0 ? "" : URLDecoder.decode(pair.substring(i + 1), StandardCharsets.UTF_8);
-            }
-        }
-        return null;
+        return ctx.queryParam(name);
     }
 
-    /** 请求头 */
+    /** 请求头，不存在返回 null */
     public String header(String name) {
-        return ex.getRequestHeaders().getFirst(name);
+        return ctx.header(name);
     }
 
-    /** 读取请求体（缓存，可多次调用） */
-    public String bodyText() throws IOException {
-        if (bodyCache == null) {
-            try (InputStream in = ex.getRequestBody()) {
-                ByteArrayOutputStream buf = new ByteArrayOutputStream();
-                in.transferTo(buf);
-                bodyCache = buf.toString(StandardCharsets.UTF_8);
-            }
-        }
-        return bodyCache;
+    /** 读取请求体（Javalin 内部已缓存，可多次调用） */
+    public String bodyText() {
+        return ctx.body();
     }
 
     /** 请求体解析为 JsonObject */
-    public JsonObject body() throws IOException {
-        return JsonUtils.parse(bodyText());
+    public JsonObject body() {
+        return JsonUtils.parse(ctx.body());
     }
 
     // ---------- 响应输出 ----------
 
     /** 输出 JSON 响应 */
-    public void json(int code, Object data) throws IOException {
-        byte[] bytes = JsonUtils.GSON.toJson(data).getBytes(StandardCharsets.UTF_8);
-        ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-        ex.sendResponseHeaders(code, bytes.length);
-        try (OutputStream out = ex.getResponseBody()) {
-            out.write(bytes);
-        }
+    public void json(int code, Object data) {
+        ctx.status(code).contentType(JSON).result(JsonUtils.GSON.toJson(data));
     }
 
     /** 输出成功 JSON：{ok:true, data:...} */
-    public void ok(Object data) throws IOException {
+    public void ok(Object data) {
         Map<String, Object> r = new HashMap<>();
         r.put("ok", true);
         r.put("data", data);
@@ -109,7 +84,7 @@ public final class Ctx {
     }
 
     /** 输出错误 JSON：{ok:false, error:...} */
-    public void fail(int code, String message) throws IOException {
+    public void fail(int code, String message) {
         Map<String, Object> r = new HashMap<>();
         r.put("ok", false);
         r.put("error", message);
@@ -119,35 +94,21 @@ public final class Ctx {
     /** 文件下载 */
     public void file(Path file, String downloadName) throws IOException {
         byte[] bytes = Files.readAllBytes(file);
-        ex.getResponseHeaders().set("Content-Type", "application/octet-stream");
-        ex.getResponseHeaders().set("Content-Disposition",
-                "attachment; filename=\"" + downloadName + "\"");
-        ex.sendResponseHeaders(200, bytes.length);
-        try (OutputStream out = ex.getResponseBody()) {
-            out.write(bytes);
-        }
+        ctx.header("Content-Disposition", "attachment; filename=\"" + downloadName + "\"");
+        ctx.status(200).contentType("application/octet-stream").result(bytes);
     }
 
     /** 纯文本响应（ACME http-01 校验文件） */
-    public void text(int code, String content, String contentType) throws IOException {
-        raw(code, content.getBytes(StandardCharsets.UTF_8), contentType);
+    public void text(int code, String content, String contentType) {
+        ctx.status(code).contentType(contentType).result(content);
     }
 
     /** 原始字节响应 */
-    public void raw(int code, byte[] bytes, String contentType) throws IOException {
-        ex.getResponseHeaders().set("Content-Type", contentType);
-        ex.sendResponseHeaders(code, bytes.length);
-        try (OutputStream out = ex.getResponseBody()) {
-            out.write(bytes);
-        }
+    public void raw(int code, byte[] bytes, String contentType) {
+        ctx.status(code).contentType(contentType).result(bytes);
     }
 
-    public void notFound() throws IOException {
+    public void notFound() {
         fail(404, "接口不存在");
-    }
-
-    /** 释放底层连接 */
-    public void close() {
-        ex.close();
     }
 }
