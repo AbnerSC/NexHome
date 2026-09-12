@@ -27,9 +27,11 @@ public final class IpResolver {
 
     /** 公网 IP 查询接口（逐个尝试，任一成功即返回） */
     private static final String[] PUBLIC_IP_URLS = {
-            "https://api.ipify.org",
-            "https://ifconfig.me/ip",
-            "https://api.my-ip.io/v2/ip.txt",
+            "https://ddns.oray.com/checkip",
+            "http://v4.66666.host:66/ip",
+            "https://myip.ipip.net",
+            "http://v4.666666.host:66/ip",
+            "https://4.ipw.cn",
             "https://ip.3322.net"
     };
 
