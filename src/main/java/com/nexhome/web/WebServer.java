@@ -1,6 +1,7 @@
 package com.nexhome.web;
 
 import com.nexhome.auth.AuthService;
+import com.nexhome.core.AppConfig;
 import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
 import com.nexhome.module.cert.CertService;
@@ -15,6 +16,8 @@ import io.javalin.http.staticfiles.Location;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -26,7 +29,8 @@ import java.util.Map;
  * 单端口同时提供：
  * <ul>
  *   <li>/api/** REST 接口（JSON，除登录/登录检查外需 X-Token 鉴权）</li>
- *   <li>内嵌于 jar 的前端静态资源（classpath 的 /web/ 目录）</li>
+ *   <li>前端静态资源：开发环境直接读 src/main/resources/web（改动刷新浏览器即生效），
+ *       生产环境读 jar 内置的 /web/ 目录，亦可通过 server.web.dir 外挂目录覆盖</li>
  *   <li>/.well-known/acme-challenge/** ACME http-01 证书校验文件</li>
  * </ul>
  * 各业务模块在启动前通过 {@link #route(String, String, Handler)} 声明接口，
@@ -57,12 +61,21 @@ public final class WebServer {
 
     /** 启动 HTTP 服务 */
     public static void start(int port) {
+        Path webDir = resolveWebDir();
         Javalin app = Javalin.create(config -> {
-            // 前端静态资源：classpath 的 /web 目录映射到根路径
+            // 前端静态资源：外部目录（开发热更新）或 classpath 的 /web 目录映射到根路径
             config.staticFiles.add(sf -> {
                 sf.hostedPath = "/";
-                sf.directory = "/web";
-                sf.location = Location.CLASSPATH;
+                if (webDir != null) {
+                    sf.directory = webDir.toString();
+                    sf.location = Location.EXTERNAL;
+                } else {
+                    sf.directory = "/web";
+                    sf.location = Location.CLASSPATH;
+                }
+                // 静态资源不做浏览器缓存：外部目录模式下改动刷新即生效，
+                // 生产升级 jar 后客户端也能立即拿到新版本（资源未做指纹命名）
+                sf.headers = Map.of("Cache-Control", "no-cache");
             });
 
             RoutesConfig routes = config.routes;
@@ -95,9 +108,11 @@ public final class WebServer {
 
             // 首页（GET 端点优先级高于静态资源，显式返回 index.html）
             routes.get("/", ctx -> {
-                byte[] idx = readResource("/web/index.html");
+                byte[] idx = webDir != null
+                        ? readFile(webDir.resolve("index.html"))
+                        : readResource("/web/index.html");
                 if (idx != null) {
-                    ctx.contentType("text/html; charset=utf-8").result(idx);
+                    ctx.header("Cache-Control", "no-cache").contentType("text/html; charset=utf-8").result(idx);
                 } else {
                     ctx.status(404).result("页面不存在");
                 }
@@ -116,6 +131,9 @@ public final class WebServer {
 
         app.start(port);
         Logs.info(Logs.SYS, "Web 服务已启动，访问地址: http://localhost:" + port);
+        if (webDir != null) {
+            Logs.info(Logs.SYS, "前端静态资源使用外部目录: " + webDir + "，改动后刷新浏览器即生效");
+        }
     }
 
     /** HTTP 方法字符串 -> Javalin HandlerType */
@@ -138,6 +156,44 @@ public final class WebServer {
         r.put("ok", false);
         r.put("error", message);
         ctx.status(code).contentType("application/json; charset=utf-8").result(JsonUtils.GSON.toJson(r));
+    }
+
+    /**
+     * 解析前端静态资源目录：
+     * <ol>
+     *   <li>配置项 server.web.dir 指定的外部目录（存在时最优先）</li>
+     *   <li>开发环境自动探测：以非 jar 方式运行（IDE 直接跑 main）且存在
+     *       src/main/resources/web 时，直接读源码目录，前端改动无需重新构建/重启</li>
+     *   <li>均不满足则返回 null，回退为 jar 内置 classpath 资源</li>
+     * </ol>
+     */
+    private static Path resolveWebDir() {
+        Path configured = AppConfig.webDir();
+        if (configured != null && Files.isDirectory(configured)) return configured;
+        if (!runningFromJar()) {
+            Path dev = AppConfig.WORK_DIR.resolve("src/main/resources/web");
+            if (Files.isDirectory(dev)) return dev;
+        }
+        return null;
+    }
+
+    /** 当前代码是否位于 jar 包内（fat-jar 运行） */
+    private static boolean runningFromJar() {
+        try {
+            return WebServer.class.getProtectionDomain().getCodeSource()
+                    .getLocation().toURI().getPath().endsWith(".jar");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 读取外部文件，失败返回 null */
+    private static byte[] readFile(Path file) {
+        try {
+            return Files.readAllBytes(file);
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     private static byte[] readResource(String path) {
