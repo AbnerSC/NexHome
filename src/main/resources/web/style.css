@@ -523,6 +523,19 @@ tr:hover td { background: #f8fafc; }
 
 .docker-kv td { border-bottom: 1px dashed var(--border); padding: 6px 10px 6px 0; }
 
+/* 宽模态框：Docker 详情 / Compose 容器列表 / 编排脚本等信息密集弹窗 */
+.modal.wide { width: 980px; }
+
+/* 可排序表头（Docker 容器列表）：点击切换升/降序 */
+th.docker-sort { cursor: pointer; user-select: none; }
+th.docker-sort:hover { color: var(--primary); }
+
+/* 编排脚本内容区：限高滚动，避免超长文件撑开弹窗 */
+.docker-yaml { max-height: 55vh; overflow: auto; }
+
+/* 模态框表格内按钮不换行（避免「详情」被窄列挤成两行） */
+.modal td .btn { white-space: nowrap; }
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 1200px) {
     /* 窄屏隐藏监控附加信息，保留核心数值与进度条 */

@@ -9,6 +9,9 @@ import com.nexhome.core.Logs;
 import com.nexhome.web.WebServer;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -23,7 +26,7 @@ import java.util.concurrent.TimeUnit;
  * <p>
  * 通过挂载的 docker.sock 或 DOCKER_HOST 直连 Docker Engine API，提供：
  * 容器列表（含实时内存/CPU、磁盘占用、容器 IP、暴露端口、Compose 归属）、
- * 容器详情（启动命令、环境变量、挂载、网络）、Compose 项目分组、整体概况。
+ * 容器详情（启动命令、环境变量、挂载、网络）、Compose 项目分组与编排脚本读取、整体概况。
  * <p>
  * 注意：stats 单次采样耗时 1~2 秒，属于慢速 IO，全部在 HTTP 请求线程内按需拉取并使用
  * 独立虚拟线程并行化，绝不占用 {@link com.nexhome.core.Tasks} 共享调度池（避免饥饿），
@@ -50,6 +53,8 @@ public final class DockerService {
         WebServer.route("GET", "/api/docker/containers/{id}", ctx ->
                 ctx.ok(detail(checkId(ctx.param("id")))));
         WebServer.route("GET", "/api/docker/compose", ctx -> ctx.ok(compose()));
+        WebServer.route("GET", "/api/docker/compose/file", ctx ->
+                ctx.ok(composeFile(ctx.query("project"))));
     }
 
     // ---------- 数据组装 ----------
@@ -386,8 +391,8 @@ public final class DockerService {
         JsonObject labels = config == null ? null : optObj(config, "Labels");
         o.addProperty("composeProject", JsonUtils.str(labels, "com.docker.compose.project"));
         o.addProperty("composeService", JsonUtils.str(labels, "com.docker.compose.service"));
-        o.addProperty("composeWorkdir", JsonUtils.str(labels, "com.docker.compose.workingdir"));
-        o.addProperty("composeFiles", JsonUtils.str(labels, "com.docker.compose.config-files"));
+        o.addProperty("composeWorkdir", JsonUtils.str(labels, "com.docker.compose.project.working_dir"));
+        o.addProperty("composeFiles", JsonUtils.str(labels, "com.docker.compose.project.config_files"));
 
         // 运行中容器补充实时资源
         if (JsonUtils.bool(o, "running", false)) {
@@ -417,8 +422,8 @@ public final class DockerService {
             JsonObject p = projects.computeIfAbsent(project, k -> {
                 JsonObject np = new JsonObject();
                 np.addProperty("name", k);
-                np.addProperty("workdir", JsonUtils.str(labels, "com.docker.compose.workingdir"));
-                np.addProperty("configFiles", JsonUtils.str(labels, "com.docker.compose.config-files"));
+                np.addProperty("workdir", JsonUtils.str(labels, "com.docker.compose.project.working_dir"));
+                np.addProperty("configFiles", JsonUtils.str(labels, "com.docker.compose.project.config_files"));
                 np.addProperty("containers", 0);
                 np.addProperty("running", 0);
                 np.add("services", new JsonArray());
@@ -433,6 +438,71 @@ public final class DockerService {
             addUnique(optArray(p, "images"), JsonUtils.str(c, "Image"));
         }
         return new ArrayList<>(projects.values());
+    }
+
+    /** Compose 编排脚本：按项目标签（working_dir + config_files）定位配置文件，从本进程可见的文件系统读取 */
+    private static Map<String, Object> composeFile(String project) throws IOException {
+        if (project == null || !project.matches(ID_PATTERN)) throw new IllegalArgumentException("非法的项目名称");
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("project", project);
+        String workdir = "", configFiles = "";
+        JsonArray arr = JsonParser.parseString(CLIENT.get("/containers/json?all=1")).getAsJsonArray();
+        for (JsonElement el : arr) {
+            JsonObject labels = optObj(el.getAsJsonObject(), "Labels");
+            if (!project.equals(JsonUtils.str(labels, "com.docker.compose.project"))) continue;
+            workdir = JsonUtils.str(labels, "com.docker.compose.project.working_dir");
+            configFiles = JsonUtils.str(labels, "com.docker.compose.project.config_files");
+            if (!configFiles.isBlank()) break;
+        }
+        r.put("workdir", workdir);
+        List<Map<String, Object>> files = new ArrayList<>();
+        r.put("files", files);
+        if (configFiles.isBlank()) {
+            r.put("error", "容器标签（com.docker.compose.project.config_files）中未获取到编排文件路径，该项目可能非 docker compose 部署");
+            return r;
+        }
+        // config_files 可能为逗号分隔的多个文件，相对路径以 working_dir 为基准
+        boolean missing = false;
+        for (String f : configFiles.split(",")) {
+            String name = f.trim();
+            if (name.isEmpty()) continue;
+            Path p = Paths.get(name).isAbsolute() || workdir.isBlank()
+                    ? Paths.get(name) : Paths.get(workdir).resolve(name);
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("name", name);
+            item.put("path", p.toString());
+            String content = readComposeFile(p);
+            if (content == null) {
+                missing = true;
+                item.put("error", "无法读取文件：" + p);
+            } else {
+                item.put("content", content);
+            }
+            files.add(item);
+        }
+        if (missing) {
+            r.put("hint", "本服务运行在容器内时无法直接读取宿主机路径：请将宿主机目录挂载进本服务容器（如 -v /:/hostfs:ro），"
+                    + "并以环境变量 NEXHOME_HOST_ROOT=/hostfs 声明挂载前缀；或直接裸机运行本服务");
+        }
+        return r;
+    }
+
+    /** 读取编排文件：先试原路径，再试环境变量 NEXHOME_HOST_ROOT 挂载前缀；限 512KB 内常规文件 */
+    private static String readComposeFile(Path p) {
+        List<Path> tries = new ArrayList<>();
+        tries.add(p);
+        String root = System.getenv("NEXHOME_HOST_ROOT");
+        if (root != null && !root.isBlank() && p.toString().startsWith("/")) {
+            tries.add(Paths.get(root).resolve(p.toString().substring(1)));
+        }
+        for (Path t : tries) {
+            try {
+                if (Files.isRegularFile(t) && Files.size(t) <= 512 * 1024) return Files.readString(t);
+            } catch (Exception ignored) {
+                // 单个候选路径不可读时尝试下一个
+            }
+        }
+        return null;
     }
 
     // ---------- 工具方法 ----------

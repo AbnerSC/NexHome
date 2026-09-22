@@ -79,9 +79,61 @@ function dockerToolbar(ov) {
 
 /* ---------------- 容器列表 ---------------- */
 
+let dockerListCache = [];       // 容器列表缓存：点击排序时本地重排，不重拉 stats
+let dockerViewCache = null;     // { head, ov }：排序后用缓存直接重绘表格
+let dockerSortKey = '';         // 排序列（空 = 服务端默认创建时间倒序）：name/image/state/mem/sizeRw/ip
+let dockerSortDir = 1;          // 排序方向：1 升序，-1 降序
+
 async function renderDockerContainers(head, ov) {
-    const list = await api('GET', '/api/docker/containers?stats=1');
-    const rows = list.map(c => {
+    dockerListCache = await api('GET', '/api/docker/containers?stats=1');
+    dockerViewCache = { head, ov };
+    paintDockerContainers();
+    setRefresh(renderDocker, 10000);
+}
+
+/** 可排序表头：点击切换该列升/降序 */
+function dockerSortTh(key, label, style) {
+    const arrow = dockerSortKey === key ? (dockerSortDir === 1 ? ' ▲' : ' ▼') : '';
+    return `<th class="docker-sort"${style ? ` style="${style}"` : ''} onclick="dockerSortBy('${key}')">${label}${arrow}</th>`;
+}
+
+/** 本地排序：内存/磁盘按数值、IP 按段数值比较，其余按本地化字符串序 */
+function dockerSorted() {
+    if (!dockerSortKey) return dockerListCache;
+    const k = dockerSortKey, d = dockerSortDir;
+    return [...dockerListCache].sort((a, b) => {
+        let r;
+        if (k === 'mem') r = (a.memUsed ?? -1) - (b.memUsed ?? -1);   // 未采样（非运行中）升序恒在前
+        else if (k === 'sizeRw') r = (a.sizeRw ?? 0) - (b.sizeRw ?? 0);
+        else if (k === 'ip') r = dockerCmpIp(a.ip, b.ip);
+        else r = String(a[k] || '').localeCompare(String(b[k] || ''));
+        return r * d;
+    });
+}
+
+/** IPv4 按段数值比较；空地址升序恒在前 */
+function dockerCmpIp(x, y) {
+    if (!x && !y) return 0;
+    if (!x) return -1;
+    if (!y) return 1;
+    const px = x.split('.'), py = y.split('.');
+    for (let i = 0; i < 4; i++) {
+        const d = (parseInt(px[i], 10) || 0) - (parseInt(py[i], 10) || 0);
+        if (d) return d;
+    }
+    return 0;
+}
+
+window.dockerSortBy = key => {
+    if (dockerSortKey === key) dockerSortDir = -dockerSortDir;
+    else { dockerSortKey = key; dockerSortDir = 1; }
+    paintDockerContainers();
+};
+
+/** 用缓存重绘容器表格（排序操作不重新请求 stats） */
+function paintDockerContainers() {
+    const { head, ov } = dockerViewCache;
+    const rows = dockerSorted().map(c => {
         const mem = c.memLimit != null && c.memLimit > 0
             ? `${fmtBytes(c.memUsed)} / ${fmtBytes(c.memLimit)}<div class="docker-mem-bar"><i style="width:${Math.min(100, (c.memUsed * 100 / c.memLimit)).toFixed(1)}%"></i></div>`
             : '<span class="muted">-</span>';
@@ -90,19 +142,19 @@ async function renderDockerContainers(head, ov) {
             : badge(`${p.privatePort}/${p.type}`, 'gray')).join(' ');
         return `
       <tr>
-        <td style="width:180px"><div style="font-weight:600">${esc(c.name)}</div>
+        <td><div style="font-weight:600">${esc(c.name)}</div>
           <div class="muted small">${esc(c.shortId)} · ${esc(c.status)}</div></td>
         <td style="word-break:break-all">${esc(c.image)}</td>
-        <td style="width:80px">${dockerStateBadge(c.state)}</td>
-        <td style="width:130px">${mem}</td>
-        <td style="width:80px" title="可写层">${fmtBytes(c.sizeRw)}</td>
-        <td style="width:120px" class="docker-mono">${esc(c.ip || '-')}
+        <td>${dockerStateBadge(c.state)}</td>
+        <td>${mem}</td>
+        <td title="可写层">${fmtBytes(c.sizeRw)}</td>
+        <td class="docker-mono">${esc(c.ip || '-')}
           ${c.network ? `<div class="muted small">${esc(c.network)}</div>` : ''}</td>
         <td>${ports || '<span class="muted">-</span>'}</td>
-        <td style="width:150px">${c.composeProject
+        <td>${c.composeProject
             ? badge(esc(c.composeProject) + (c.composeService ? '/' + esc(c.composeService) : ''), 'info')
             : '<span class="muted">-</span>'}</td>
-        <td style="width:60px"><button class="btn small" onclick="dockerDetail('${esc(c.id)}')">详情</button></td>
+        <td><button class="btn small" onclick="dockerDetail('${esc(c.id)}')">详情</button></td>
       </tr>`;
     }).join('');
     $('#pageBody').innerHTML = `
@@ -110,14 +162,17 @@ async function renderDockerContainers(head, ov) {
       ${dockerToolbar(ov)}
       <div class="panel" style="padding:6px 10px"><table>
         <thead><tr>
-          <th style="width:180px">容器名称</th><th>镜像</th><th style="width:80px">状态</th>
-          <th style="width:130px">内存</th><th style="width:80px">磁盘(可写)</th>
-          <th style="width:120px">容器 IP</th><th>暴露端口</th><th style="width:150px">Compose</th>
+          ${dockerSortTh('name', '容器名称', 'width:180px')}
+          ${dockerSortTh('image', '镜像')}
+          ${dockerSortTh('state', '状态', 'width:80px')}
+          ${dockerSortTh('mem', '内存', 'width:130px')}
+          ${dockerSortTh('sizeRw', '磁盘(可写)', 'width:90px')}
+          ${dockerSortTh('ip', '容器 IP', 'width:120px')}
+          <th>暴露端口</th><th style="width:150px">Compose</th>
           <th style="width:70px">操作</th>
         </tr></thead>
         <tbody>${rows || '<tr><td colspan="9" class="muted">暂无容器</td></tr>'}</tbody>
       </table></div>`;
-    setRefresh(renderDocker, 10000);
 }
 
 /* ---------------- 容器详情 ---------------- */
@@ -184,7 +239,7 @@ window.dockerDetail = async id => {
       <table>${mntRows ? '<thead><tr><th style="width:60px">类型</th><th>宿主机路径</th><th>容器内路径</th><th style="width:70px">模式</th></tr></thead><tbody>' + mntRows + '</tbody>'
         : '<tbody><tr><td class="muted">无挂载</td></tr></tbody>'}</table>
       ${sec('环境变量')}
-      <table><tbody>${envRows || '<tr><td class="muted">无</td></tr>'}</tbody></table>`);
+      <table><tbody>${envRows || '<tr><td class="muted">无</td></tr>'}</tbody></table>`, 'wide');
 };
 
 /* ---------------- Compose 项目 ---------------- */
@@ -199,7 +254,10 @@ async function renderDockerCompose(head, ov) {
         <td style="width:80px">${p.running}/${p.containers}</td>
         <td>${(p.services || []).map(s => badge(esc(s), 'gray')).join(' ')}</td>
         <td style="width:60px">${p.images.length}</td>
-        <td style="width:90px"><button class="btn small" onclick="dockerProjectDetail('${esc(p.name)}')">查看容器</button></td>
+        <td style="width:170px"><div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn small" onclick="dockerProjectDetail('${esc(p.name)}')">查看容器</button>
+          <button class="btn small" onclick="dockerComposeFile('${esc(p.name)}')">查看编排</button>
+        </div></td>
       </tr>`).join('');
     $('#pageBody').innerHTML = `
       ${head}
@@ -209,32 +267,51 @@ async function renderDockerCompose(head, ov) {
         <thead><tr>
           <th style="width:150px">项目</th><th>工作目录</th><th>配置文件</th>
           <th style="width:80px">运行/总数</th><th>服务</th><th style="width:60px">镜像数</th>
-          <th style="width:90px">操作</th>
+          <th style="width:170px">操作</th>
         </tr></thead>
         <tbody>${rows || '<tr><td colspan="7" class="muted">未发现 Compose 项目（仅统计携带 compose 标签的容器）</td></tr>'}</tbody>
       </table></div>`;
     setRefresh(renderDocker, 15000);
 }
 
-/** 项目详情弹窗：列出该 Compose 项目下的全部容器 */
+/** 项目详情弹窗：宽模态框列出该 Compose 项目下全部容器；下钻容器详情关闭后自动回到本列表 */
 window.dockerProjectDetail = async name => {
     let list;
     try { list = await api('GET', '/api/docker/containers?stats=0'); }
     catch (e) { toast(e.message, 'err'); return; }
     const rows = list.filter(c => c.composeProject === name).map(c => `
       <tr>
-        <td style="font-weight:600">${esc(c.name)}</td>
+        <td><div style="font-weight:600">${esc(c.name)}</div>
+          <div class="muted small docker-mono">${esc(c.shortId)}</div></td>
         <td>${esc(c.composeService || '-')}</td>
         <td>${dockerStateBadge(c.state)}</td>
-        <td>${esc(c.status)}</td>
+        <td class="small">${esc(c.status)}</td>
         <td style="word-break:break-all">${esc(c.image)}</td>
+        <td class="docker-mono">${esc(c.ip || '-')}</td>
         <td><button class="btn small" onclick="dockerDetail('${esc(c.id)}')">详情</button></td>
       </tr>`).join('');
     modal(`Compose 项目 · ${name}`, `
       <table>
-        <thead><tr><th>容器</th><th style="width:90px">服务</th><th style="width:70px">状态</th><th style="width:110px">运行时长</th><th>镜像</th><th style="width:60px">操作</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="6" class="muted">该项目当前无容器</td></tr>'}</tbody>
-      </table>`);
+        <thead><tr><th style="width:170px">容器</th><th style="width:110px">服务</th><th style="width:86px">状态</th>
+          <th style="width:140px">运行时长</th><th>镜像</th><th style="width:110px">容器 IP</th><th style="width:70px">操作</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="7" class="muted">该项目当前无容器</td></tr>'}</tbody>
+      </table>`, 'wide');
+};
+
+/** 编排脚本弹窗：后端按项目标签定位并读取 compose 配置文件内容 */
+window.dockerComposeFile = async name => {
+    let r;
+    try { r = await api('GET', '/api/docker/compose/file?project=' + encodeURIComponent(name)); }
+    catch (e) { toast(e.message, 'err'); return; }
+    const blocks = (r.files || []).map(f => f.content != null
+        ? `<h4>${esc(f.path)}</h4><div class="docker-mono docker-yaml">${esc(f.content)}</div>`
+        : `<h4>${esc(f.path || f.name)}</h4>
+           <div class="tip" style="background:#fef2f2;border-color:#fecaca;color:var(--red)">${esc(f.error || '读取失败')}</div>`).join('');
+    modal(`编排脚本 · ${name}`, `
+      <div class="muted small" style="margin-bottom:10px">工作目录：<span class="docker-mono">${esc(r.workdir || '-')}</span></div>
+      ${r.error ? `<div class="tip">${esc(r.error)}</div>` : ''}
+      ${blocks || '<div class="tip">未发现该项目的编排文件</div>'}
+      ${r.hint ? `<div class="tip" style="background:#fef2f2;border-color:#fecaca;color:var(--red)">${esc(r.hint)}</div>` : ''}`, 'wide');
 };
 
 window.dockerSwitchTab = t => {

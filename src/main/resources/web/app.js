@@ -45,13 +45,38 @@ async function api(method, path, body) {
     return data.data;
 }
 
-function modal(title, bodyHtml) {
+/** 模态框栈：嵌套打开新模态框时保存上一层的标题/内容/宽度类，关闭时逐层回退 */
+const modalStack = [];
+
+/**
+ * 打开模态框；若当前已有模态框打开则自动入栈，关闭时回退到上一层
+ * （如从 Compose 项目容器列表下钻容器详情，关闭详情后回到项目列表）。
+ * @param {string} cls 可选宽度样式类，如 'wide'
+ */
+function modal(title, bodyHtml, cls) {
+    const mask = $('#modalMask');
+    if (mask.classList.contains('hidden')) modalStack.length = 0;
+    else modalStack.push({
+        title: $('#modalTitle').textContent,
+        body: $('#modalBody').innerHTML,
+        cls: $('#modalBox').className.replace('modal', '').trim()
+    });
     $('#modalTitle').textContent = title;
     $('#modalBody').innerHTML = bodyHtml;
-    $('#modalMask').classList.remove('hidden');
+    $('#modalBox').className = 'modal' + (cls ? ' ' + cls : '');
+    mask.classList.remove('hidden');
 }
 
-function closeModal() { $('#modalMask').classList.add('hidden'); }
+function closeModal() {
+    if (modalStack.length) {
+        const prev = modalStack.pop();
+        $('#modalTitle').textContent = prev.title;
+        $('#modalBody').innerHTML = prev.body;
+        $('#modalBox').className = 'modal' + (prev.cls ? ' ' + prev.cls : '');
+        return;
+    }
+    $('#modalMask').classList.add('hidden');
+}
 
 /**
  * 全局确认弹窗，替代原生 confirm，风格与主题一致。
