@@ -509,7 +509,9 @@ tr:hover td { background: #f8fafc; }
     word-break: break-all;
 }
 
-.modal .docker-mono {
+/* 代码块样式仅用于非表格单元格：display:block 作用于 td 会使其失去表格单元格特性，
+   导致行高错乱（如 Compose 容器列表的容器 IP 列）；td 上的 docker-mono 仅保留等宽字体 */
+.modal .docker-mono:not(td) {
     background: #f8fafc;
     border: 1px solid var(--border);
     border-radius: 6px;
