@@ -19,7 +19,7 @@ async function renderLogs() {
       <div class="toolbar">
         <select id="logModuleSel" class="btn" style="padding:6px 10px">
           <option value="">全部模块</option>
-          ${['SYSTEM', 'AUTH', 'DDNS', 'STUN', 'WOL', 'CERT', 'NAV'].map(m =>
+          ${['SYSTEM', 'AUTH', 'DDNS', 'STUN', 'WOL', 'CERT', 'NAV', 'DOCKER'].map(m =>
               `<option value="${m}" ${logModule === m ? 'selected' : ''}>${m}</option>`).join('')}
         </select>
         <button class="btn" onclick="logPage=1;renderLogs()">刷新</button>

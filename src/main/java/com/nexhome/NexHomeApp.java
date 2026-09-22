@@ -7,6 +7,7 @@ import com.nexhome.core.Logs;
 import com.nexhome.core.Tasks;
 import com.nexhome.module.cert.CertService;
 import com.nexhome.module.ddns.DdnsService;
+import com.nexhome.module.docker.DockerService;
 import com.nexhome.module.nav.NavService;
 import com.nexhome.module.stun.StunServerService;
 import com.nexhome.module.stun.StunService;
@@ -18,7 +19,7 @@ import com.nexhome.web.WebServer;
  * NexHome（联枢）主程序入口。
  * <p>
  * 一站式内网节点守护工具：DDNS 域名同步 / STUN 端口穿透 / WOL 网络唤醒 /
- * SSL 证书自动续期 / 网站导航，前后端一体化单进程部署。
+ * SSL 证书自动续期 / 网站导航 / Docker 容器观测，前后端一体化单进程部署。
  */
 public final class NexHomeApp {
 
@@ -48,6 +49,7 @@ public final class NexHomeApp {
             WolService.registerRoutes();
             CertService.registerRoutes();
             NavService.registerRoutes();
+            DockerService.registerRoutes();
 
             // 5. 启动业务调度与后台任务
             CertService.init();      // 证书自动续期检查

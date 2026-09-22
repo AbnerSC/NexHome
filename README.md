@@ -9,7 +9,7 @@ https://github.com/AbnerSC/NexHome.git
 > 一站式内网节点守护工具，面向家庭 / 小型机房服务器，把内网能力安全对外打通。
 
 NexHome 是一款单进程、前后端一体化的轻量 Java 服务，内置 Web 服务器与 Web 管理界面，
-集成 **DDNS 域名同步、STUN 端口穿透、WOL 网络唤醒、SSL 证书自动申请续期、网站导航** 五大功能。
+集成 **DDNS 域名同步、STUN 端口穿透、WOL 网络唤醒、SSL 证书自动申请续期、网站导航、Docker 容器观测** 六大功能。
 只启动一个 Java 程序、只占用一个端口，配置与日志全部持久化在 SQLite（程序运行目录 `data/`）。
 
 ---
@@ -53,6 +53,20 @@ java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
 
 低内存环境可选：`java -Xmx128m --enable-native-access=ALL-UNNAMED -jar nexhome.jar`
 
+### Docker 部署（挂载宿主机 docker.sock 管理容器）
+
+```bash
+docker run -d --name nexhome \
+  -p 8090:8090 \
+  -v nexhome-data:/app/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  babyfly/nex-home:latest
+```
+
+挂载 `/var/run/docker.sock` 后，「Docker 容器」模块即可查看宿主机上的容器与 Compose 项目；
+容器内进程需有 socket 读写权限（默认 root 满足，非 root 用户需将其加入宿主 `docker` 组对应的 gid）。
+裸机 / 远程 Docker 场景可用环境变量 `DOCKER_HOST` 指定 `unix:///var/run/docker.sock` 或 `tcp://host:2375`（tcp 需自行保障安全，切勿暴露公网）。
+
 ## 四、功能说明
 
 ### 1. DDNS 域名同步
@@ -91,7 +105,14 @@ java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
 - 前端自动识别访问来源（内网 IP 段 / 公网）智能优先选择地址，也支持手动切换
 - 卡片式展示，支持增删改、启停、权重排序与拖拽排序
 
-### 6. 其他
+### 6. Docker 容器观测（只读）
+- 通过挂载的 **docker.sock** 直连 Docker Engine API（零第三方依赖，JDK 原生 Unix Domain Socket）
+- **容器列表**：名称、镜像、状态、实时内存（含进度条）、磁盘占用（可写层）、容器内 IP、暴露端口（含宿主机映射）、Compose 归属，10 秒自动刷新
+- **容器详情**：启动命令（Entrypoint + Cmd）、工作目录、环境变量、挂载、网络（IP/网关/MAC）、端口映射、CPU/内存限制与实时占用、重启策略
+- **Compose 项目**：按容器标签自动分组，展示工作目录、配置文件、服务列表、运行状态，可下钻查看项目内全部容器
+- **整体概况**：Docker 版本、宿主机系统、镜像/卷磁盘占用汇总
+
+### 7. 其他
 - 全模块操作日志（SQLite 持久化，界面分页查询、模块过滤、自动刷新）
 - 内置登录鉴权（密码登录，会话 Token 24 小时有效）
 - 全部异常统一捕获并在界面提示
@@ -129,3 +150,5 @@ java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
 4. **STUN 探测无响应**：更换 STUN 服务器（如 `stun.qq.com:3478`、`stun.miwifi.com:3478`），并确认本机可访问公网 UDP。
 5. **TCP 任务运行中但外网仍无法访问映射地址**：依次排查——① 探测 NAT 类型，对称型无法纯 STUN 穿透，改用路由器端口转发；
    ② 受限锥形需填写「对端公网地址」由本端主动打洞，或在对端配合下互打；③ 确认主机防火墙已放行监听端口（Windows：允许 Java 通过专用/公用网络的入站规则）。
+6. **Docker 模块提示未连接**：容器部署需 `-v /var/run/docker.sock:/var/run/docker.sock` 挂载；
+   报权限错误（Permission denied）说明容器内用户无 socket 读写权限；远程 Docker 检查 `DOCKER_HOST` 与网络连通性。

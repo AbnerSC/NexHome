@@ -21,6 +21,7 @@ public final class Logs {
     public static final String WOL  = "WOL";
     public static final String CERT = "CERT";
     public static final String NAV  = "NAV";
+    public static final String DOCKER = "DOCKER";
 
     private Logs() {
     }

@@ -1,7 +1,7 @@
 /* ============ NexHome 前端逻辑（原生 JS，无框架） ============ */
 /* 主入口：通用工具、登录鉴权、页面路由。
    各菜单模块的逻辑拆分到 js/ 目录（须在 index.html 中先于本文件加载）：
-   home=网站导航 ddns=DDNS stun=STUN wol=WOL cert=SSL证书 logs=日志 settings=设置 */
+   home=网站导航 ddns=DDNS stun=STUN wol=WOL cert=SSL证书 docker=Docker logs=日志 settings=设置 */
 'use strict';
 
 const $ = s => document.querySelector(s);
@@ -121,12 +121,12 @@ async function loadSysInfo() {
 
 const PAGE_TITLES = {
     home: '网站导航', ddns: 'DDNS 域名同步', stun: 'STUN 端口穿透',
-    wol: 'WOL 网络唤醒', cert: 'SSL 证书管理', logs: '操作日志', settings: '系统设置'
+    wol: 'WOL 网络唤醒', cert: 'SSL 证书管理', docker: 'Docker 容器', logs: '操作日志', settings: '系统设置'
 };
 
 const RENDER = {
     home: renderHome, ddns: renderDdns, stun: renderStun,
-    wol: renderWol, cert: renderCert, logs: renderLogs, settings: renderSettings
+    wol: renderWol, cert: renderCert, docker: renderDocker, logs: renderLogs, settings: renderSettings
 };
 
 function setPage(page) {

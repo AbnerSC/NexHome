@@ -370,6 +370,56 @@ tr:hover td { background: #f8fafc; }
 
 .pager { display: flex; gap: 8px; align-items: center; margin-top: 12px; justify-content: flex-end; }
 
+/* ---------- Docker 模块 ---------- */
+.docker-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.docker-stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    box-shadow: var(--shadow);
+}
+
+.docker-stat .v { font-size: 17px; font-weight: 600; word-break: break-all; }
+.docker-stat .l { font-size: 12px; color: var(--muted); margin-top: 3px; word-break: break-all; }
+
+.docker-mem-bar {
+    height: 4px;
+    background: #e5e7eb;
+    border-radius: 2px;
+    margin-top: 5px;
+    overflow: hidden;
+    max-width: 130px;
+}
+
+.docker-mem-bar i { display: block; height: 100%; background: var(--primary); border-radius: 2px; }
+
+.docker-mono {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12px;
+    word-break: break-all;
+}
+
+.modal .docker-mono {
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    white-space: pre-wrap;
+    display: block;
+    margin: 4px 0;
+}
+
+.modal h4 { margin: 16px 0 6px; font-size: 13px; color: var(--muted); }
+
+.docker-kv td { border-bottom: 1px dashed var(--border); padding: 6px 10px 6px 0; }
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 860px) {
     .layout { flex-direction: column; }
