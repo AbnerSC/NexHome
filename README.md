@@ -63,6 +63,34 @@ docker run -d --name nexhome \
   babyfly/nex-home:latest
 ```
 
+compose 部署示例（host 网络 + socket 挂载）：
+
+```yaml
+services:
+  nex-home:
+    image: scdm/nex-home:latest
+    container_name: nex-home
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=Asia/Shanghai
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    mem_limit: 512m          # 256m→512m：容纳 -Xmx256m + Metaspace128m + CodeCache64m，否则 OOM Kill
+    healthcheck:
+      # 镜像无 curl，改用 bash /dev/tcp 探测端口（仅验证端口可连）
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8090 && echo -n '' >&3"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+```
+
+> 注意：运行镜像基于 eclipse-temurin，**不含 curl/wget**，healthcheck 切勿使用 `curl -f`，
+> 否则容器将始终处于 unhealthy。
+
 挂载 `/var/run/docker.sock` 后，「Docker 容器」模块即可查看宿主机上的容器与 Compose 项目；
 容器内进程需有 socket 读写权限（默认 root 满足，非 root 用户需将其加入宿主 `docker` 组对应的 gid）。
 裸机 / 远程 Docker 场景可用环境变量 `DOCKER_HOST` 指定 `unix:///var/run/docker.sock` 或 `tcp://host:2375`（tcp 需自行保障安全，切勿暴露公网）。

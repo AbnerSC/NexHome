@@ -445,13 +445,18 @@ public final class DockerService {
     /** 连接失败转为对用户友好的提示 */
     private static String friendly(Exception e) {
         String m = e.getMessage() == null ? e.toString() : e.getMessage();
-        if (m.contains("Unsupported address type")) {
-            return "当前平台/运行时不支持 Unix Domain Socket（" + m + "），"
-                    + "Windows 本地运行请通过环境变量 DOCKER_HOST=tcp://host:2375 连接 Docker";
+        if (m.startsWith("DOCKER_HOST 配置无效")) {
+            return m + "；正确格式：unix:///var/run/docker.sock 或 tcp://host:2375";
+        }
+        if (m.contains("Unsupported address type") || m.contains("UnsupportedAddressType")) {
+            // 理论上不再出现（已改用 SocketChannel），保留兜底：极老运行时不支持 UDS
+            return "当前 Java 运行时不支持 Unix Domain Socket（" + m + "），"
+                    + "请升级运行时或改用环境变量 DOCKER_HOST=tcp://host:2375";
         }
         if (m.contains("No such file") || m.contains("Connection refused")
-                || m.contains("connect failed") || m.contains("SocketException")) {
-            return "无法连接 Docker Daemon（" + m + "），请检查 docker.sock 挂载或 DOCKER_HOST 配置";
+                || m.contains("connect failed") || m.contains("SocketException")
+                || m.contains("Permission denied")) {
+            return "无法连接 Docker Daemon（" + m + "），请检查 docker.sock 挂载/读写权限或 DOCKER_HOST 配置";
         }
         return m;
     }
