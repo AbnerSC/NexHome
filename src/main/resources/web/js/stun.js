@@ -36,10 +36,12 @@ async function renderStun() {
         <br><b>注意：任务运行中 ≠ 外网可访问。</b>外网能否主动连入取决于 NAT 过滤行为：
         Full Cone 可直接访问；受限锥形仅允许已打洞的对端访问；<b>对称型（Symmetric）NAT 纯 STUN 无法穿透</b>，
         请改用路由器端口转发。同时请确认主机防火墙已放行监听端口（Windows 需允许 Java 入站连接）。
-        <br><b>可用性自测：</b>穿透成功后系统自动测试一次（TCP 连接映射地址 / UDP 发探测包）。
-        <b>自测走本机→路由器 WAN 回环路径：路由器不支持 NAT 回流(hairpin)或拦截未请求入站时（企业路由器常见），即使穿透正常自测也会被拒绝</b>
-        （典型表现 Connection refused）。此时自测结果记为「无法判断」（黄色），<b>不代表穿透失败</b>，请用外部设备（手机流量等）访问映射地址验证真实可达性；
-        仅连接超时等其他失败会触发自动重新穿透并复测（最多 3 次），被拒绝不触发重穿。
+        <br><b>可用性自测：</b>穿透成功后系统自动测试一次，也可在操作列点「自测」手动复测。
+        自测先验证<b>映射保活存活</b>（UDP：STUN 绑定响应；TCP：保活链路交互 + 本地监听），
+        TCP 任务随后自动做<b>公网入站验证</b>：优先从本机直连穿透出的公网 IP:端口——实测多数路由器/运营商支持
+        NAT 回流(hairpin)，局域网访问公网映射会被送回本机，<b>连接成功即证明外网可主动连入</b>（毫秒级完成、不依赖外部服务）；
+        直连失败不代表映射不可用（部分网络无回流，连接在 WAN 侧即被丢弃），自动退回第三方探测节点真实连接映射地址复验，
+        仍不可达时请检查上层 NAT/运营商策略或用外部设备（手机流量等）验证。
         <br>穿透启动时同时尝试 <b>UPnP 端口映射</b>（需路由器开启 UPnP，路由器不支持时可在任务中关闭）：
         路由器 WAN 口为公网时，UPnP 映射即外网可主动连入的权威通道（展示端口固定）。若路由器 WAN 口非公网（CGNAT，如 100.64.x.x）
         或未启用 UPnP，TCP 任务会改从监听端口向支持 TCP 的 STUN 服务器出站（配置服务器不支持时自动改用「STUN 服务器维护」中标记支持 TCP 的服务器）建立映射并周期保活，
@@ -52,15 +54,15 @@ async function renderStun() {
       <div class="panel"><table>
         <thead>
             <tr>
-                <th style="width: 160px">任务</th>
-                <th style="width: 160px">内网目标</th>
-                <th style="width: 200px">STUN服务器</th>
-                <th style="width: 120px">状态</th>
-                <th style="width: 160px">NAT类型</th>
-                <th style="width: 180px">外网映射地址</th>
-                <th style="width: 180px">穿透成功时间</th>
+                <th style="width: 8%">任务</th>
+                <th style="width: 10%">内网目标</th>
+                <th style="width: 12%">STUN服务器</th>
+                <th style="width: 7%">状态</th>
+                <th style="width: 7%">NAT类型</th>
+                <th style="width: 13%">外网映射地址</th>
+                <th style="width: 13%">穿透成功时间</th>
                 <th>可用性自测</th>
-                <th style="width: 240px">操作</th>
+                <th style="width: 230px">操作</th>
             </tr>
         </thead>
         <tbody>${rows || '<tr><td colspan="9" class="muted">暂无任务</td></tr>'}</tbody>
@@ -94,7 +96,7 @@ window.stunCmd = async (id, cmd) => {
 };
 
 window.stunDelete = async id => {
-    if (!confirm('确定删除该穿透任务？')) return;
+    if (!(await confirmBox({ title: '删除穿透任务', message: '确定删除该穿透任务？', confirmText: '删除', danger: true }))) return;
     try { await api('DELETE', '/api/stun/tasks/' + id); toast('已删除'); renderStun(); }
     catch (e) { toast(e.message, 'err'); }
 };
@@ -250,7 +252,7 @@ window.stunServerForm = async (id) => {
 };
 
 window.stunServerDelete = async id => {
-    if (!confirm('确定删除该 STUN 服务器？已创建的穿透任务不受影响。')) return;
+    if (!(await confirmBox({ title: '删除 STUN 服务器', message: '确定删除该 STUN 服务器？已创建的穿透任务不受影响。', confirmText: '删除', danger: true }))) return;
     try { await api('DELETE', '/api/stun/servers/' + id); toast('已删除'); renderStunServers(); }
     catch (e) { toast(e.message, 'err'); }
 };

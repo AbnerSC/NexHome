@@ -43,6 +43,8 @@
     <main class="content">
         <header class="topbar">
             <h2 id="pageTitle">网站导航</h2>
+            <!-- 顶栏系统资源监控（CPU / 内存 / 虚拟内存），由 app.js 每 5 秒刷新 -->
+            <div id="sysMetrics" class="sys-metrics"></div>
             <div class="topbar-actions">
                 <button class="btn ghost small" id="btnLogout">退出登录</button>
             </div>
@@ -56,6 +58,19 @@
     <div class="modal">
         <div class="modal-head"><span id="modalTitle"></span><span class="modal-close" id="modalClose">✕</span></div>
         <div id="modalBody" class="modal-body"></div>
+    </div>
+</div>
+
+<!-- 全局确认弹窗（替代原生 confirm，由 app.js 的 confirmBox() 驱动） -->
+<div id="confirmMask" class="confirm-mask hidden">
+    <div class="confirm-box" role="dialog" aria-modal="true">
+        <div class="confirm-icon" id="confirmIcon">❔</div>
+        <div class="confirm-title" id="confirmTitle">操作确认</div>
+        <div class="confirm-msg" id="confirmMsg"></div>
+        <div class="confirm-actions">
+            <button type="button" class="btn" id="confirmCancel">取消</button>
+            <button type="button" class="btn primary" id="confirmOk">确定</button>
+        </div>
     </div>
 </div>
 

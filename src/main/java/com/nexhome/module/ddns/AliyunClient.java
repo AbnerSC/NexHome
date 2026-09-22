@@ -51,19 +51,21 @@ public final class AliyunClient {
     /**
      * 查询域名下指定主机记录的解析列表。
      *
-     * @return Records.Record JSON 数组
+     * @return DomainRecords.Record JSON 数组
      */
     public static JsonArray dnsDescribeRecords(String ak, String sk, String domain, String rr) throws Exception {
         JsonObject resp = dnsCall(ak, sk, Map.of(
                 "Action", "DescribeDomainRecords",
                 "DomainName", domain,
+                "PageSize", "100",
                 "RRKeyWord", rr));
-        if (resp.has("Code")) {
-            throw new IllegalStateException("阿里云DNS错误[" + resp.get("Code").getAsString() + "]: "
-                    + (resp.has("Message") ? resp.get("Message").getAsString() : ""));
+        checkDnsError(resp);
+        // 响应结构为 DomainRecords.Record，无匹配时该节点可能缺省
+        if (!resp.has("DomainRecords") || !resp.get("DomainRecords").isJsonObject()) {
+            return new JsonArray();
         }
-        return resp.get("Records").getAsJsonObject()
-                .get("Record").getAsJsonArray();
+        JsonObject records = resp.getAsJsonObject("DomainRecords");
+        return records.has("Record") ? records.getAsJsonArray("Record") : new JsonArray();
     }
 
     /** 新增解析记录，返回 RecordId */
@@ -90,6 +92,14 @@ public final class AliyunClient {
                 "Type", type,
                 "Value", value,
                 "TTL", String.valueOf(ttl)));
+        checkDnsError(resp);
+    }
+
+    /** 删除解析记录（云解析 DNS） */
+    public static void dnsDeleteRecord(String ak, String sk, String recordId) throws Exception {
+        JsonObject resp = dnsCall(ak, sk, Map.of(
+                "Action", "DeleteDomainRecord",
+                "RecordId", recordId));
         checkDnsError(resp);
     }
 
@@ -165,6 +175,13 @@ public final class AliyunClient {
         checkEsaError(resp);
     }
 
+    /** 删除 ESA 解析记录 */
+    public static void esaDeleteRecord(String ak, String sk, String recordId) throws Exception {
+        JsonObject resp = esaCall(ak, sk, "DeleteRecord", Map.of(
+                "RecordId", recordId));
+        checkEsaError(resp);
+    }
+
     private static void checkEsaError(JsonObject resp) {
         if (resp.has("Code") && !resp.get("Code").getAsString().isBlank()) {
             throw new IllegalStateException("阿里云ESA错误[" + resp.get("Code").getAsString() + "]: "
@@ -229,9 +246,22 @@ public final class AliyunClient {
         headers.forEach(b::header);
         HttpResponse<String> resp = HTTP.send(b.build(), HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
-            throw new IllegalStateException("HTTP " + resp.statusCode() + ": " + resp.body());
+            throw apiError(resp.statusCode(), resp.body());
         }
         return JsonParser.parseString(resp.body()).getAsJsonObject();
+    }
+
+    /** 非 200 响应转业务异常：尽量解析错误码（如 DomainRecordDuplicate），供上层做已存在降级 */
+    private static IllegalStateException apiError(int status, String body) {
+        try {
+            JsonObject err = JsonParser.parseString(body).getAsJsonObject();
+            if (err.has("Code")) {
+                String msg = err.has("Message") ? err.get("Message").getAsString() : body;
+                return new AliyunApiException(err.get("Code").getAsString(), msg);
+            }
+        } catch (Exception ignored) {
+        }
+        return new IllegalStateException("HTTP " + status + ": " + body);
     }
 
     /** 阿里云签名 1.0 专用编码：URL 编码后修正 + * ~ 三个字符 */

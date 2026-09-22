@@ -33,7 +33,7 @@ public final class AppConfig {
         if (!Files.exists(CONFIG_FILE)) {
             props.setProperty("server.port", "8090");
             try (OutputStream out = Files.newOutputStream(CONFIG_FILE)) {
-                props.store(out, "NexHome configuration. server.port: Web service port.");
+                props.store(out, "NexHome configuration. server.port: Web service port. server.web.dir: optional external web static dir.");
             }
             return;
         }
@@ -49,5 +49,17 @@ public final class AppConfig {
         } catch (NumberFormatException e) {
             return 8090;
         }
+    }
+
+    /**
+     * 外部前端资源目录（可选配置项 server.web.dir）。
+     * 配置且目录存在时，静态资源优先从该目录读取而非 jar 内置资源；
+     * 相对路径基于运行目录解析。
+     */
+    public static Path webDir() {
+        String v = props.getProperty("server.web.dir", "").trim();
+        if (v.isEmpty()) return null;
+        Path p = Path.of(v);
+        return p.isAbsolute() ? p : WORK_DIR.resolve(p);
     }
 }

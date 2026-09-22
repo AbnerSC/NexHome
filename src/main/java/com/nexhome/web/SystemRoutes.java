@@ -9,6 +9,7 @@ import com.nexhome.core.Logs;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
+import com.sun.management.OperatingSystemMXBean;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -79,6 +80,29 @@ public final class SystemRoutes {
             info.put("maxMemoryMB", rt.maxMemory() / 1024 / 1024);
             ctx.ok(info);
         });
+
+        // ---------- 系统资源监控（CPU / 物理内存 / 虚拟内存，供顶栏实时展示） ----------
+        WebServer.route("GET", "/api/system/metrics", ctx -> {
+            OperatingSystemMXBean os = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+            long memTotal = os.getTotalMemorySize();
+            long memUsed = memTotal - os.getFreeMemorySize();
+            long swapTotal = os.getTotalSwapSpaceSize();
+            long swapUsed = swapTotal - os.getFreeSwapSpaceSize();
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("cores", os.getAvailableProcessors());
+            m.put("cpuLoad", toPct(os.getCpuLoad()));           // JVM 采样未就绪时为 -1
+            m.put("memTotalMB", memTotal / 1024 / 1024);
+            m.put("memUsedMB", memUsed / 1024 / 1024);
+            m.put("swapTotalMB", swapTotal / 1024 / 1024);
+            m.put("swapUsedMB", swapUsed / 1024 / 1024);
+            ctx.ok(m);
+        });
+    }
+
+    /** 0~1 的负载比例转百分比（保留 1 位小数）；负值表示尚未完成采样，原样返回 -1 */
+    private static double toPct(double ratio) {
+        if (ratio < 0) return -1;
+        return Math.round(ratio * 1000.0) / 10.0;
     }
 
     private static int parsePage(String s) {

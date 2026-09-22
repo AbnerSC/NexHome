@@ -17,13 +17,6 @@
         <maven.compiler.release>25</maven.compiler.release>
     </properties>
 
-    <!--
-        轻量化依赖说明（刻意不引入 Spring / SpringBoot 等重型框架）：
-        1. sqlite-jdbc : SQLite 驱动（唯一数据库依赖）
-        2. gson        : JSON 序列化（单文件轻量库）
-        3. acme4j      : ACME 协议客户端，对接 Let's Encrypt / ZeroSSL（纯 Java，无 BouncyCastle 依赖）
-        Web 服务器使用 JDK 内置 com.sun.net.httpserver，调度使用 java.util.concurrent.ScheduledExecutorService。
-    -->
     <dependencies>
         <dependency>
             <groupId>org.xerial</groupId>
@@ -34,6 +27,12 @@
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>
             <version>2.14.0</version>
+        </dependency>
+        <!-- Web 服务框架：单端口同时提供 REST 接口与内嵌前端静态资源 -->
+        <dependency>
+            <groupId>io.javalin</groupId>
+            <artifactId>javalin</artifactId>
+            <version>7.2.3</version>
         </dependency>
         <dependency>
             <groupId>org.shredzone.acme4j</groupId>

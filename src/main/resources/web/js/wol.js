@@ -47,7 +47,7 @@ window.wolWakeBatch = async () => {
 };
 
 window.wolDelete = async id => {
-    if (!confirm('确定删除该设备？')) return;
+    if (!(await confirmBox({ title: '删除设备', message: '确定删除该设备？', confirmText: '删除', danger: true }))) return;
     try { await api('DELETE', '/api/wol/devices/' + id); toast('已删除'); renderWol(); }
     catch (e) { toast(e.message, 'err'); }
 };
