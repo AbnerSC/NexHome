@@ -62,7 +62,7 @@ async function renderStun() {
                 <th style="width: 13%">外网映射地址</th>
                 <th style="width: 13%">穿透成功时间</th>
                 <th>可用性自测</th>
-                <th style="width: 230px">操作</th>
+                <th style="width: 260px">操作</th>
             </tr>
         </thead>
         <tbody>${rows || '<tr><td colspan="9" class="muted">暂无任务</td></tr>'}</tbody>
