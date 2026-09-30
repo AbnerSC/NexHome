@@ -30,6 +30,10 @@ public final class NavService {
         WebServer.route("POST", "/api/nav/items", NavService::create);
         WebServer.route("PUT", "/api/nav/items/{id}", NavService::update);
         WebServer.route("DELETE", "/api/nav/items/{id}", NavService::delete);
+        // 本地图标上传（multipart），返回相对 URL 回填 icon_url
+        WebServer.route("POST", "/api/nav/icons", NavService::uploadIcon);
+        // 图标展示：位于 /api/** 之外故免登录，供 <img> 直接加载
+        WebServer.route("GET", "/nav-icons/{file}", ctx -> NavIconStore.serve(ctx, ctx.param("file")));
         // 拖拽排序：前端按新顺序提交 id 数组，权重从大到小赋值
         WebServer.route("PUT", "/api/nav/reorder", ctx -> {
             JsonObject b = ctx.body();
@@ -42,6 +46,11 @@ public final class NavService {
             Logs.info(Logs.NAV, "更新导航排序，共 " + ids.size() + " 项");
             ctx.ok("排序已保存");
         });
+    }
+
+    /** 启动维护：清理上传后取消表单遗留的孤儿图标文件 */
+    public static void init() {
+        NavIconStore.cleanOrphans();
     }
 
     private static void create(Ctx ctx) throws Exception {
@@ -59,7 +68,7 @@ public final class NavService {
 
     private static void update(Ctx ctx) throws Exception {
         long id = ctx.paramLong("id");
-        mustGet(id);
+        Map<String, Object> old = mustGet(id);
         JsonObject b = ctx.body();
         validate(b);
         Database.update("""
@@ -68,6 +77,8 @@ public final class NavService {
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "icon_url"), JsonUtils.str(b, "description"),
                 JsonUtils.str(b, "lan_url"), JsonUtils.str(b, "wan_url"),
                 JsonUtils.num(b, "weight", 0), JsonUtils.bool(b, "enabled", true) ? 1 : 0, id);
+        // 更换图标后清理不再被引用的旧本地文件（仍被引用时内部自动跳过）
+        NavIconStore.deleteIfUnreferenced(str(old.get("icon_url")));
         Logs.info(Logs.NAV, "更新导航 #" + id + ": " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
     }
@@ -76,8 +87,22 @@ public final class NavService {
         long id = ctx.paramLong("id");
         Map<String, Object> item = mustGet(id);
         Database.update("DELETE FROM nav_item WHERE id=?", id);
+        NavIconStore.deleteIfUnreferenced(str(item.get("icon_url")));
         Logs.info(Logs.NAV, "删除导航 #" + id + ": " + item.get("name"));
         ctx.ok("已删除");
+    }
+
+    /** 图标上传：落盘本地目录后返回相对 URL，供前端回填表单 icon_url */
+    private static void uploadIcon(Ctx ctx) throws Exception {
+        var up = ctx.javalin().uploadedFile("file");
+        if (up == null) throw new IllegalArgumentException("请选择要上传的图标文件");
+        byte[] bytes;
+        try (var in = up.content()) {
+            bytes = in.readAllBytes();
+        }
+        String url = NavIconStore.save(up.filename(), bytes);
+        Logs.info(Logs.NAV, "上传导航图标: " + url);
+        ctx.ok(Map.of("url", url));
     }
 
     private static void validate(JsonObject b) {
@@ -87,6 +112,14 @@ public final class NavService {
         if (!isUrl(JsonUtils.str(b, "lan_url")) || !isUrl(JsonUtils.str(b, "wan_url"))) {
             throw new IllegalArgumentException("访问地址需以 http:// 或 https:// 开头");
         }
+        String icon = JsonUtils.str(b, "icon_url");
+        if (!icon.isBlank() && !isUrl(icon) && !icon.startsWith(NavIconStore.URL_PREFIX)) {
+            throw new IllegalArgumentException("图标需为上传后的本地路径或以 http(s):// 开头的外部地址");
+        }
+    }
+
+    private static String str(Object v) {
+        return v == null ? null : v.toString();
     }
 
     private static boolean isUrl(String url) {

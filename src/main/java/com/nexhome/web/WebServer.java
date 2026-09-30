@@ -63,6 +63,8 @@ public final class WebServer {
     public static void start(int port) {
         Path webDir = resolveWebDir();
         Javalin app = Javalin.create(config -> {
+            // 图标上传（multipart）需突破框架默认 1MB 请求体限制；业务层另有 2MB 上限并友好报错
+            config.http.maxRequestSize = 8_000_000;
             // 前端静态资源：外部目录（开发热更新）或 classpath 的 /web 目录映射到根路径
             config.staticFiles.add(sf -> {
                 sf.hostedPath = "/";

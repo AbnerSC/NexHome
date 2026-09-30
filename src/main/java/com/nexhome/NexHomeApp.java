@@ -56,6 +56,7 @@ public final class NexHomeApp {
             DdnsService.init();      // 恢复 DDNS 定时同步
             StunServerService.init(); // 播种 STUN 服务器列表
             StunService.init();      // 恢复运行中的穿透任务
+            NavService.init();       // 清理孤儿导航图标文件
 
             // 6. 启动内置 Web 服务器（前端静态资源 + API 同一端口）
             WebServer.start(AppConfig.port());

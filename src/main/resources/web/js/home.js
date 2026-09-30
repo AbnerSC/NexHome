@@ -63,6 +63,7 @@ async function renderNavManage() {
     let rows = items.map(it => `
         <tr draggable="true" data-id="${it.id}" class="drag-row">
           <td style="cursor:move">⠿</td>
+          <td>${it.icon_url ? `<img class="nav-thumb" src="${esc(it.icon_url)}" onerror="this.replaceWith(document.createTextNode('🌍'))">` : ''}</td>
           <td>${esc(it.name)}</td>
           <td class="small muted">${esc(it.lan_url)}</td>
           <td class="small muted">${esc(it.wan_url)}</td>
@@ -80,7 +81,7 @@ async function renderNavManage() {
         <button class="btn primary small" onclick="navForm()">＋ 新增导航</button>
       </div>
       <div class="panel"><table>
-        <thead><tr><th></th><th>名称</th><th>内网地址</th><th>外网地址</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th></th><th>图标</th><th>名称</th><th>内网地址</th><th>外网地址</th><th>状态</th><th>操作</th></tr></thead>
         <tbody id="navTbody">${rows}</tbody>
       </table></div>`;
     bindDragSort();
@@ -115,7 +116,19 @@ window.navForm = async (id) => {
     modal(id ? '编辑导航' : '新增导航', `
       <form id="navFormEl" class="form-grid">
         <div class="field"><label>网站名称 <b>*</b></label><input name="name" required value="${esc(it.name || '')}"></div>
-        <div class="field"><label>图标 URL（可选）</label><input name="icon_url" value="${esc(it.icon_url || '')}" placeholder="https://.../icon.png"></div>
+        <div class="field full"><label>图标（可选）</label>
+          <div class="icon-picker">
+            <div class="icon-preview" id="navIconPreview">🌍</div>
+            <div class="icon-picker-body">
+              <input name="icon_url" id="navIconUrl" value="${esc(it.icon_url || '')}" placeholder="上传本地图标或填写外部 URL">
+              <div class="icon-picker-btns">
+                <button type="button" class="btn small" id="navIconUploadBtn">上传图标</button>
+                <button type="button" class="btn small danger" id="navIconClearBtn">移除</button>
+              </div>
+            </div>
+            <input type="file" id="navIconFile" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml,image/x-icon" hidden>
+          </div>
+        </div>
         <div class="field full"><label>描述文字</label><input name="description" value="${esc(it.description || '')}"></div>
         <div class="field full"><label>内网访问地址 <b>*</b></label><input name="lan_url" required placeholder="http://192.168.1.10:8080" value="${esc(it.lan_url || '')}"></div>
         <div class="field full"><label>外网访问地址 <b>*</b></label><input name="wan_url" required placeholder="https://nas.example.com" value="${esc(it.wan_url || '')}"></div>
@@ -126,6 +139,34 @@ window.navForm = async (id) => {
           <button class="btn primary">保存</button>
         </div>
       </form>`);
+    // 图标选择区：预览随输入联动，上传成功后回填相对路径到 icon_url
+    const iconInput = $('#navIconUrl');
+    const iconPreview = $('#navIconPreview');
+    const syncIconPreview = () => {
+        const v = iconInput.value.trim();
+        iconPreview.innerHTML = v
+            ? `<img src="${esc(v)}" onerror="this.replaceWith(document.createTextNode('🌍'))">`
+            : '🌍';
+    };
+    syncIconPreview();
+    iconInput.addEventListener('input', syncIconPreview);
+    $('#navIconUploadBtn').addEventListener('click', () => $('#navIconFile').click());
+    $('#navIconClearBtn').addEventListener('click', () => { iconInput.value = ''; syncIconPreview(); });
+    $('#navIconFile').addEventListener('change', async e => {
+        const file = e.target.files[0];
+        e.target.value = '';   // 清空以允许重复选择同一文件
+        if (!file) return;
+        try {
+            const fd = new FormData();
+            fd.append('file', file);
+            const resp = await fetch('/api/nav/icons', { method: 'POST', headers: { 'X-Token': TOKEN }, body: fd });
+            const data = await resp.json().catch(() => ({}));
+            if (!data.ok) throw new Error(data.error || ('上传失败 ' + resp.status));
+            iconInput.value = data.data.url;
+            syncIconPreview();
+            toast('图标已上传');
+        } catch (err) { toast(err.message, 'err'); }
+    });
     $('#navFormEl').addEventListener('submit', async e => {
         e.preventDefault();
         const f = new FormData(e.target);
