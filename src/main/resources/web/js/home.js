@@ -2,8 +2,10 @@
 'use strict';
 
 let navSmartMode = null;          // null=自动, 'lan'/'wan' 手动
+let netSourceLan = null;          // 服务端按连接源 IP 识别的访问来源（null=未知，回退 hostname 判断）
 
 function isLanVisit() {
+    if (netSourceLan !== null) return netSourceLan;
     const h = location.hostname;
     return /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
 }
@@ -14,13 +16,19 @@ function currentNetMode() {
 }
 
 async function renderHome() {
-    const items = await api('GET', '/api/nav/items');
+    const [items, src] = await Promise.all([
+        api('GET', '/api/nav/items'),
+        // 服务端按连接源 IP 识别访问来源（内外网两套域名也不影响判断），失败时回退 hostname 判断
+        api('GET', '/api/net/source').catch(() => null)
+    ]);
+    if (src && typeof src.lan === 'boolean') netSourceLan = src.lan;
     const mode = currentNetMode();
+    const autoLan = isLanVisit();
     const modeLabel = navSmartMode ? (navSmartMode === 'lan' ? '内网（手动）' : '外网（手动）')
-        : (isLanVisit() ? '内网（自动识别）' : '外网（自动识别）');
+        : (autoLan ? '内网（自动识别）' : '外网（自动识别）');
     let html = `
       <div class="toolbar">
-        <span class="muted small">当前访问来源：${esc(modeLabel)}</span>
+        <span class="muted small" title="${src && src.ip ? '识别依据来源 IP：' + esc(src.ip) : ''}">当前访问来源：${esc(modeLabel)}</span>
         <button class="btn small" onclick="switchNetMode('lan')">切到内网地址</button>
         <button class="btn small" onclick="switchNetMode('wan')">切到外网地址</button>
         <button class="btn small" onclick="switchNetMode(null)">恢复自动</button>
@@ -33,7 +41,13 @@ async function renderHome() {
     } else {
         html += '<div class="nav-cards">';
         for (const it of items.filter(i => i.enabled === 1)) {
-            const url = mode === 'lan' ? it.lan_url : it.wan_url;
+            const lanFirst = mode === 'lan';
+            // 当前模式无对应地址时回退到另一地址（两地址允许只填其一）
+            const preferred = lanFirst ? it.lan_url : it.wan_url;
+            const url = preferred || (lanFirst ? it.wan_url : it.lan_url);
+            if (!url) continue;
+            const fallback = !preferred;
+            const kind = (preferred ? lanFirst : !lanFirst) ? '内网地址' : '外网地址';
             const icon = it.icon_url
                 ? `<img src="${esc(it.icon_url)}" onerror="this.replaceWith(document.createTextNode('🌍'))">`
                 : '🌍';
@@ -46,7 +60,7 @@ async function renderHome() {
               <div class="icon">${icon}</div>
               <h3>${esc(it.name)}</h3>
               <p>${esc(it.description || '')}</p>
-              <div class="addr-row">${badge(mode === 'lan' ? '内网地址' : '外网地址', 'info')}
+              <div class="addr-row">${badge(kind + (fallback ? '·回退' : ''), fallback ? 'warn' : 'info')}
                 <span class="muted small" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(url)}</span></div>
             </div>`;
         }
@@ -65,8 +79,8 @@ async function renderNavManage() {
           <td style="cursor:move">⠿</td>
           <td>${it.icon_url ? `<img class="nav-thumb" src="${esc(it.icon_url)}" onerror="this.replaceWith(document.createTextNode('🌍'))">` : ''}</td>
           <td>${esc(it.name)}</td>
-          <td class="small muted">${esc(it.lan_url)}</td>
-          <td class="small muted">${esc(it.wan_url)}</td>
+          <td class="small muted">${esc(it.lan_url) || '-'}</td>
+          <td class="small muted">${esc(it.wan_url) || '-'}</td>
           <td>${it.enabled === 1 ? badge('启用', 'ok') : badge('停用', 'gray')}</td>
           <td>
             <button class="btn small" onclick="navForm(${it.id})">编辑</button>
@@ -130,8 +144,8 @@ window.navForm = async (id) => {
           </div>
         </div>
         <div class="field full"><label>描述文字</label><input name="description" value="${esc(it.description || '')}"></div>
-        <div class="field full"><label>内网访问地址 <b>*</b></label><input name="lan_url" required placeholder="http://192.168.1.10:8080" value="${esc(it.lan_url || '')}"></div>
-        <div class="field full"><label>外网访问地址 <b>*</b></label><input name="wan_url" required placeholder="https://nas.example.com" value="${esc(it.wan_url || '')}"></div>
+        <div class="field full"><label>内网访问地址 <span class="muted small">（与外网地址至少填一项）</span></label><input name="lan_url" placeholder="http://192.168.1.10:8080" value="${esc(it.lan_url || '')}"></div>
+        <div class="field full"><label>外网访问地址 <span class="muted small">（与内网地址至少填一项）</span></label><input name="wan_url" placeholder="https://nas.example.com" value="${esc(it.wan_url || '')}"></div>
         <div class="field"><label>排序权重</label><input name="weight" type="number" value="${it.weight ?? 0}"></div>
         <div class="field"><label>是否启用</label><select name="enabled"><option value="true" ${it.enabled !== 0 ? 'selected' : ''}>启用</option><option value="false" ${it.enabled === 0 ? 'selected' : ''}>停用</option></select></div>
         <div class="form-foot full">
@@ -175,6 +189,7 @@ window.navForm = async (id) => {
             lan_url: f.get('lan_url').trim(), wan_url: f.get('wan_url').trim(),
             weight: Number(f.get('weight') || 0), enabled: f.get('enabled') === 'true'
         };
+        if (!body.lan_url && !body.wan_url) { toast('内网地址与外网地址至少填写一个', 'err'); return; }
         try {
             if (id) await api('PUT', '/api/nav/items/' + id, body);
             else await api('POST', '/api/nav/items', body);

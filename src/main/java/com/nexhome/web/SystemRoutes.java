@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import com.sun.management.OperatingSystemMXBean;
+import java.net.InetAddress;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -97,6 +98,27 @@ public final class SystemRoutes {
             m.put("swapUsedMB", swapUsed / 1024 / 1024);
             ctx.ok(m);
         });
+
+        // ---------- 访问来源识别（首页导航内外网智能切换依据） ----------
+        // 内外网用两套域名时前端 hostname 无法区分，但 TCP 连接的源 IP 不会骗人：
+        // 内网来源必然是私网/环回地址，外网来源必然是公网地址（经反代时取 XFF 首跳）
+        WebServer.route("GET", "/api/net/source", ctx -> {
+            String ip = ctx.clientIp();
+            ctx.ok(Map.of("lan", isPrivateSource(ip), "ip", ip));
+        });
+    }
+
+    /** 是否内网来源：环回/私网/链路本地/组播及运营商 CGNAT(100.64.0.0/10) 均视为内网，其余视为公网 */
+    private static boolean isPrivateSource(String ip) {
+        try {
+            InetAddress a = InetAddress.getByName(ip);
+            if (a.isAnyLocalAddress() || a.isLoopbackAddress() || a.isSiteLocalAddress()
+                    || a.isLinkLocalAddress() || a.isMulticastAddress()) return true;
+            byte[] b = a.getAddress();
+            return b.length == 4 && (b[0] & 0xFF) == 100 && (b[1] & 0xFF) >= 64 && (b[1] & 0xFF) <= 127;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /** 0~1 的负载比例转百分比（保留 1 位小数）；负值表示尚未完成采样，原样返回 -1 */

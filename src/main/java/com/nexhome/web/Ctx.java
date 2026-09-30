@@ -58,6 +58,18 @@ public final class Ctx {
         return ctx.header(name);
     }
 
+    /** 客户端真实来源 IP：存在反向代理头时优先 X-Forwarded-For 首跳 / X-Real-IP，否则取 socket 对端地址 */
+    public String clientIp() {
+        String xff = ctx.header("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            String first = xff.split(",")[0].trim();
+            if (!first.isEmpty()) return first;
+        }
+        String real = ctx.header("X-Real-IP");
+        if (real != null && !real.isBlank()) return real.trim();
+        return ctx.ip();
+    }
+
     /** 读取请求体（Javalin 内部已缓存，可多次调用） */
     public String bodyText() {
         return ctx.body();

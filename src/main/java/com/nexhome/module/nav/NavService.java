@@ -14,8 +14,8 @@ import java.util.Map;
 /**
  * 网站导航服务。
  * <p>
- * 每个条目同时配置内网地址与外网地址；前端根据访问来源智能选择优先地址，
- * 也可手动切换。排序使用权重字段（拖拽排序后批量回传新顺序）。
+ * 每个条目至少配置内网地址或外网地址之一，也可两者都填；前端根据访问来源智能选择优先地址，
+ * 缺失时自动回退到另一地址，也可手动切换。排序使用权重字段（拖拽排序后批量回传新顺序）。
  */
 public final class NavService {
 
@@ -107,9 +107,11 @@ public final class NavService {
 
     private static void validate(JsonObject b) {
         if (JsonUtils.str(b, "name").isBlank()) throw new IllegalArgumentException("网站名称不能为空");
-        if (JsonUtils.str(b, "lan_url").isBlank()) throw new IllegalArgumentException("内网地址不能为空");
-        if (JsonUtils.str(b, "wan_url").isBlank()) throw new IllegalArgumentException("外网地址不能为空");
-        if (!isUrl(JsonUtils.str(b, "lan_url")) || !isUrl(JsonUtils.str(b, "wan_url"))) {
+        String lan = JsonUtils.str(b, "lan_url");
+        String wan = JsonUtils.str(b, "wan_url");
+        // 两地址允许只填其一，但至少要有其一
+        if (lan.isBlank() && wan.isBlank()) throw new IllegalArgumentException("内网地址与外网地址至少填写一个");
+        if ((!lan.isBlank() && !isUrl(lan)) || (!wan.isBlank() && !isUrl(wan))) {
             throw new IllegalArgumentException("访问地址需以 http:// 或 https:// 开头");
         }
         String icon = JsonUtils.str(b, "icon_url");
