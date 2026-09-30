@@ -1086,7 +1086,7 @@ final class StunRunner {
             if (latest != null && !latest.isBlank()) mapped = latest;
             if (probeLocalInbound(mapped)) {
                 noteExtVerdict("OK", true);
-                result += "，公网入站验证可达(本机直连公网映射成功)";
+                result += "，公网入站验证可达";
             } else {
                 long now = System.currentTimeMillis();
                 if (manual) {
@@ -1135,10 +1135,9 @@ final class StunRunner {
             }
         }
         if (lastMappedAt > before) {
-            return "OK(映射保活存活，" + (System.currentTimeMillis() - t0)
-                    + "ms；真实入站可达性受NAT类型与路由器策略影响，请用外部设备验证)";
+            return "OK(映射保活存活，" + (System.currentTimeMillis() - t0) + "ms)";
         }
-        return "FAIL(STUN绑定无响应：映射可能已失效或候选STUN服务器均不可达，保活调度将持续重试)";
+        return "FAIL(STUN绑定无响应，映射可能已失效或服务器不可达)";
     }
 
     /**
@@ -1149,10 +1148,10 @@ final class StunRunner {
      */
     private String verifyTcpKeepalive(boolean manual) {
         if (tcpRefreshing) {
-            return "重建中(TCP链路弹跳重建进行中，重建完成后自动复验)";
+            return "重建中(链路重建完成后自动复验)";
         }
         if (!wanTcpReady) {
-            return "FAIL(TCP映射未建立：STUN-over-TCP服务器不可用且端口保留出站链路未建成，巡检自动重试)";
+            return "FAIL(TCP映射未建立，巡检自动重试)";
         }
         if (tcpServer == null || tcpServer.isClosed()) {
             return "FAIL(本地TCP监听已关闭)";
@@ -1169,7 +1168,7 @@ final class StunRunner {
         }
         if (!manual) {
             // 周期自测不等待弹跳：按重建中返回（前端黄色展示），下轮自测复验
-            return "重建中(TCP保活链路无响应，已触发弹跳重建，重建完成后自动复验)";
+            return "重建中(已触发链路重建，完成后自动复验)";
         }
         long deadline = System.currentTimeMillis() + 60_000;
         while (tcpRefreshing && System.currentTimeMillis() < deadline) {
@@ -1183,16 +1182,15 @@ final class StunRunner {
         if (wanTcpReady && punch.keepaliveOnce()) {
             return okTcp(System.currentTimeMillis() - t0, true);
         }
-        return "FAIL(TCP保活链路无响应且重建未成功：保活调度与巡检将按退避持续重试)";
+        return "FAIL(TCP保活链路无响应且重建未成功)";
     }
 
     /** TCP 自测通过时的结果文案（区分映射来源，便于用户判断验证方式） */
     private String okTcp(long costMs, boolean rebuilt) {
         String mode = tcpMappedViaUpnp ? "UPnP公网直通"
-                : (punch != null && punch.addrPresumed() ? "端口保留模式(展示端口取自同端口UDP STUN估计，入站不保证可达，以公网入站验证为准)"
+                : (punch != null && punch.addrPresumed() ? "端口保留模式(入站以公网入站验证为准)"
                 : "STUN精确映射");
-        return "OK(TCP映射保活存活" + (rebuilt ? "，链路已重建" : "") + "[" + mode + "]，" + costMs
-                + "ms；端到端可达以公网入站验证为准：本机直连公网映射优先，无回流网络退第三方节点/外部设备)";
+        return "OK(TCP映射保活存活" + (rebuilt ? "，链路已重建" : "") + "[" + mode + "]，" + costMs + "ms)";
     }
 
     /** 公网入站验证结论处理：状态变化时记日志并缓存（null=第三方服务不可用/未完成，本轮跳过） */

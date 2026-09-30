@@ -29,24 +29,10 @@ async function renderStun() {
       </tr>`).join('');
     $('#pageBody').innerHTML = `
       <div class="tip">
-        <b>穿透通道支持承载 UDP / TCP / HTTP 数据传输。</b>
-        UDP 任务：外网数据包经 NAT 映射进入后按会话转发到内网目标，响应原路返回；
-        TCP/HTTP 任务：建议填写「对端公网地址」由本端主动打洞，连接建立后双向透传（HTTP 直接可用）；
-        路由器 WAN 口为公网时，在任务中启用 UPnP（或在路由器手动做端口转发）可获得固定的权威入站通道。
-        <br><b>注意：任务运行中 ≠ 外网可访问。</b>外网能否主动连入取决于 NAT 过滤行为：
-        Full Cone 可直接访问；受限锥形仅允许已打洞的对端访问；<b>对称型（Symmetric）NAT 纯 STUN 无法穿透</b>，
-        请改用路由器端口转发。同时请确认主机防火墙已放行监听端口（Windows 需允许 Java 入站连接）。
-        <br><b>可用性自测：</b>穿透成功后系统自动测试一次，也可在操作列点「自测」手动复测。
-        自测先验证<b>映射保活存活</b>（UDP：STUN 绑定响应；TCP：保活链路交互 + 本地监听），
-        TCP 任务随后自动做<b>公网入站验证</b>：优先从本机直连穿透出的公网 IP:端口——实测多数路由器/运营商支持
-        NAT 回流(hairpin)，局域网访问公网映射会被送回本机，<b>连接成功即证明外网可主动连入</b>（毫秒级完成、不依赖外部服务）；
-        直连失败不代表映射不可用（部分网络无回流，连接在 WAN 侧即被丢弃），自动退回第三方探测节点真实连接映射地址复验，
-        仍不可达时请检查上层 NAT/运营商策略或用外部设备（手机流量等）验证。
-        <br>穿透启动时同时尝试 <b>UPnP 端口映射</b>（需路由器开启 UPnP，路由器不支持时可在任务中关闭）：
-        路由器 WAN 口为公网时，UPnP 映射即外网可主动连入的权威通道（展示端口固定）。若路由器 WAN 口非公网（CGNAT，如 100.64.x.x）
-        或未启用 UPnP，TCP 任务会改从监听端口向支持 TCP 的 STUN 服务器出站（配置服务器不支持时自动改用「STUN 服务器维护」中标记支持 TCP 的服务器）建立映射并周期保活，
-        <b>出站探测映射经实测可被外网设备主动连入，自测通过即代表互联网可达，无需更换端口重新穿透</b>；
-        展示改用 STUN 出口公网 IP，也可在操作列点「自测」手动复测。
+        <b>穿透通道支持承载 UDP / TCP / HTTP 数据传输；任务运行中 ≠ 外网可访问。</b>
+        受限锥形 NAT 仅允许已打洞的对端连入，<b>对称型（Symmetric）NAT 纯 STUN 无法穿透</b>，请改用路由器端口转发，并确认防火墙已放行监听端口。
+        穿透启动时自动尝试 <b>UPnP 端口映射</b>（WAN 口为公网时即权威入站通道）；CGNAT 或未启用 UPnP 时，TCP 任务经支持 TCP 的 STUN 服务器出站建立映射并保活，自测通过即代表互联网可达。
+        穿透成功后系统自动自测一次（映射保活 + 公网入站可达），可在操作列点「自测」手动复测。
       </div>
       <div class="toolbar"><div class="spacer"></div>
         <button class="btn" onclick="renderStunServers()">🛠 管理STUN服务器</button>
@@ -62,7 +48,7 @@ async function renderStun() {
                 <th style="width: 13%">外网映射地址</th>
                 <th style="width: 13%">穿透成功时间</th>
                 <th>可用性自测</th>
-                <th style="width: 260px">操作</th>
+                <th style="width: 320px">操作</th>
             </tr>
         </thead>
         <tbody>${rows || '<tr><td colspan="9" class="muted">暂无任务</td></tr>'}</tbody>
