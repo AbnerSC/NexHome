@@ -7,7 +7,7 @@ async function renderWol() {
       <tr>
         <td><input type="checkbox" class="wol-chk" value="${d.id}"></td>
         <td>${esc(d.name)}</td>
-        <td>${esc(d.mac)}</td>
+        <td>${esc(d.mac).split(',').join('<br>')}</td>
         <td>${esc(d.broadcast)}:${d.port}</td>
         <td>
           <button class="btn small success" onclick="wolWake(${d.id})">⚡ 唤醒</button>
@@ -16,7 +16,7 @@ async function renderWol() {
         </td>
       </tr>`).join('');
     $('#pageBody').innerHTML = `
-      <div class="tip">通过局域网广播 UDP 魔术包唤醒设备，被唤醒主机需在网卡与 BIOS 中开启 WOL（Wake on LAN）支持。</div>
+      <div class="tip">通过局域网广播 UDP 魔术包唤醒设备，被唤醒主机需在网卡与 BIOS 中开启 WOL（Wake on LAN）支持。多网口设备可配置多个 MAC，唤醒时逐个发送魔术包。</div>
       <div class="toolbar">
         <button class="btn" onclick="wolWakeBatch()">⚡ 批量唤醒选中</button>
         <label class="small muted"><input type="checkbox" id="wolAll"> 全选</label>
@@ -58,7 +58,7 @@ window.wolForm = async (id) => {
     modal(id ? '编辑设备' : '新增唤醒设备', `
       <form id="wolFormEl" class="form-grid">
         <div class="field full"><label>机器名称 <b>*</b></label><input name="name" required value="${esc(d.name || '')}"></div>
-        <div class="field full"><label>MAC 地址 <b>*</b></label><input name="mac" required placeholder="00:11:22:33:44:55" value="${esc(d.mac || '')}"></div>
+        <div class="field full"><label>MAC 地址 <b>*</b></label><textarea name="mac" required rows="2" placeholder="00:11:22:33:44:55&#10;多网口可填多个 MAC，用逗号/分号或换行分隔">${esc(d.mac || '').split(',').join('\n')}</textarea></div>
         <div class="field"><label>广播地址 <b>*</b></label><input name="broadcast" required value="${esc(d.broadcast || '255.255.255.255')}"></div>
         <div class="field"><label>WOL 端口</label><input name="port" type="number" value="${d.port ?? 9}"></div>
         <div class="form-foot full">

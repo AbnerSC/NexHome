@@ -21,6 +21,7 @@ import java.util.Map;
  * <p>
  * 底层实现：向目标广播地址发送 UDP 魔术包（Magic Packet）：
  * 6 字节 0xFF + 目标 MAC 地址重复 16 遍，连续发送 3 次提高成功率。
+ * 多网口设备可配置多个 MAC（逗号/分号/换行分隔），唤醒时逐个 MAC 发送魔术包。
  * 被唤醒主机需在网卡/BIOS 中开启 WOL 支持。
  */
 public final class WolService {
@@ -65,7 +66,7 @@ public final class WolService {
         validate(b);
         long id = Database.insert(
                 "INSERT INTO wol_device(name, mac, broadcast, port) VALUES(?,?,?,?)",
-                JsonUtils.str(b, "name"), normalizeMac(JsonUtils.str(b, "mac")),
+                JsonUtils.str(b, "name"), normalizeMacs(JsonUtils.str(b, "mac")),
                 JsonUtils.str(b, "broadcast"), JsonUtils.num(b, "port", 9));
         Logs.info(Logs.WOL, "新增唤醒设备: " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
@@ -77,7 +78,7 @@ public final class WolService {
         JsonObject b = ctx.body();
         validate(b);
         Database.update("UPDATE wol_device SET name=?, mac=?, broadcast=?, port=? WHERE id=?",
-                JsonUtils.str(b, "name"), normalizeMac(JsonUtils.str(b, "mac")),
+                JsonUtils.str(b, "name"), normalizeMacs(JsonUtils.str(b, "mac")),
                 JsonUtils.str(b, "broadcast"), JsonUtils.num(b, "port", 9), id);
         Logs.info(Logs.WOL, "更新唤醒设备 #" + id + ": " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
@@ -97,26 +98,28 @@ public final class WolService {
     public static void wake(long deviceId) throws Exception {
         Map<String, Object> dev = mustGet(deviceId);
         String name = str(dev, "name");
-        byte[] mac = parseMac(str(dev, "mac"));
+        List<String> macs = macList(str(dev, "mac"));
         String broadcast = str(dev, "broadcast");
         int port = intVal(dev, "port");
-
-        // 魔术包：6 字节 0xFF + MAC 重复 16 次，共 102 字节
-        byte[] packet = new byte[102];
-        for (int i = 0; i < 6; i++) packet[i] = (byte) 0xFF;
-        for (int i = 0; i < 16; i++) {
-            System.arraycopy(mac, 0, packet, 6 + i * 6, 6);
-        }
 
         InetAddress addr = InetAddress.getByName(broadcast);
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
-            // 连发 3 次，应对 UDP 丢包
-            for (int i = 0; i < 3; i++) {
-                socket.send(new DatagramPacket(packet, packet.length, addr, port));
+            // 多网口设备逐个 MAC 发送，每个 MAC 连发 3 次，应对 UDP 丢包
+            for (String mac : macs) {
+                // 魔术包：6 字节 0xFF + MAC 重复 16 次，共 102 字节
+                byte[] packet = new byte[102];
+                for (int i = 0; i < 6; i++) packet[i] = (byte) 0xFF;
+                byte[] macBytes = parseMac(mac);
+                for (int i = 0; i < 16; i++) {
+                    System.arraycopy(macBytes, 0, packet, 6 + i * 6, 6);
+                }
+                for (int i = 0; i < 3; i++) {
+                    socket.send(new DatagramPacket(packet, packet.length, addr, port));
+                }
             }
         }
-        Logs.info(Logs.WOL, "唤醒魔术包已发送 -> " + name + " (MAC=" + str(dev, "mac")
+        Logs.info(Logs.WOL, "唤醒魔术包已发送 -> " + name + " (MAC=" + String.join(",", macs)
                 + ", 广播=" + broadcast + ":" + port + ")");
     }
 
@@ -124,24 +127,43 @@ public final class WolService {
 
     private static void validate(JsonObject b) {
         if (JsonUtils.str(b, "name").isBlank()) throw new IllegalArgumentException("设备名称不能为空");
-        String mac = JsonUtils.str(b, "mac");
-        if (!mac.replaceAll("[:-]", "").matches("[0-9a-fA-F]{12}")) {
-            throw new IllegalArgumentException("MAC 地址格式不正确，例如 00:11:22:33:44:55");
-        }
+        macList(JsonUtils.str(b, "mac"));
         if (JsonUtils.str(b, "broadcast").isBlank()) {
             throw new IllegalArgumentException("广播地址不能为空，常用 255.255.255.255 或子网广播地址");
         }
     }
 
-    /** 统一 MAC 格式为冒号分隔小写 */
-    private static String normalizeMac(String mac) {
-        String hex = mac.replaceAll("[:-]", "").toLowerCase();
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < 6; i++) {
-            if (i > 0) sb.append(':');
-            sb.append(hex, i * 2, i * 2 + 2);
+    /**
+     * 拆分 MAC 字段为单个地址列表并逐个校验格式。
+     * 多网口设备可配置多个 MAC，以逗号/分号/空白（含换行）分隔。
+     */
+    private static List<String> macList(String mac) {
+        List<String> list = new ArrayList<>();
+        for (String part : mac.split("[,;\\s]+")) {
+            if (part.isBlank()) continue;
+            if (!part.replaceAll("[:-]", "").matches("[0-9a-fA-F]{12}")) {
+                throw new IllegalArgumentException("MAC 地址格式不正确: " + part
+                        + "（多网口可用逗号/分号/换行分隔多个 MAC，例如 00:11:22:33:44:55）");
+            }
+            list.add(part);
         }
-        return sb.toString();
+        if (list.isEmpty()) throw new IllegalArgumentException("MAC 地址不能为空");
+        return list;
+    }
+
+    /** 统一每个 MAC 格式为冒号分隔小写，多个以逗号连接存储 */
+    private static String normalizeMacs(String mac) {
+        List<String> list = new ArrayList<>();
+        for (String m : macList(mac)) {
+            String hex = m.replaceAll("[:-]", "").toLowerCase();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 6; i++) {
+                if (i > 0) sb.append(':');
+                sb.append(hex, i * 2, i * 2 + 2);
+            }
+            list.add(sb.toString());
+        }
+        return String.join(",", list);
     }
 
     private static byte[] parseMac(String mac) {

@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS stun_server (
 );
 
 -- WOL 唤醒设备表
+-- mac : MAC 地址，多网口设备可配置多个，以逗号/分号/空白分隔
 CREATE TABLE IF NOT EXISTS wol_device (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT NOT NULL,
