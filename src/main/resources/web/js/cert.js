@@ -129,6 +129,9 @@ window.certForm = async (id) => {
     if (id) t = (await api('GET', '/api/cert/tasks')).find(x => x.id === id);
     let configs = [];
     try { configs = await api('GET', '/api/provider/configs'); } catch (e) { /* ignore */ }
+    // 默认保存目录（后端下发，供新增任务预填）
+    let defaultSaveDir = '/app/data/ssl';
+    try { const s = await api('GET', '/api/cert/settings'); defaultSaveDir = s.default_save_dir || defaultSaveDir; } catch (e) { /* ignore */ }
     // DNS01 自动验证支持阿里云（云解析或 ESA 托管的域名，ESA 需在凭证配置中填写站点 SiteId），
     // 仅列出该类型配置（已引用的配置始终保留避免编辑时回显丢失）
     const credOpts = configs
@@ -155,8 +158,8 @@ window.certForm = async (id) => {
           </select></div>
         <div class="field"><label>自动续期</label>
           <select name="auto_renew"><option value="true" ${t.auto_renew !== 0 ? 'selected' : ''}>开启（到期前21天）</option><option value="false" ${t.auto_renew === 0 ? 'selected' : ''}>关闭</option></select></div>
-        <div class="field full"><label>证书保存目录（可选，留空则仅存默认任务目录）</label>
-          <input name="save_dir" id="certSaveDir" placeholder="填写目录，签发后以主域名作为文件名保存，例如 /etc/nginx/certs 或 D:\\certs" value="${esc(t.save_dir || '')}" oninput="certPreviewPath()">
+        <div class="field full"><label>证书保存目录（默认 ${esc(defaultSaveDir)}，可修改；不存在时自动新建，签发后以主域名作为文件名保存）</label>
+          <input name="save_dir" id="certSaveDir" placeholder="${esc(defaultSaveDir)}" value="${esc(t.save_dir || defaultSaveDir)}" oninput="certPreviewPath()">
           <div class="small muted" id="certPathPreview" style="margin-top:4px;word-break:break-all"></div></div>
         <div class="field full"><label>Webhook 地址（可选，签发成功后 POST 证书完整内容同步到其他系统）</label>
           <input name="webhook_url" placeholder="https://example.com/hooks/cert，留空则不推送" value="${esc(t.webhook_url || '')}">
@@ -186,8 +189,7 @@ window.certForm = async (id) => {
     window.certPreviewPath = () => {
         const el = $('#certPathPreview');
         if (!el) return;
-        const dir = ($('#certSaveDir').value || '').trim();
-        if (!dir) { el.textContent = ''; return; }
+        const dir = ($('#certSaveDir').value || '').trim() || defaultSaveDir;
         const primary = certPrimaryDomain($('#certDomains').value);
         if (!primary) { el.textContent = '请先填写域名'; return; }
         const sep = (dir.includes('\\') && !dir.includes('/')) ? '\\' : '/';

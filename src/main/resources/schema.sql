@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS wol_device (
 -- challenge_type : HTTP01（自动，需本机 80 端口可被公网访问） / DNS01（手动添加 TXT 或引用凭证配置自动添加）
 -- provider_config_id : DNS01 自动验证引用的服务商凭证配置（阿里云，云解析/ESA 自动探测）；为空时手动添加 TXT
 -- status         : IDLE / PENDING_VALIDATION / ISSUED / ERROR
--- save_dir       : 可选，签发成功后额外保存证书的目录（以主域名作为文件名）；为空时仅保存到默认任务目录
+-- save_dir       : 签发成功后保存证书的目录（以主域名作为文件名，不存在时自动新建）；默认 /app/data/ssl，可按任务修改
 -- webhook_url    : 可选，签发成功后将证书完整内容（证书/私钥/证书链 PEM）POST 推送到该地址，用于同步到其他系统
 CREATE TABLE IF NOT EXISTS cert_task (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS cert_task (
     not_after      TEXT,
     auto_renew     INTEGER NOT NULL DEFAULT 1,
     cert_dir       TEXT,
-    save_dir       TEXT,
+    save_dir       TEXT NOT NULL DEFAULT '/app/data/ssl',
     webhook_url    TEXT,
     created_at     TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );

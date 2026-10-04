@@ -83,6 +83,9 @@ public final class CertService {
     /** 续期提前天数：到期前 21 天自动续期 */
     private static final int RENEW_AHEAD_DAYS = 21;
 
+    /** 默认证书保存目录（与 Docker 部署的数据目录一致）：任务未填写 save_dir 时使用，不存在时自动新建 */
+    public static final String DEFAULT_SAVE_DIR = "/app/data/ssl";
+
     /** 证书同步 webhook 使用的共享 HTTP 客户端 */
     private static final HttpClient WEBHOOK_HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
@@ -130,11 +133,12 @@ public final class CertService {
             ctx.file(p, task.get("name") + "-" + file + ".pem");
             Logs.info(Logs.CERT, "下载证书文件: 任务#" + id + " " + file);
         });
-        // 服务商凭证设置（ZeroSSL EAB / 联系邮箱）
+        // 服务商凭证设置（ZeroSSL EAB / 联系邮箱）；default_save_dir 供前端新增任务时预填默认保存目录
         WebServer.route("GET", "/api/cert/settings", ctx -> ctx.ok(Map.of(
                 "email", cfg("acme.email", ""),
                 "zerossl_eab_kid", cfg("zerossl.eab_kid", ""),
-                "zerossl_eab_hmac", cfg("zerossl.eab_hmac", ""))));
+                "zerossl_eab_hmac", cfg("zerossl.eab_hmac", ""),
+                "default_save_dir", DEFAULT_SAVE_DIR)));
         WebServer.route("PUT", "/api/cert/settings", ctx -> {
             JsonObject b = ctx.body();
             Database.setConfig("acme.email", JsonUtils.str(b, "email"));
@@ -189,7 +193,7 @@ public final class CertService {
                 JsonUtils.str(b, "challenge_type"),
                 ProviderConfigService.parseId(b, "provider_config_id"),
                 JsonUtils.bool(b, "auto_renew", true) ? 1 : 0,
-                JsonUtils.str(b, "save_dir").trim(),
+                resolveSaveDir(b),
                 JsonUtils.str(b, "webhook_url").trim());
         Logs.info(Logs.CERT, "新增证书任务: " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
@@ -207,7 +211,7 @@ public final class CertService {
                 JsonUtils.str(b, "challenge_type"),
                 ProviderConfigService.parseId(b, "provider_config_id"),
                 JsonUtils.bool(b, "auto_renew", true) ? 1 : 0,
-                JsonUtils.str(b, "save_dir").trim(),
+                resolveSaveDir(b),
                 JsonUtils.str(b, "webhook_url").trim(), id);
         Logs.info(Logs.CERT, "更新证书任务 #" + id + ": " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
@@ -694,13 +698,20 @@ public final class CertService {
         return d.replaceAll("[^a-zA-Z0-9.-]", "_");
     }
 
+    /** 解析任务保存目录：留空时回退到默认目录 {@link #DEFAULT_SAVE_DIR} */
+    private static String resolveSaveDir(JsonObject b) {
+        String dir = JsonUtils.str(b, "save_dir").trim();
+        return dir.isEmpty() ? DEFAULT_SAVE_DIR : dir;
+    }
+
     /**
-     * 可选：将证书以主域名作为文件名写入自定义保存目录。
-     * 生成 {domain}.key / {domain}.pem / {domain}.fullchain.pem 三个文件。
+     * 将证书以主域名作为文件名写入保存目录（save_dir）。
+     * 生成 {domain}.key / {domain}.pem / {domain}.fullchain.pem 三个文件；目录不存在时自动新建。
+     * save_dir 为空时回退到默认目录 {@link #DEFAULT_SAVE_DIR}。
      * 失败不阻断签发主流程（文件已存于默认任务目录），仅记日志。
      */
     private static void saveToCustomDir(String saveDir, List<String> domains, byte[] keyDer, byte[] leafDer, String fullchainPem) {
-        if (saveDir == null || saveDir.isBlank()) return;
+        if (saveDir == null || saveDir.isBlank()) saveDir = DEFAULT_SAVE_DIR;
         String base = primaryDomain(domains);
         try {
             Path dir = Path.of(saveDir.trim());
