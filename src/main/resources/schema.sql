@@ -9,6 +9,20 @@ CREATE TABLE IF NOT EXISTS app_config (
     value TEXT
 );
 
+-- 服务商凭证配置表（云服务商 AccessKey 等，DDNS / SSL 证书 DNS01 按名称选择引用）
+-- provider_type : 服务商类型（ALIYUN 等，清单见 ProviderConfigService.PROVIDER_TYPES，后续可扩展）
+-- esa_site_id   : 可选，仅阿里云 ESA 使用；DDNS 任务选择配置后自动带出（可按任务覆盖），
+--                  证书 DNS01 在云解析定位不到域名（托管在 ESA）时自动用该站点写入 TXT
+CREATE TABLE IF NOT EXISTS provider_config (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    name              TEXT NOT NULL,
+    provider_type     TEXT NOT NULL DEFAULT 'ALIYUN',
+    access_key_id     TEXT NOT NULL,
+    access_key_secret TEXT NOT NULL,
+    esa_site_id       TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
 -- 全局操作日志表（所有模块统一写入，支持分页查询）
 CREATE TABLE IF NOT EXISTS op_log (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,6 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_op_log_id ON op_log (id DESC);
 -- DDNS 同步任务表
 -- provider : ALIYUN_DNS（云解析） / ALIYUN_ESA（边缘安全加速）
 -- ip_mode  : LOCAL（本机网卡） / MANUAL（手动输入） / PUBLIC（公网接口）
+-- provider_config_id : 引用服务商凭证配置（provider_config.id）；为空时使用任务内手动填写的 AccessKey
 CREATE TABLE IF NOT EXISTS ddns_task (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     name               TEXT NOT NULL,
@@ -33,6 +48,7 @@ CREATE TABLE IF NOT EXISTS ddns_task (
     ip_mode            TEXT NOT NULL DEFAULT 'PUBLIC',
     manual_ip          TEXT,
     local_nic          TEXT,
+    provider_config_id INTEGER,
     access_key_id      TEXT,
     access_key_secret  TEXT,
     esa_site_id        TEXT,
@@ -99,15 +115,17 @@ CREATE TABLE IF NOT EXISTS wol_device (
 
 -- SSL 证书任务表
 -- provider       : LETSENCRYPT / ZEROSSL
--- challenge_type : HTTP01（自动，需本机 80 端口可被公网访问） / DNS01（手动添加 TXT 记录）
+-- challenge_type : HTTP01（自动，需本机 80 端口可被公网访问） / DNS01（手动添加 TXT 或引用凭证配置自动添加）
+-- provider_config_id : DNS01 自动验证引用的服务商凭证配置（阿里云，云解析/ESA 自动探测）；为空时手动添加 TXT
 -- status         : IDLE / PENDING_VALIDATION / ISSUED / ERROR
 CREATE TABLE IF NOT EXISTS cert_task (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    name           TEXT NOT NULL,
-    provider       TEXT NOT NULL DEFAULT 'LETSENCRYPT',
-    domains        TEXT NOT NULL,
-    challenge_type TEXT NOT NULL DEFAULT 'HTTP01',
-    status         TEXT NOT NULL DEFAULT 'IDLE',
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    name               TEXT NOT NULL,
+    provider           TEXT NOT NULL DEFAULT 'LETSENCRYPT',
+    domains            TEXT NOT NULL,
+    challenge_type     TEXT NOT NULL DEFAULT 'HTTP01',
+    provider_config_id INTEGER,
+    status             TEXT NOT NULL DEFAULT 'IDLE',
     message        TEXT,
     dns_hint       TEXT,
     not_after      TEXT,

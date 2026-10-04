@@ -6,6 +6,7 @@ import com.nexhome.core.Database;
 import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
 import com.nexhome.core.Tasks;
+import com.nexhome.module.provider.ProviderConfigService;
 import com.nexhome.web.Ctx;
 import com.nexhome.web.WebServer;
 
@@ -68,10 +69,20 @@ public final class DdnsService {
 
     /** 启动时加载全部启用的任务并建立定时调度（重启自动加载） */
     public static void init() throws SQLException {
+        ensureColumn("provider_config_id", "INTEGER"); // 旧库升级：引用服务商凭证配置
         for (Map<String, Object> task : Database.query("SELECT * FROM ddns_task")) {
             schedule(task);
         }
         Logs.info(Logs.DDNS, "DDNS 任务已加载，共 " + SCHEDULES.size() + " 个定时任务");
+    }
+
+    /** 旧库升级：补充缺失列（新库建表脚本已包含） */
+    private static void ensureColumn(String name, String type) throws SQLException {
+        boolean exists = Database.query("PRAGMA table_info(ddns_task)").stream()
+                .anyMatch(col -> name.equals(col.get("name")));
+        if (!exists) {
+            Database.update("ALTER TABLE ddns_task ADD COLUMN " + name + " " + type);
+        }
     }
 
     // ---------- 增删改 ----------
@@ -79,14 +90,15 @@ public final class DdnsService {
     private static void create(Ctx ctx) throws Exception {
         JsonObject b = ctx.body();
         validate(b, true);
+        Long cfgId = ProviderConfigService.parseId(b, "provider_config_id");
         long id = Database.insert("""
                 INSERT INTO ddns_task(name, provider, domain, rr, type, ttl, ip_mode, manual_ip, local_nic,
-                    access_key_id, access_key_secret, esa_site_id, interval_sec, enabled)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    provider_config_id, access_key_id, access_key_secret, esa_site_id, interval_sec, enabled)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "provider"), JsonUtils.str(b, "domain"),
                 JsonUtils.str(b, "rr"), JsonUtils.str(b, "type"), JsonUtils.num(b, "ttl", 600),
                 JsonUtils.str(b, "ip_mode"), JsonUtils.str(b, "manual_ip"), JsonUtils.str(b, "local_nic"),
-                JsonUtils.str(b, "access_key_id"), JsonUtils.str(b, "access_key_secret"),
+                cfgId, JsonUtils.str(b, "access_key_id"), JsonUtils.str(b, "access_key_secret"),
                 JsonUtils.str(b, "esa_site_id"), JsonUtils.num(b, "interval_sec", 300),
                 JsonUtils.bool(b, "enabled", true) ? 1 : 0);
         Logs.info(Logs.DDNS, "新增同步任务: " + JsonUtils.str(b, "name"));
@@ -101,14 +113,15 @@ public final class DdnsService {
         mustGet(id);
         JsonObject b = ctx.body();
         validate(b, false);
+        Long cfgId = ProviderConfigService.parseId(b, "provider_config_id");
         Database.update("""
                 UPDATE ddns_task SET name=?, provider=?, domain=?, rr=?, type=?, ttl=?, ip_mode=?,
-                    manual_ip=?, local_nic=?, access_key_id=?, access_key_secret=?, esa_site_id=?,
+                    manual_ip=?, local_nic=?, provider_config_id=?, access_key_id=?, access_key_secret=?, esa_site_id=?,
                     interval_sec=?, enabled=? WHERE id=?""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "provider"), JsonUtils.str(b, "domain"),
                 JsonUtils.str(b, "rr"), JsonUtils.str(b, "type"), JsonUtils.num(b, "ttl", 600),
                 JsonUtils.str(b, "ip_mode"), JsonUtils.str(b, "manual_ip"), JsonUtils.str(b, "local_nic"),
-                JsonUtils.str(b, "access_key_id"), JsonUtils.str(b, "access_key_secret"),
+                cfgId, JsonUtils.str(b, "access_key_id"), JsonUtils.str(b, "access_key_secret"),
                 JsonUtils.str(b, "esa_site_id"), JsonUtils.num(b, "interval_sec", 300),
                 JsonUtils.bool(b, "enabled", true) ? 1 : 0, id);
         Logs.info(Logs.DDNS, "更新同步任务 #" + id + ": " + JsonUtils.str(b, "name"));
@@ -147,11 +160,11 @@ public final class DdnsService {
                 if (online == null) return "（远程无 " + fullDomain + " 解析记录，无需删除）";
                 recordId = recordIdOf(task, online);
             }
-            String ak = str(task, "access_key_id"), sk = str(task, "access_key_secret");
+            String[] cred = credentials(task);
             if ("ALIYUN_DNS".equals(str(task, "provider"))) {
-                AliyunClient.dnsDeleteRecord(ak, sk, recordId);
+                AliyunClient.dnsDeleteRecord(cred[0], cred[1], recordId);
             } else {
-                AliyunClient.esaDeleteRecord(ak, sk, recordId);
+                AliyunClient.esaDeleteRecord(cred[0], cred[1], recordId);
             }
             return "（已删除远程解析记录 " + fullDomain + "）";
         } catch (Exception e) {
@@ -170,8 +183,10 @@ public final class DdnsService {
         if (JsonUtils.str(b, "name").isBlank()) throw new IllegalArgumentException("任务名称不能为空");
         if (JsonUtils.str(b, "domain").isBlank()) throw new IllegalArgumentException("域名不能为空");
         if (JsonUtils.str(b, "rr").isBlank()) throw new IllegalArgumentException("主机记录不能为空");
-        if (JsonUtils.str(b, "access_key_id").isBlank() || JsonUtils.str(b, "access_key_secret").isBlank()) {
-            throw new IllegalArgumentException("阿里云 AccessKey ID / Secret 不能为空");
+        // 已选择服务商凭证配置时无需手动填写 AccessKey
+        if (ProviderConfigService.parseId(b, "provider_config_id") == null
+                && (JsonUtils.str(b, "access_key_id").isBlank() || JsonUtils.str(b, "access_key_secret").isBlank())) {
+            throw new IllegalArgumentException("请选择阿里云凭证配置，或手动填写 AccessKey ID / Secret");
         }
         if ("ALIYUN_ESA".equals(JsonUtils.str(b, "provider")) && JsonUtils.str(b, "esa_site_id").isBlank()) {
             throw new IllegalArgumentException("ESA 服务商需要填写站点 SiteId");
@@ -249,11 +264,10 @@ public final class DdnsService {
     /** 查询线上与任务主机记录/类型匹配的解析记录，不存在返回 null */
     private static JsonObject findOnlineRecord(Map<String, Object> task, String fullDomain) throws Exception {
         String rr = str(task, "rr"), type = str(task, "type");
+        String[] cred = credentials(task);
         JsonArray records;
         if ("ALIYUN_DNS".equals(str(task, "provider"))) {
-            records = AliyunClient.dnsDescribeRecords(
-                    str(task, "access_key_id"), str(task, "access_key_secret"),
-                    str(task, "domain"), rr);
+            records = AliyunClient.dnsDescribeRecords(cred[0], cred[1], str(task, "domain"), rr);
             for (var el : records) {
                 JsonObject r = el.getAsJsonObject();
                 if (r.get("RR").getAsString().equalsIgnoreCase(rr)
@@ -263,9 +277,7 @@ public final class DdnsService {
             }
         } else {
             // ESA
-            records = AliyunClient.esaListRecords(
-                    str(task, "access_key_id"), str(task, "access_key_secret"),
-                    str(task, "esa_site_id"), fullDomain);
+            records = AliyunClient.esaListRecords(cred[0], cred[1], str(task, "esa_site_id"), fullDomain);
             for (var el : records) {
                 JsonObject r = el.getAsJsonObject();
                 // 部分记录类型（如 NS）无 Data.Value 结构，跳过避免 NPE
@@ -316,23 +328,23 @@ public final class DdnsService {
 
     /** 新增线上解析记录（仅在查询确认不存在后调用），并缓存 RecordId */
     private static void addRecord(Map<String, Object> task, String fullDomain, String ip) throws Exception {
-        String ak = str(task, "access_key_id"), sk = str(task, "access_key_secret");
+        String[] cred = credentials(task);
         String newId = "ALIYUN_DNS".equals(str(task, "provider"))
-                ? AliyunClient.dnsAddRecord(ak, sk, str(task, "domain"), str(task, "rr"),
+                ? AliyunClient.dnsAddRecord(cred[0], cred[1], str(task, "domain"), str(task, "rr"),
                         str(task, "type"), ip, intVal(task, "ttl"))
-                : AliyunClient.esaCreateRecord(ak, sk, str(task, "esa_site_id"), fullDomain,
+                : AliyunClient.esaCreateRecord(cred[0], cred[1], str(task, "esa_site_id"), fullDomain,
                         str(task, "type"), ip, intVal(task, "ttl"));
         Database.update("UPDATE ddns_task SET record_id=? WHERE id=?", newId, task.get("id"));
     }
 
     /** 更新线上解析记录 */
     private static void updateRecord(Map<String, Object> task, String recordId, String ip) throws Exception {
-        String ak = str(task, "access_key_id"), sk = str(task, "access_key_secret");
+        String[] cred = credentials(task);
         if ("ALIYUN_DNS".equals(str(task, "provider"))) {
-            AliyunClient.dnsUpdateRecord(ak, sk, recordId, str(task, "rr"),
+            AliyunClient.dnsUpdateRecord(cred[0], cred[1], recordId, str(task, "rr"),
                     str(task, "type"), ip, intVal(task, "ttl"));
         } else {
-            AliyunClient.esaUpdateRecord(ak, sk, recordId, str(task, "type"), ip, intVal(task, "ttl"));
+            AliyunClient.esaUpdateRecord(cred[0], cred[1], recordId, str(task, "type"), ip, intVal(task, "ttl"));
         }
     }
 
@@ -368,6 +380,18 @@ public final class DdnsService {
     /** 主机记录 + 域名拼成完整记录名，@ 表示主域名本身 */
     static String fullRecordName(String rr, String domain) {
         return "@".equals(rr) ? domain : rr + "." + domain;
+    }
+
+    /**
+     * 任务实际生效的阿里云凭证 [accessKeyId, accessKeySecret]。
+     * 选择了服务商凭证配置时实时读取（修改配置后所有引用任务自动生效），
+     * 否则使用任务内手动填写的 AccessKey。
+     */
+    private static String[] credentials(Map<String, Object> task) throws SQLException {
+        if (task.get("provider_config_id") instanceof Number n) {
+            return ProviderConfigService.credentials(n.longValue());
+        }
+        return new String[]{str(task, "access_key_id"), str(task, "access_key_secret")};
     }
 
     private static Map<String, Object> mustGet(long id) throws SQLException {

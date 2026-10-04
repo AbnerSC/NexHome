@@ -28,7 +28,9 @@ async function renderCert() {
     $('#pageBody').innerHTML = `
       <div class="tip">
         Let's Encrypt 免费无需凭证；<b>ZeroSSL 需要在下方填写 EAB 凭证</b>（ZeroSSL 控制台 → Developer → EAB Credentials 生成）。
-        HTTP01 验证要求公网可访问本机 80 端口（可路由器转发）；无法开放 80 端口时请选择 DNS01 手动添加 TXT 记录。
+        HTTP01 验证要求公网可访问本机 80 端口（可路由器转发）；无法开放 80 端口时选择 DNS01——
+        域名解析托管在阿里云（云解析或 ESA）的可在下方配置中选择凭证实现 <b>全自动验证</b>（含通配符；
+        托管在 ESA 需在凭证配置中填写站点 SiteId），否则手动添加 TXT 记录。
       </div>
       <div class="panel">
         <h3 style="font-size:14px;margin-bottom:12px">服务商凭证设置</h3>
@@ -75,7 +77,8 @@ window.certAutoRenew = async (id, checked) => {
     try {
         await api('PUT', '/api/cert/tasks/' + id, {
             name: t.name, provider: t.provider, domains: t.domains,
-            challenge_type: t.challenge_type, auto_renew: checked
+            challenge_type: t.challenge_type, provider_config_id: t.provider_config_id ?? null,
+            auto_renew: checked
         });
         toast(checked ? '已开启自动续期' : '已关闭自动续期');
     } catch (e) { toast(e.message, 'err'); }
@@ -117,6 +120,13 @@ window.certDelete = async id => {
 window.certForm = async (id) => {
     let t = {};
     if (id) t = (await api('GET', '/api/cert/tasks')).find(x => x.id === id);
+    let configs = [];
+    try { configs = await api('GET', '/api/provider/configs'); } catch (e) { /* ignore */ }
+    // DNS01 自动验证支持阿里云（云解析或 ESA 托管的域名，ESA 需在凭证配置中填写站点 SiteId），
+    // 仅列出该类型配置（已引用的配置始终保留避免编辑时回显丢失）
+    const credOpts = configs
+        .filter(c => (c.provider_type || 'ALIYUN') === 'ALIYUN' || c.id === t.provider_config_id)
+        .map(c => `<option value="${c.id}" ${t.provider_config_id === c.id ? 'selected' : ''}>${esc(c.name)}（自动添加TXT）</option>`).join('');
     modal(id ? '编辑证书任务' : '新增证书任务', `
       <form id="certFormEl" class="form-grid">
         <div class="field"><label>任务名称 <b>*</b></label><input name="name" required value="${esc(t.name || '')}"></div>
@@ -128,9 +138,13 @@ window.certForm = async (id) => {
         <div class="field full"><label>域名列表 <b>*</b>（逗号分隔，支持 *.example.com 通配，仅 DNS01）</label>
           <input name="domains" required placeholder="example.com, www.example.com" value="${esc(t.domains || '')}"></div>
         <div class="field"><label>验证方式 <b>*</b></label>
-          <select name="challenge_type">
+          <select name="challenge_type" onchange="certChallengeChanged(this.value)">
             <option value="HTTP01" ${t.challenge_type !== 'DNS01' ? 'selected' : ''}>HTTP01（自动，需80端口）</option>
-            <option value="DNS01" ${t.challenge_type === 'DNS01' ? 'selected' : ''}>DNS01（手动添加TXT记录）</option>
+            <option value="DNS01" ${t.challenge_type === 'DNS01' ? 'selected' : ''}>DNS01（TXT 记录验证）</option>
+          </select></div>
+        <div class="field hidden" id="fDnsProvider"><label>DNS 解析服务商（阿里云可选自动验证）</label>
+          <select name="provider_config_id">
+            <option value="">手动添加 TXT 记录</option>${credOpts}
           </select></div>
         <div class="field"><label>自动续期</label>
           <select name="auto_renew"><option value="true" ${t.auto_renew !== 0 ? 'selected' : ''}>开启（到期前21天）</option><option value="false" ${t.auto_renew === 0 ? 'selected' : ''}>关闭</option></select></div>
@@ -139,9 +153,14 @@ window.certForm = async (id) => {
           <button class="btn primary">保存</button>
         </div>
       </form>`);
+    window.certChallengeChanged = v => {
+        $('#fDnsProvider').classList.toggle('hidden', v !== 'DNS01');
+    };
+    window.certChallengeChanged(t.challenge_type || 'HTTP01');
     $('#certFormEl').addEventListener('submit', async e => {
         e.preventDefault();
         const body = Object.fromEntries(new FormData(e.target).entries());
+        body.provider_config_id = body.provider_config_id ? Number(body.provider_config_id) : null;
         body.auto_renew = body.auto_renew === 'true';
         try {
             if (id) await api('PUT', '/api/cert/tasks/' + id, body);

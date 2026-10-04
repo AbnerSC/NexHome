@@ -20,7 +20,8 @@ async function renderDdns() {
       </tr>`).join('');
     $('#pageBody').innerHTML = `
       <div class="tip">IP 来源支持三种模式：<b>公网接口</b>（自动获取出口 IP）/ <b>本地网卡</b> / <b>手动输入</b>。
-        对接阿里云需要使用 RAM 子账号 AccessKey（建议仅授予 AliyunDNSFullAccess 或 ESA 解析权限）。</div>
+        阿里云 AccessKey 可在 <a href="#" onclick="setPage('settings')">系统设置 → 服务商凭证配置</a> 中统一维护，表单中直接下拉选择；
+        对接阿里云建议使用 RAM 子账号 AccessKey（仅授予 AliyunDNSFullAccess 或 ESA 解析权限）。</div>
       <div class="toolbar"><div class="spacer"></div><button class="btn primary" onclick="ddnsForm()">＋ 新增同步任务</button></div>
       <div class="panel"><table>
         <thead><tr><th>任务</th><th>域名</th><th>IP来源</th><th>定时同步</th><th>当前IP</th><th>最近同步</th><th>操作</th></tr></thead>
@@ -36,6 +37,7 @@ window.ddnsToggle = async (id, enabled, interval) => {
         await api('PUT', '/api/ddns/tasks/' + id, {
             name: t.name, provider: t.provider, domain: t.domain, rr: t.rr, type: t.type, ttl: t.ttl,
             ip_mode: t.ip_mode, manual_ip: t.manual_ip, local_nic: t.local_nic,
+            provider_config_id: t.provider_config_id ?? null,
             access_key_id: t.access_key_id, access_key_secret: t.access_key_secret,
             esa_site_id: t.esa_site_id, interval_sec: t.interval_sec, enabled
         });
@@ -75,9 +77,16 @@ window.ddnsDelete = async id => {
 window.ddnsForm = async (id) => {
     let t = {};
     if (id) t = (await api('GET', '/api/ddns/tasks')).find(x => x.id === id);
-    let nics = [];
+    let nics = [], configs = [];
     try { nics = (await api('GET', '/api/ddns/nics')).nics; } catch (e) { /* ignore */ }
+    try { configs = await api('GET', '/api/provider/configs'); } catch (e) { /* ignore */ }
     const nicOpts = nics.map(n => `<option value="${esc(n)}" ${t.local_nic === n ? 'selected' : ''}>${esc(n)}</option>`).join('');
+    // 仅列出与任务服务商同类型的凭证配置（ALIYUN_DNS/ALIYUN_ESA -> ALIYUN；后续新服务商按前缀匹配），
+    // 已引用的配置始终保留避免编辑时回显丢失
+    const credType = (t.provider || 'ALIYUN_DNS').split('_')[0];
+    const credOpts = configs
+        .filter(c => (c.provider_type || 'ALIYUN') === credType || c.id === t.provider_config_id)
+        .map(c => `<option value="${c.id}" ${t.provider_config_id === c.id ? 'selected' : ''}>${esc(c.name)}（${esc(maskAk(c.access_key_id))}）</option>`).join('');
     modal(id ? '编辑同步任务' : '新增同步任务', `
       <form id="ddnsFormEl" class="form-grid">
         <div class="field"><label>任务名称 <b>*</b></label><input name="name" required value="${esc(t.name || '')}"></div>
@@ -105,8 +114,12 @@ window.ddnsForm = async (id) => {
             <span id="ipPreview" class="small muted">按当前 IP 来源配置解析</span>
           </div>
         </div>
-        <div class="field"><label>AccessKey ID <b>*</b></label><input name="access_key_id" required value="${esc(t.access_key_id || '')}"></div>
-        <div class="field"><label>AccessKey Secret <b>*</b></label><input name="access_key_secret" required type="password" value="${esc(t.access_key_secret || '')}"></div>
+        <div class="field"><label>阿里云凭证 <b>*</b></label>
+          <select name="provider_config_id" onchange="ddnsCredChanged(this.value)">
+            <option value="">手动填写 AccessKey</option>${credOpts}
+          </select></div>
+        <div class="field hidden" id="fAkId"><label>AccessKey ID <b>*</b></label><input name="access_key_id" value="${esc(t.access_key_id || '')}"></div>
+        <div class="field hidden" id="fAkSecret"><label>AccessKey Secret <b>*</b></label><input name="access_key_secret" type="password" value="${esc(t.access_key_secret || '')}"></div>
         <div class="field hidden" id="fSiteId"><label>ESA 站点 SiteId <b>*</b></label><input name="esa_site_id" value="${esc(t.esa_site_id || '')}" placeholder="数字站点ID"></div>
         <div class="field"><label>同步间隔（秒，最小60）</label><input name="interval_sec" type="number" min="60" value="${t.interval_sec ?? 300}"></div>
         <div class="field"><label>启用定时同步</label><select name="enabled"><option value="true" ${t.enabled !== 0 ? 'selected' : ''}>启用</option><option value="false" ${t.enabled === 0 ? 'selected' : ''}>停用</option></select></div>
@@ -116,6 +129,21 @@ window.ddnsForm = async (id) => {
         </div>
       </form>`);
     window.ddnsProviderChanged = p => { $('#fSiteId').classList.toggle('hidden', p !== 'ALIYUN_ESA'); };
+    window.ddnsCredChanged = v => {
+        const manual = !v; // 未选配置时手动填写 AccessKey
+        $('#fAkId').classList.toggle('hidden', !manual);
+        $('#fAkSecret').classList.toggle('hidden', !manual);
+        $('#fAkId input').required = manual;
+        $('#fAkSecret input').required = manual;
+        if (!manual) {
+            // 配置中保存了 ESA SiteId 时自动带出（仍可按任务覆盖）
+            const c = configs.find(x => String(x.id) === String(v));
+            if (c && c.esa_site_id) {
+                const site = $('#ddnsFormEl [name=esa_site_id]');
+                if (!site.value) site.value = c.esa_site_id;
+            }
+        }
+    };
     window.ddnsModeChanged = m => {
         $('#fNic').classList.toggle('hidden', m !== 'LOCAL');
         $('#fManualIp').classList.toggle('hidden', m !== 'MANUAL');
@@ -143,10 +171,12 @@ window.ddnsForm = async (id) => {
     };
     window.ddnsProviderChanged(t.provider || 'ALIYUN_DNS');
     window.ddnsModeChanged(t.ip_mode || 'PUBLIC');
+    window.ddnsCredChanged(t.provider_config_id ? String(t.provider_config_id) : '');
     $('#ddnsFormEl').addEventListener('submit', async e => {
         e.preventDefault();
         const f = new FormData(e.target);
         const body = Object.fromEntries(f.entries());
+        body.provider_config_id = body.provider_config_id ? Number(body.provider_config_id) : null;
         body.ttl = Number(body.ttl || 600);
         body.interval_sec = Number(body.interval_sec || 300);
         body.enabled = body.enabled === 'true';

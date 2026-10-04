@@ -9,6 +9,7 @@ import com.nexhome.module.cert.CertService;
 import com.nexhome.module.ddns.DdnsService;
 import com.nexhome.module.docker.DockerService;
 import com.nexhome.module.nav.NavService;
+import com.nexhome.module.provider.ProviderConfigService;
 import com.nexhome.module.stun.StunServerService;
 import com.nexhome.module.stun.StunService;
 import com.nexhome.module.wol.WolService;
@@ -43,6 +44,7 @@ public final class NexHomeApp {
 
             // 4. 注册全部 REST 接口
             SystemRoutes.register();
+            ProviderConfigService.registerRoutes();
             DdnsService.registerRoutes();
             StunService.registerRoutes();
             StunServerService.registerRoutes();
@@ -52,6 +54,7 @@ public final class NexHomeApp {
             DockerService.registerRoutes();
 
             // 5. 启动业务调度与后台任务
+            ProviderConfigService.init(); // 服务商凭证配置旧库迁移
             CertService.init();      // 证书自动续期检查
             DdnsService.init();      // 恢复 DDNS 定时同步
             StunServerService.init(); // 播种 STUN 服务器列表

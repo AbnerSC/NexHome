@@ -1,11 +1,15 @@
 package com.nexhome.module.cert;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.nexhome.core.AppConfig;
 import com.nexhome.core.Database;
 import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
 import com.nexhome.core.Tasks;
+import com.nexhome.module.ddns.AliyunApiException;
+import com.nexhome.module.ddns.AliyunClient;
+import com.nexhome.module.provider.ProviderConfigService;
 import com.nexhome.web.Ctx;
 import com.nexhome.web.WebServer;
 
@@ -57,7 +61,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * <ul>
  *   <li>HTTP01：全自动。CA 会访问 {@code http://域名/.well-known/acme-challenge/token}，
  *       由本程序内置 Web 服务器应答，因此要求本服务 80 端口可被公网访问（或路由器 80 端口转发到本服务端口）。</li>
- *   <li>DNS01：半自动。程序生成需要添加的 DNS TXT 记录，用户在域名服务商处添加后点击"完成验证"。</li>
+ *   <li>DNS01：引用服务商凭证配置时全自动写入 TXT（支持云解析与 ESA 托管的域名）；
+ *       未引用时为半自动——程序生成需要添加的 DNS TXT 记录，用户在域名服务商处添加后点击"完成验证"。</li>
  * </ul>
  * 证书文件保存在 {@code data/certs/task-{id}/}：私钥、证书、完整证书链（PEM）。
  */
@@ -132,11 +137,21 @@ public final class CertService {
     }
 
     /** 启动初始化：注册 BouncyCastle 提供者 + 启动自动续期检查 */
-    public static void init() {
+    public static void init() throws SQLException {
         Security.addProvider(new BouncyCastleProvider());
+        ensureColumn("provider_config_id", "INTEGER"); // 旧库升级：DNS01 自动验证引用凭证配置
         // 每小时检查一次证书有效期
         Tasks.every(60, 3600, CertService::autoRenewCheck);
         Logs.info(Logs.CERT, "证书自动续期检查已启动（每小时，到期前 " + RENEW_AHEAD_DAYS + " 天续期）");
+    }
+
+    /** 旧库升级：补充缺失列（新库建表脚本已包含） */
+    private static void ensureColumn(String name, String type) throws SQLException {
+        boolean exists = Database.query("PRAGMA table_info(cert_task)").stream()
+                .anyMatch(col -> name.equals(col.get("name")));
+        if (!exists) {
+            Database.update("ALTER TABLE cert_task ADD COLUMN " + name + " " + type);
+        }
     }
 
     /** 供 WebServer 分发 /.well-known/acme-challenge/{token} */
@@ -156,11 +171,12 @@ public final class CertService {
         JsonObject b = ctx.body();
         validate(b);
         long id = Database.insert("""
-                INSERT INTO cert_task(name, provider, domains, challenge_type, auto_renew)
-                VALUES(?,?,?,?,?)""",
+                INSERT INTO cert_task(name, provider, domains, challenge_type, provider_config_id, auto_renew)
+                VALUES(?,?,?,?,?,?)""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "provider"),
                 normalizeDomains(JsonUtils.str(b, "domains")),
                 JsonUtils.str(b, "challenge_type"),
+                ProviderConfigService.parseId(b, "provider_config_id"),
                 JsonUtils.bool(b, "auto_renew", true) ? 1 : 0);
         Logs.info(Logs.CERT, "新增证书任务: " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
@@ -172,10 +188,11 @@ public final class CertService {
         JsonObject b = ctx.body();
         validate(b);
         Database.update("""
-                UPDATE cert_task SET name=?, provider=?, domains=?, challenge_type=?, auto_renew=? WHERE id=?""",
+                UPDATE cert_task SET name=?, provider=?, domains=?, challenge_type=?, provider_config_id=?, auto_renew=? WHERE id=?""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "provider"),
                 normalizeDomains(JsonUtils.str(b, "domains")),
                 JsonUtils.str(b, "challenge_type"),
+                ProviderConfigService.parseId(b, "provider_config_id"),
                 JsonUtils.bool(b, "auto_renew", true) ? 1 : 0, id);
         Logs.info(Logs.CERT, "更新证书任务 #" + id + ": " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
@@ -252,21 +269,44 @@ public final class CertService {
                 waitAuthorizations(order, Duration.ofSeconds(120));
                 finalizeAndDownload(taskId, task, order, domains);
             } else {
-                // DNS01：只收集提示，不触发验证，等用户添加 TXT 后手动提交
-                StringBuilder hint = new StringBuilder();
-                for (Authorization auth : order.getAuthorizations()) {
-                    if (auth.getStatus() == Status.VALID) continue;
-                    Dns01Challenge ch = auth.findChallenge(Dns01Challenge.class)
-                            .orElseThrow(() -> new IllegalStateException("CA 未提供 dns-01 验证方式"));
-                    String domain = auth.getIdentifier().getDomain();
-                    hint.append("记录类型: TXT\n主机记录: _acme-challenge.")
-                            .append(auth.isWildcard() ? domain : domain)
-                            .append("\n记录值: ").append(ch.getDigest()).append("\n\n");
+                // DNS01：引用服务商凭证配置时全自动（写入 DNS TXT -> 触发校验 -> 签发后清理），
+                // 未引用时收集提示等待用户手动添加 TXT 后点「完成验证」
+                DnsCred cred = dnsCredentials(task);
+                List<TxtRecord> addedTxt = new ArrayList<>();
+                try {
+                    if (cred != null) {
+                        for (Authorization auth : order.getAuthorizations()) {
+                            if (auth.getStatus() == Status.VALID) continue;
+                            Dns01Challenge ch = auth.findChallenge(Dns01Challenge.class)
+                                    .orElseThrow(() -> new IllegalStateException("CA 未提供 dns-01 验证方式"));
+                            String domain = auth.getIdentifier().getDomain();
+                            TxtRecord txt = autoApplyTxt(cred, domain, ch.getDigest());
+                            addedTxt.add(txt);
+                            ch.trigger();
+                            Logs.info(Logs.CERT, "任务[" + name + "] dns-01 已自动写入"
+                                    + txt.channelName() + " TXT: _acme-challenge." + domain);
+                        }
+                        waitAuthorizations(order, Duration.ofSeconds(180));
+                        finalizeAndDownload(taskId, task, order, domains);
+                    } else {
+                        StringBuilder hint = new StringBuilder();
+                        for (Authorization auth : order.getAuthorizations()) {
+                            if (auth.getStatus() == Status.VALID) continue;
+                            Dns01Challenge ch = auth.findChallenge(Dns01Challenge.class)
+                                    .orElseThrow(() -> new IllegalStateException("CA 未提供 dns-01 验证方式"));
+                            String domain = auth.getIdentifier().getDomain();
+                            hint.append("记录类型: TXT\n主机记录: _acme-challenge.")
+                                    .append(auth.isWildcard() ? domain : domain)
+                                    .append("\n记录值: ").append(ch.getDigest()).append("\n\n");
+                        }
+                        Database.update("UPDATE cert_task SET status='PENDING_VALIDATION', dns_hint=?, message=? WHERE id=?",
+                                hint.toString(),
+                                "请前往域名服务商添加以上 TXT 记录（等待生效后）点击\"完成验证\"", taskId);
+                        Logs.info(Logs.CERT, "任务[" + name + "] 等待用户添加 DNS TXT 记录");
+                    }
+                } finally {
+                    cleanupTxt(cred, addedTxt); // 验证完成/失败后均清理自动写入的 TXT
                 }
-                Database.update("UPDATE cert_task SET status='PENDING_VALIDATION', dns_hint=?, message=? WHERE id=?",
-                        hint.toString(),
-                        "请前往域名服务商添加以上 TXT 记录（等待生效后）点击\"完成验证\"", taskId);
-                Logs.info(Logs.CERT, "任务[" + name + "] 等待用户添加 DNS TXT 记录");
             }
         } catch (Exception e) {
             fail(taskId, trigger + "失败: " + e.getMessage());
@@ -397,6 +437,101 @@ public final class CertService {
         result.put("serial", cert.getSerialNumber().toString(16));
         result.put("sha256", hexSha256(cert.getEncoded()));
         return result;
+    }
+
+    // ---------- DNS01 自动验证（引用服务商凭证配置） ----------
+
+    /** DNS01 自动验证凭证上下文：阿里云 AK/SK + 凭证配置中可选的 ESA 站点（域名托管在 ESA 时降级使用） */
+    private record DnsCred(String ak, String sk, String esaSiteId) {
+    }
+
+    /** 自动写入的 TXT 记录：channel 标识写入通道（DNS=云解析 / ESA=边缘安全加速），验证后按原通道删除 */
+    private record TxtRecord(String channel, String recordId) {
+        String channelName() {
+            return "ESA".equals(channel) ? "阿里云ESA" : "阿里云云解析";
+        }
+    }
+
+    /** 任务引用的服务商凭证（DNS01 自动模式）；未引用配置返回 null */
+    private static DnsCred dnsCredentials(Map<String, Object> task) throws SQLException {
+        if (!(task.get("provider_config_id") instanceof Number n)) return null;
+        long cfgId = n.longValue();
+        String[] cred = ProviderConfigService.credentials(cfgId);
+        return new DnsCred(cred[0], cred[1], ProviderConfigService.esaSiteId(cfgId));
+    }
+
+    /**
+     * 向阿里云写入 dns-01 TXT 记录并返回写入结果，供验证结束后按原通道清理。
+     * <p>
+     * 授权域可能是主域或其子域（泛域名授权的 identifier 为主域），而云解析接口的
+     * DomainName 参数必须是账户内的主域：优先整域探测，失败逐级剥离左段重试（最多三层）。
+     * 已存在相同值的 TXT 直接复用（如上次失败残留），避免重复添加。
+     * 云解析全部探测失败且凭证配置填写了 ESA 站点时，说明域名解析托管在 ESA，降级改走 ESA 记录接口。
+     */
+    private static TxtRecord autoApplyTxt(DnsCred cred, String domain, String value) throws Exception {
+        String[] parts = domain.split("\\.");
+        int maxStrip = Math.min(2, parts.length - 2); // 主域至少保留两段
+        AliyunApiException last = null;
+        for (int strip = 0; strip <= maxStrip; strip++) {
+            String zone = String.join(".", List.of(parts).subList(strip, parts.length));
+            String rr = strip == 0 ? "_acme-challenge"
+                    : "_acme-challenge." + String.join(".", List.of(parts).subList(0, strip));
+            try {
+                for (var el : AliyunClient.dnsDescribeRecords(cred.ak(), cred.sk(), zone, "_acme-challenge")) {
+                    JsonObject r = el.getAsJsonObject();
+                    if (r.get("RR").getAsString().equalsIgnoreCase(rr)
+                            && "TXT".equalsIgnoreCase(r.get("Type").getAsString())
+                            && value.equals(r.get("Value").getAsString())) {
+                        return new TxtRecord("DNS", null); // 已有相同值记录，无需重复添加
+                    }
+                }
+                return new TxtRecord("DNS", AliyunClient.dnsAddRecord(cred.ak(), cred.sk(), zone, rr, "TXT", value, 600));
+            } catch (AliyunApiException e) {
+                last = e; // 域名不在当前账户/不存在：剥离左段继续探测主域
+            }
+        }
+        if (!cred.esaSiteId().isBlank()) {
+            return esaApplyTxt(cred, domain, value);
+        }
+        throw new IllegalStateException("自动写入 TXT 失败（无法定位 " + domain
+                + " 的主域；若域名解析托管在阿里云 ESA，请在所引用的凭证配置中填写 ESA 站点 SiteId）: "
+                + (last == null ? "" : last.getMessage()), last);
+    }
+
+    /** ESA 托管域名：向站点写入 _acme-challenge TXT（ESA 记录名为完整记录名） */
+    private static TxtRecord esaApplyTxt(DnsCred cred, String domain, String value) throws Exception {
+        String fullName = "_acme-challenge." + domain;
+        try {
+            for (var el : AliyunClient.esaListRecords(cred.ak(), cred.sk(), cred.esaSiteId(), fullName)) {
+                JsonObject r = el.getAsJsonObject();
+                if ("TXT".equalsIgnoreCase(r.get("Type").getAsString())
+                        && r.has("Data") && r.get("Data").isJsonObject()
+                        && value.equals(r.getAsJsonObject("Data").get("Value").getAsString())) {
+                    return new TxtRecord("ESA", null); // 已有相同值记录，无需重复添加
+                }
+            }
+            return new TxtRecord("ESA", AliyunClient.esaCreateRecord(
+                    cred.ak(), cred.sk(), cred.esaSiteId(), fullName, "TXT", value, 600));
+        } catch (Exception e) {
+            throw new IllegalStateException("ESA 写入 TXT 失败（请检查凭证配置的 ESA 站点 SiteId 是否为 "
+                    + domain + " 所在站点）: " + e.getMessage(), e);
+        }
+    }
+
+    /** 验证结束后清理自动写入的 TXT 记录（CA 已缓存验证结果，删除不影响签发；失败仅记日志） */
+    private static void cleanupTxt(DnsCred cred, List<TxtRecord> addedTxt) {
+        for (TxtRecord t : addedTxt) {
+            if (t.recordId() == null) continue; // 复用的已有记录，无需清理
+            try {
+                if ("ESA".equals(t.channel())) {
+                    AliyunClient.esaDeleteRecord(cred.ak(), cred.sk(), t.recordId());
+                } else {
+                    AliyunClient.dnsDeleteRecord(cred.ak(), cred.sk(), t.recordId());
+                }
+            } catch (Exception e) {
+                Logs.warn(Logs.CERT, "清理 dns-01 TXT 记录失败(" + t.channel() + " RecordId=" + t.recordId() + "): " + e.getMessage());
+            }
+        }
     }
 
     // ---------- ACME 账号管理 ----------
