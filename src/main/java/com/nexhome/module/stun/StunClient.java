@@ -161,7 +161,14 @@ public final class StunClient {
      * STUN-over-TCP 探测（兼容旧调用）：仅返回外网映射地址，探测连接用后即关闭，详见 {@link #probeOverTcp}。
      */
     public static String bindOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
-        TcpProbe p = probeOverTcp(stunHost, stunPort, localPort, timeoutMs);
+        return bindOverTcp(stunHost, stunPort, null, localPort, timeoutMs);
+    }
+
+    /**
+     * STUN-over-TCP 探测（指定出站源 IP）：仅返回外网映射地址，探测连接用后即关闭，详见 {@link #probeOverTcp}。
+     */
+    public static String bindOverTcp(String stunHost, int stunPort, String srcIp, int localPort, int timeoutMs) {
+        TcpProbe p = probeOverTcp(stunHost, stunPort, srcIp, localPort, timeoutMs);
         if (p == null) return null;
         try {
             return p.mapped();
@@ -175,6 +182,13 @@ public final class StunClient {
     }
 
     /**
+     * STUN-over-TCP 探测（RFC 5389 §7.1，兼容旧调用）：详见 {@link #probeOverTcp(String, int, String, int, int)}。
+     */
+    public static TcpProbe probeOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
+        return probeOverTcp(stunHost, stunPort, null, localPort, timeoutMs);
+    }
+
+    /**
      * STUN-over-TCP 探测（RFC 5389 §7.1）：从指定本地端口向 STUN 服务器建立 TCP 连接
      * 并发送绑定请求，返回该 TCP 出口的外网映射地址、实际本地端口与<b>保持打开的探测连接</b>。
      * <p>
@@ -183,12 +197,14 @@ public final class StunClient {
      * 连接不关闭：实测该类映射的入站可达性依赖出站连接的活跃状态，连接关闭后映射很快失效；
      * 调用方应持有该连接。注意公共服务器多为单事务型（响应后约 1 秒内断开），周期保活需按同本地端口轮换新建连接；不用时调用方负责关闭。
      * 服务器不支持 STUN/TCP 或本地端口绑定失败时返回 null。
+     *
+     * @param srcIp 出站源 IP（null=通配绑定）：通配绑定被拒时（如 Windows 上 0.0.0.0 监听已开启）
+     *              退回绑定该具体地址，具体地址出站绑定可与通配 LISTEN 共存（natmap 同款做法）
      */
-    public static TcpProbe probeOverTcp(String stunHost, int stunPort, int localPort, int timeoutMs) {
+    public static TcpProbe probeOverTcp(String stunHost, int stunPort, String srcIp, int localPort, int timeoutMs) {
         Socket s = new Socket();
         try {
-            s.setReuseAddress(true);
-            s.bind(new InetSocketAddress(Math.max(localPort, 0)));
+            bindOutbound(s, srcIp, localPort);
             int bound = s.getLocalPort();
             s.connect(new InetSocketAddress(InetAddress.getByName(stunHost), stunPort), timeoutMs);
             String mapped = exchangeTcpBinding(s, timeoutMs);
@@ -220,7 +236,14 @@ public final class StunClient {
     }
 
     /**
-     * 公共出站端点连接（端口保留模式兜底）：从指定本地端口向端点建立 TCP 连接，连接建立
+     * 公共出站端点连接（兼容旧调用）：详见 {@link #connectOutboundEx(String, int, String, int, int)}。
+     */
+    public static Socket connectOutboundEx(String host, int port, int localPort, int timeoutMs) throws Exception {
+        return connectOutboundEx(host, port, null, localPort, timeoutMs);
+    }
+    
+    /**
+     * 公共出站端点连接（端口保留模式/双链路保活段）：从指定本地端口向端点建立 TCP 连接，连接建立
      * 即返回——出站连接在沿途全部 NAT（含运营商 CGNAT）上建立映射，TCP 三次握手完成
      * 本身就是双向链路的验证，连接上不做任何应用层交互（域名解析按其设计走 UDP 53，
      * 由系统解析器承担）。注意端点须为透传服务：53/TCP 等被运营商透明拦截的端口，
@@ -228,11 +251,10 @@ public final class StunClient {
      * 调用方持有连接至下一保活周期（映射跟随连接存活），失败携带原因上抛
      * （连接被拒/超时等，供调用方记录端点失效原因）。
      */
-    public static Socket connectOutboundEx(String host, int port, int localPort, int timeoutMs) throws Exception {
+    public static Socket connectOutboundEx(String host, int port, String srcIp, int localPort, int timeoutMs) throws Exception {
         Socket s = new Socket();
         try {
-            s.setReuseAddress(true);
-            s.bind(new InetSocketAddress(Math.max(localPort, 0)));
+            bindOutbound(s, srcIp, localPort);
             s.connect(new InetSocketAddress(InetAddress.getByName(host), port), timeoutMs);
             return s;
         } catch (Exception e) {
@@ -242,6 +264,22 @@ public final class StunClient {
                 // 连接失败，关闭 socket 后抛出
             }
             throw e;
+        }
+    }
+    
+    /**
+     * 出站 socket 绑定本地端口：通配绑定优先（Linux 语义稳定）；被拒时（Windows 上通配 LISTEN
+     * 已开启后通配出站绑定必败）退回绑定具体源地址——具体地址出站绑定可与 0.0.0.0 LISTEN 共存
+     * （natmap Windows 版同款做法，源地址需为出站路由的真实本机 IP，由调用方按目标路由选取）。
+     */
+    static void bindOutbound(Socket s, String srcIp, int localPort) throws java.io.IOException {
+        s.setReuseAddress(true);
+        int port = Math.max(localPort, 0);
+        try {
+            s.bind(new InetSocketAddress(port));
+        } catch (java.net.BindException e) {
+            if (srcIp == null) throw e;
+            s.bind(new InetSocketAddress(InetAddress.getByName(srcIp), port));
         }
     }
 

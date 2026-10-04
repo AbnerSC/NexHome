@@ -42,8 +42,12 @@ import java.util.concurrent.ScheduledFuture;
  * <b>TCP 模式</b>（多级 NAT/运营商 CGNAT 场景按优先级自动选择出站通道，详见 {@link TcpPunch}）：
  * <ol>
  *   <li>路由器 WAN 口为公网：UPnP 端口映射即权威入站通道（外网端口=本地端口），跳过出站探测</li>
- *   <li>存在可用 STUN-over-TCP 服务器：从本地端口出站探测取得<b>精确</b>的 TCP 映射地址</li>
- *   <li>端口保留模式（兜底，全部 STUN/TCP 服务器不可用时的最后手段）：
+ *   <li>存在持久型 STUN-over-TCP 服务器：长连接保活 + 原连接刷新交互，取得<b>精确</b>映射地址</li>
+ *   <li>双链路模式（参考 natmap，公共 STUN/TCP 多为单事务型时的主要精确映射来源）：
+ *       出站连接公共端点（qq/baidu 等）仅作<b>保活链路</b>维持 NAT 映射，映射地址由同端口
+ *       STUN <b>短连接</b>即连即用即弃探测（单事务型服务器完全可用），双源探测一致
+ *       （全锥/受限锥 EIM 端口保持特征）才确认为精确地址，不一致退端口保留展示</li>
+ *   <li>端口保留模式（兑底，全部 STUN/TCP 服务器不可用时的最后手段）：
  *       从本地端口出站连接公共透传端点（非 DNS 端口：53/TCP 被运营商 CGNAT 透明拦截，
  *       映射终结在 CGNAT 不接受入站）在运营商 CGNAT 上建立 TCP 映射，
  *       连接上不做应用层交互，周期检测链路存活、死亡即轮换新建连接维持映射；
@@ -208,7 +212,8 @@ final class StunRunner {
         upnpPublicWan = false;
         tcpMappedViaUpnp = false;
         tcpRefreshing = false;
-        punch = new TcpPunch(name, stunHost, stunPort, this::onTcpLinkReady);
+        // 出站源 IP（通配绑定被拒时的具体地址兑底，Windows 监听后解锁同端口绑定，natmap 同款）
+        punch = new TcpPunch(name, lanIp(), stunHost, stunPort, this::onTcpLinkReady);
         try {
             if ("UDP".equalsIgnoreCase(protocol)) {
                 startUdp();
@@ -286,10 +291,14 @@ final class StunRunner {
                     udpSocket.setSoTimeout(2000);
                     DatagramPacket pkt = new DatagramPacket(buf, buf.length);
                     udpSocket.receive(pkt);
-                    if (isStunResponseSource(pkt.getAddress(), pkt.getPort())) {
-                        // 保活响应（配置的或兜底 STUN 服务器）：刷新外网映射地址（不再与保活线程竞争 receive）
+                    String stunSrc = stunCandidateOf(pkt.getAddress(), pkt.getPort());
+                    if (stunSrc != null) {
+                        // 保活响应（配置的或兑底 STUN 服务器）：刷新外网映射地址并记录响应来源（常规周期优先向它续命）
                         String mapped = StunClient.parseBindingMapped(pkt.getData(), pkt.getLength());
-                        if (mapped != null) updateUdpMapped(mapped, null);
+                        if (mapped != null) {
+                            lastStunOk = stunSrc;
+                            updateUdpMapped(mapped, null);
+                        }
                         continue;
                     }
                     if (relayData) {
@@ -328,13 +337,23 @@ final class StunRunner {
     }
 
     /**
-     * 刷新 UDP STUN 映射（保活/重新穿透共用）：向配置的服务器与维护列表中兜底服务器
-     * 发送绑定请求（fire-and-forget），响应由接收线程解析后刷新映射地址。
-     * 配置服务器无响应时兜底服务器可恢复映射，避免单点失效导致穿透静默失效。
+     * 刷新 UDP STUN 映射（保活/重新穿透共用），分级发包（参考 natmap -c 周期思想）：
+     * 常规周期仅向配置服务器与最近响应服务器发绑定请求（fire-and-forget，响应由接收线程
+     * 解析后刷新映射地址）——既维持映射又降低多服务器响应引起的地址抖动与服务器负载；
+     * 每 {@link #STUN_FULL_CYCLE} 个周期向全部候选兜底轮询一次，配置服务器单点失效时自动切换。
      */
     private void repunchUdpMapping() {
         if (udpSocket == null || udpSocket.isClosed()) return;
-        for (String addr : stunServerCandidates()) {
+        Set<String> targets;
+        if (++stunCycle % STUN_FULL_CYCLE == 0) {
+            targets = stunServerCandidates(); // 全候选兜底轮询：服务器故障自动切换，保持单点失效自愈能力
+        } else {
+            LinkedHashSet<String> t = new LinkedHashSet<>();
+            t.add(stunHost + ":" + stunPort);
+            if (lastStunOk != null) t.add(lastStunOk); // 最近响应的服务器优先续命（映射挂在它认识的会话上）
+            targets = t;
+        }
+        for (String addr : targets) {
             int ci = addr.lastIndexOf(':');
             try {
                 StunClient.sendBindingRequest(udpSocket, addr.substring(0, ci), Integer.parseInt(addr.substring(ci + 1)));
@@ -347,6 +366,13 @@ final class StunRunner {
         }
     }
 
+    /** STUN 保活分级周期：每 N 个保活周期做一次全候选兜底轮询，其余周期仅发包给配置+最近响应服务器 */
+    private static final int STUN_FULL_CYCLE = 5;
+    /** 保活分级周期计数器 */
+    private int stunCycle;
+    /** 最近响应保活请求的 STUN 服务器（host:port，接收线程记录）：常规周期优先向它续命 */
+    private volatile String lastStunOk;
+    
     /** STUN 服务器候选地址（host:port）：配置的服务器 + 维护列表中全部服务器（按维护排序兜底），结果缓存 60s */
     private Set<String> stunServerCandidates() {
         long now = System.currentTimeMillis();
@@ -360,18 +386,18 @@ final class StunRunner {
         return cachedStunCandidates;
     }
 
-    /** 入站包是否来自任一候选 STUN 服务器（保活响应判定） */
-    private boolean isStunResponseSource(InetAddress addr, int port) {
+    /** 入站包是否来自任一候选 STUN 服务器（保活响应判定），是则返回匹配的候选地址（host:port） */
+    private String stunCandidateOf(InetAddress addr, int port) {
         for (String candidate : stunServerCandidates()) {
             int ci = candidate.lastIndexOf(':');
             if (port != Integer.parseInt(candidate.substring(ci + 1))) continue;
             try {
-                if (addr.equals(InetAddress.getByName(candidate.substring(0, ci)))) return true;
+                if (addr.equals(InetAddress.getByName(candidate.substring(0, ci)))) return candidate;
             } catch (Exception ignored) {
                 // 域名解析失败：视为不匹配，继续比较其余候选
             }
         }
-        return false;
+        return null;
     }
 
     /** UDP 业务数据转发：对端 -> 目标服务；目标响应经会话 socket 回流 */
@@ -514,8 +540,11 @@ final class StunRunner {
         tcpMappedViaUpnp = false;
         if (link.viaStun()) {
             updateTcpMapped(link.mapped());
-            Logs.info(Logs.STUN, "任务[" + name + "] TCP映射已建立(STUN/TCP服务器 " + link.endpoint()
-                    + "，精确映射): " + link.mapped());
+            Logs.info(Logs.STUN, "任务[" + name + "] TCP映射已建立("
+                    + (link.split()
+                            ? "双链路:出站端点 " + link.endpoint() + " 保活 + STUN短连接探测，精确映射"
+                            : "STUN/TCP服务器 " + link.endpoint() + "，精确映射")
+                    + "): " + link.mapped());
             return;
         }
         String presumed = presumedAddr();
@@ -1086,7 +1115,7 @@ final class StunRunner {
             if (latest != null && !latest.isBlank()) mapped = latest;
             if (probeLocalInbound(mapped)) {
                 noteExtVerdict("OK", true);
-                result += "，公网入站验证可达(本机直连公网映射成功)";
+                result += "，公网入站验证可达";
             } else {
                 long now = System.currentTimeMillis();
                 if (manual) {
@@ -1135,10 +1164,9 @@ final class StunRunner {
             }
         }
         if (lastMappedAt > before) {
-            return "OK(映射保活存活，" + (System.currentTimeMillis() - t0)
-                    + "ms；真实入站可达性受NAT类型与路由器策略影响，请用外部设备验证)";
+            return "OK(映射保活存活，" + (System.currentTimeMillis() - t0) + "ms)";
         }
-        return "FAIL(STUN绑定无响应：映射可能已失效或候选STUN服务器均不可达，保活调度将持续重试)";
+        return "FAIL(STUN绑定无响应，映射可能已失效或服务器不可达)";
     }
 
     /**
@@ -1149,10 +1177,10 @@ final class StunRunner {
      */
     private String verifyTcpKeepalive(boolean manual) {
         if (tcpRefreshing) {
-            return "重建中(TCP链路弹跳重建进行中，重建完成后自动复验)";
+            return "重建中(链路重建完成后自动复验)";
         }
         if (!wanTcpReady) {
-            return "FAIL(TCP映射未建立：STUN-over-TCP服务器不可用且端口保留出站链路未建成，巡检自动重试)";
+            return "FAIL(TCP映射未建立，巡检自动重试)";
         }
         if (tcpServer == null || tcpServer.isClosed()) {
             return "FAIL(本地TCP监听已关闭)";
@@ -1169,7 +1197,7 @@ final class StunRunner {
         }
         if (!manual) {
             // 周期自测不等待弹跳：按重建中返回（前端黄色展示），下轮自测复验
-            return "重建中(TCP保活链路无响应，已触发弹跳重建，重建完成后自动复验)";
+            return "重建中(已触发链路重建，完成后自动复验)";
         }
         long deadline = System.currentTimeMillis() + 60_000;
         while (tcpRefreshing && System.currentTimeMillis() < deadline) {
@@ -1183,16 +1211,16 @@ final class StunRunner {
         if (wanTcpReady && punch.keepaliveOnce()) {
             return okTcp(System.currentTimeMillis() - t0, true);
         }
-        return "FAIL(TCP保活链路无响应且重建未成功：保活调度与巡检将按退避持续重试)";
+        return "FAIL(TCP保活链路无响应且重建未成功)";
     }
 
     /** TCP 自测通过时的结果文案（区分映射来源，便于用户判断验证方式） */
     private String okTcp(long costMs, boolean rebuilt) {
         String mode = tcpMappedViaUpnp ? "UPnP公网直通"
-                : (punch != null && punch.addrPresumed() ? "端口保留模式(展示端口取自同端口UDP STUN估计，入站不保证可达，以公网入站验证为准)"
-                : "STUN精确映射");
-        return "OK(TCP映射保活存活" + (rebuilt ? "，链路已重建" : "") + "[" + mode + "]，" + costMs
-                + "ms；端到端可达以公网入站验证为准：本机直连公网映射优先，无回流网络退第三方节点/外部设备)";
+                : (punch != null && punch.splitActive() ? "双链路:出站保活+STUN探测"
+                : (punch != null && punch.addrPresumed() ? "端口保留模式(入站以公网入站验证为准)"
+                : "STUN精确映射"));
+        return "OK(TCP映射保活存活" + (rebuilt ? "，链路已重建" : "") + "[" + mode + "]，" + costMs + "ms)";
     }
 
     /** 公网入站验证结论处理：状态变化时记日志并缓存（null=第三方服务不可用/未完成，本轮跳过） */
