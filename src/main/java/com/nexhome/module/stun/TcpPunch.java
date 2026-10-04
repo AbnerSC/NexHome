@@ -19,13 +19,19 @@ import java.util.function.Consumer;
  * TCP 出站保活链路管理器（每个 TCP 任务一个实例）：负责在运营商 CGNAT 上建立并维持
  * TCP 映射的出站连接，按优先级选择通道：
  * <ol>
- *   <li>STUN-over-TCP 服务器（配置的 + 维护列表 + 内置候选）：取得<b>精确</b>映射地址</li>
- *   <li>公共出站端点（端口保留模式兜底）：出站长连接维持运营商 CGNAT 上的 TCP 映射，
- *       连接上不做应用层交互（TCP 握手完成即双向链路验证；域名解析按其设计走 UDP 53，
- *       不占用 TCP 连接）。端点须为非 DNS 端口的透传服务：实测运营商 CGNAT 对 53/TCP
- *       透明拦截（连接能建立但终结在 CGNAT、查询无响应），此类映射不接受入站；
- *       外网映射端口无法直接探测，无 TCP 探测能力时由运行器取同本地端口的 UDP STUN 映射
- *       尽力估计展示（实测同本地端口 TCP/UDP 外部端口并不相同，入站不保证可达）</li>
+ *   <li>STUN-over-TCP 长连接（配置的 + 维护列表 + 内置候选，排除单事务型）：取得<b>精确</b>映射地址</li>
+ *   <li><b>双链路模式</b>（参考 natmap，首选升级路径）：出站保活连接与映射探测<b>分离</b>——
+ *       从本地端口连接公共端点（qq/baidu 等）作为长寿命保活链路维持 NAT 映射，再用同端口
+ *       向 STUN/TCP 服务器新建<b>短连接</b>探测一次映射地址后即弃（即连即用，<b>单事务型服务器
+ *       完全可用</b>）。全锥/受限锥 NAT（EIM 端口保持）下同源端口的出站映射端口与目标无关，
+ *       探测地址即保活链路的真实映射；双源（两台不同 STUN 服务器）探测一致才确认为精确地址，
+ *       不一致为对称型特征（探测地址不代表保活链路映射）退端口保留展示</li>
+ *   <li>公共出站端点（端口保留模式兑底）：无任何可用 STUN/TCP 服务器时，出站长连接仅维持
+ *       运营商 CGNAT 上的 TCP 映射，连接上不做应用层交互（TCP 握手完成即双向链路验证；
+ *       域名解析按其设计走 UDP 53，不占用 TCP 连接）。端点须为非 DNS 端口的透传服务：
+ *       实测运营商 CGNAT 对 53/TCP 透明拦截（连接能建立但终结在 CGNAT、查询无响应），
+ *       此类映射不接受入站；外网映射端口无法直接探测，由运行器取同本地端口的 UDP STUN
+ *       映射尽力估计展示（实测同本地端口 TCP/UDP 外部端口并不相同，入站不保证可达）</li>
  * </ol>
  * 链路死亡时优先复用预绑定的备用出站 socket（同端口、未连接，监听开启前预绑）立即重连，
  * 实现<b>零监听中断</b>的链路重建；备用耗尽才由调用方「弹跳」（关监听→重建→重开监听）。
@@ -33,8 +39,20 @@ import java.util.function.Consumer;
  */
 final class TcpPunch {
 
-    /** 一条保活链路：连接 + 模式 + 端点 + 精确映射地址（端口保留模式为 null）+ 建立时刻 */
-    record Link(Socket socket, boolean viaStun, String endpoint, String mapped, long at) {
+    /**
+     * 一条保活链路：连接 + 模式 + 端点 + 精确映射地址（端口保留模式为 null）+ 建立时刻。
+     * <ul>
+     *   <li>viaStun=true 且 split=false：STUN 长连接，socket 即 STUN 连接，映射地址可反复交互刷新</li>
+     *   <li>viaStun=true 且 split=true：双链路（natmap 式），socket 为公共端点保活连接，
+     *       mapped 为同端口 STUN 短连接探测所得（即连即弃，不可在 socket 上刷新）；
+     *       映射随保活连接存活而恒定，保活连接死亡重建后需重探测刷新</li>
+     *   <li>viaStun=false：端口保留模式（无可用 STUN/TCP），mapped 恒为 null</li>
+     * </ul>
+     */
+    record Link(Socket socket, boolean viaStun, String endpoint, String mapped, long at, boolean split) {
+        Link(Socket socket, boolean viaStun, String endpoint, String mapped, long at) {
+            this(socket, viaStun, endpoint, mapped, at, false);
+        }
     }
 
     /** 新链路宽限期：建立/重建刚完成交互验证，期内再交互只会白白翻动连接（重建后立即自测失败的根源） */
@@ -43,6 +61,8 @@ final class TcpPunch {
     private final String taskName;
     private final String stunHost;
     private final int stunPort;
+    /** 出站源 IP（null=通配绑定）：通配绑定被拒时退回绑定该具体地址（Windows 监听后解锁同端口绑定） */
+    private final String srcIp;
     /** 链路就绪/映射地址变化回调（调用方据此更新权威展示地址与日志） */
     private final Consumer<Link> onReady;
 
@@ -67,13 +87,26 @@ final class TcpPunch {
     private volatile int currentKeepalives;
     /** 单事务服务器黑名单持久化键（重启后仍生效，启动建链不再重选注定握不住映射的服务器） */
     private static final String SINGLE_TX_KEY = "stun.tcpSingleTx";
+    /** 最近成功的双链路探测服务器（host:port），重建/重探测时优先复用 */
+    private volatile String probeServer;
+    /** 最近一次双链路精确映射地址：独立于链路对象跟踪（链路死亡/关闭后仍保留，供重建时比对是否变化） */
+    private volatile String lastSplitMapped;
+    /** 双链路探测服务器持久化键（重启后优先复用，免去逐候选探测） */
+    private static final String PROBE_SERVER_KEY = "stun.tcpProbeServer";
 
-    TcpPunch(String taskName, String stunHost, int stunPort, Consumer<Link> onReady) {
+    TcpPunch(String taskName, String srcIp, String stunHost, int stunPort, Consumer<Link> onReady) {
         this.taskName = taskName;
+        this.srcIp = srcIp;
         this.stunHost = stunHost;
         this.stunPort = stunPort;
         this.onReady = onReady;
         singleTx.addAll(loadPersistedSingleTx());
+        try {
+            String v = Database.getConfig(PROBE_SERVER_KEY);
+            if (v != null && v.lastIndexOf(':') > 0) probeServer = v;
+        } catch (Exception ignored) {
+            // 读取失败不影响主流程：运行期探测成功后会重新写入
+        }
     }
 
     /** 读取持久化的单事务服务器黑名单（逗号分隔），读取失败返回空集 */
@@ -95,6 +128,12 @@ final class TcpPunch {
     /** 端口保留模式：展示地址语义为「出口IP:本地端口」（外部端口=本地源端口假设） */
     boolean addrPresumed() {
         return addrPresumed;
+    }
+
+    /** 当前链路是否双链路模式（natmap 式：出站端点保活 + STUN 短连接探测的精确映射） */
+    boolean splitActive() {
+        Link c = current;
+        return c != null && c.split();
     }
 
     /** STUN/TCP 候选是否已过退避期（整体失败 300 秒后允许再试） */
@@ -122,7 +161,7 @@ final class TcpPunch {
         Link cur = current;
         if (cur == null) return false;
         if (System.currentTimeMillis() - cur.at() < FRESH_GRACE_MS) return true; // 新建链路刚验证过，无需再交互
-        if (cur.viaStun()) {
+        if (cur.viaStun() && !cur.split()) { // split 双链路的 socket 是端点保活连接（非 STUN），走下方端点分支
             if (isAlive(cur.socket())) {
                 // 连接存活：在原连接上刷新交互（映射挂在原四元组上，外部端口恒定，避免重建即漂移）
                 String mapped = StunClient.bindingOverTcp(cur.socket(), 3000);
@@ -158,10 +197,13 @@ final class TcpPunch {
         }
         if (isAlive(cur.socket())) {
             currentKeepalives++;
-            return true; // 长连接存活：CGNAT 映射存活，无需轮换（映射地址不变）
+            return true; // 保活长连接存活：CGNAT 映射存活，无需轮换（双链路/端口保留的映射地址均不变）
         }
-        // 链路死亡：先废弃旧连接释放四元组，再轮换新建（当前端点优先，失败依次尝试其余候选）
+        // 链路死亡：先废弃旧连接释放四元组，再轮换新建（当前端点优先，失败依次尝试其余候选）。
+        // 双链路模式（split）下轮换成功后需重探测刷新精确映射（旧映射随旧连接失效）；
+        // 端口保留模式在非退避期顺带尝试探测升级为双链路（地址从估计值精确化）
         int localPort = cur.socket().getLocalPort();
+        if (cur.split() && cur.mapped() != null) lastSplitMapped = cur.mapped(); // 供重建后比对是否变化
         abandon(cur.socket());
         current = null;
         for (String[] ep : outboundCandidates()) {
@@ -170,11 +212,98 @@ final class TcpPunch {
             if (s == null) return false;
             Link link = connectOutbound(s, ep);
             if (link != null) {
-                current = link;
-                return true;
+                return installEndpointLink(link, localPort) != null;
             }
         }
         return false;
+    }
+
+    /**
+     * 登记端点链路并按需升级为双链路：曾取得过精确映射（lastSplitMapped 非空）或端口保留模式下
+     * 非退避期重探测一次精确映射——成功则升级/维持双链路（映射变化时回调调用方刷新展示），
+     * 失败时曾为双链路则保留旧探测值（下轮重探测修正），否则退回端口保留估计展示。
+     */
+    private Link installEndpointLink(Link base, int localPort) {
+        String prevMapped = lastSplitMapped;
+        String mapped = null;
+        if (allowStunNow()) {
+            mapped = probeMappedOnce(localPort, true); // 监听已开：优先消耗预绑备用 socket
+        }
+        if (mapped != null) {
+            lastSplitMapped = mapped;
+            Link split = new Link(base.socket(), true, base.endpoint(), mapped,
+                    System.currentTimeMillis(), true);
+            current = split;
+            addrPresumed = false;
+            downWarned = false;
+            currentKeepalives = 0;
+            if (!mapped.equals(prevMapped)) onReady.accept(split); // 映射变化/升级：更新权威展示地址
+            return split;
+        }
+        if (prevMapped != null) {
+            // 退避期内探测不可用：保留旧探测值（地址可能已随旧连接失效，退避期结束后下轮重探测修正）
+            Link split = new Link(base.socket(), true, base.endpoint(), prevMapped,
+                    System.currentTimeMillis(), true);
+            current = split;
+            addrPresumed = false;
+            downWarned = false;
+            currentKeepalives = 0;
+            return split;
+        }
+        current = base;
+        return base;
+    }
+
+    /**
+     * 双链路重探测：从同本地端口向 STUN/TCP 服务器新建短连接探测一次精确映射。
+     * 优先用上次探测成功的服务器（快路径），失败顺延下一候选（限 2 个控制耗时）。
+     * 探测连接即连即弃（RST 释放），不占用保活链路。
+     */
+    private String probeMappedOnce(int localPort, boolean useSpare) {
+        int tried = 0;
+        for (String addr : stunProbeCandidates()) {
+            if (tried++ >= 2) break; // 限制耗时：重探测是保活周期的附带动作，不占过多预算
+            String m = probeOnce(addr, localPort, useSpare);
+            if (m != null) {
+                probeServer = addr;
+                persistProbeServer(addr);
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 单次短连接探测：新建同端口连接 → 绑定交互 → RST 释放，失败返回 null。
+     * useSpare=true 时优先消耗预绑备用 socket（监听已开、新建绑定受限的场景），
+     * 否则新建绑定（监听未开的 establish 阶段，spare 留给监听开启后用）。
+     */
+    private String probeOnce(String addr, int localPort, boolean useSpare) {
+        Socket s = useSpare ? spares.poll() : null;
+        if (s == null) {
+            s = freshBound(localPort);
+        }
+        if (s == null) return null;
+        try {
+            int ci = addr.lastIndexOf(':');
+            s.connect(new InetSocketAddress(InetAddress.getByName(addr.substring(0, ci)),
+                    Integer.parseInt(addr.substring(ci + 1))), 2500);
+            return StunClient.bindingOverTcp(s, 2500);
+        } catch (Exception ignored) {
+            // 探测失败：换下一候选
+        } finally {
+            abandon(s); // RST 复位即弃：单事务型服务器本就活不长，长连接型也不作保活用
+        }
+        return null;
+    }
+
+    /** 持久化最近成功的双链路探测服务器：重启后优先复用 */
+    private void persistProbeServer(String addr) {
+        try {
+            Database.setConfig(PROBE_SERVER_KEY, addr);
+        } catch (Exception ignored) {
+            // 写入失败不影响主流程：运行期内仍有内存态 probeServer 兜底
+        }
     }
 
     /**
@@ -204,12 +333,11 @@ final class TcpPunch {
         return null;
     }
 
-    /** 新建出站 socket 并绑定指定本地端口（备用耗尽时兜底），绑定失败返回 null */
-    private static Socket freshBound(int localPort) {
+    /** 新建出站 socket 并绑定指定本地端口（备用耗尽时兑底），通配被拒时退回具体源地址，绑定失败返回 null */
+    private Socket freshBound(int localPort) {
         try {
             Socket s = new Socket();
-            s.setReuseAddress(true);
-            s.bind(new InetSocketAddress(localPort));
+            StunClient.bindOutbound(s, srcIp, localPort);
             return s;
         } catch (Exception e) {
             return null;
@@ -240,11 +368,16 @@ final class TcpPunch {
         }
     }
 
-    /** 标记单事务型 STUN/TCP 服务器（首次告警）：持久化黑名单并清空最近成功记录，避免快速路径重选 */
+    /**
+     * 标记单事务型 STUN/TCP 服务器（首次告警）：持久化黑名单并清空最近成功记录，避免快速路径重选。
+     * 黑名单仅约束<b>长连接保活链路</b>的选择（单事务连接活不过一个保活周期、映射随轮换漂移）；
+     * 双链路的短连接探测不受限（即连即用即弃，单事务型完全可用，见 stunProbeCandidates）。
+     */
     private void markSingleTx(String ep) {
         if (singleTx.add(ep)) {
             Logs.warn(Logs.STUN, "任务[" + taskName + "] STUN/TCP服务器 " + ep
-                    + " 为单事务型(响应后即断连)，链路活不过一个保活周期、映射端口随轮换漂移无法稳定入站，降权改选持久型服务器");
+                    + " 为单事务型(响应后即断连)，不宜作保活长连接(映射随轮换漂移)，降权改选持久型；"
+                    + "仍可用作双链路短连接探测");
             try {
                 Database.setConfig(SINGLE_TX_KEY, String.join(",", singleTx));
             } catch (Exception ignored) {
@@ -298,7 +431,7 @@ final class TcpPunch {
                 if (System.currentTimeMillis() >= deadline) break; // 预算耗尽：不再逐个等超时，直接回退公共端点
                 int ci = addr.lastIndexOf(':');
                 StunClient.TcpProbe p = StunClient.probeOverTcp(addr.substring(0, ci),
-                        Integer.parseInt(addr.substring(ci + 1)), localPort, 2500);
+                        Integer.parseInt(addr.substring(ci + 1)), srcIp, localPort, 2500);
                 if (p != null) {
                     if (diedQuickly(p.socket())) {
                         // 绑定有响应但连接随即断开：单事务服务器，注定握不住映射（建立的地址也在数秒内失效），
@@ -313,17 +446,34 @@ final class TcpPunch {
                     return install(new Link(p.socket(), true, addr, p.mapped(), System.currentTimeMillis()));
                 }
             }
-            if (System.currentTimeMillis() - probeFailAt > 300_000) {
-                // 刚进入新的退避期才告警（含首次）：避免每个保活周期重复刷屏
-                Logs.warn(Logs.STUN, "任务[" + taskName + "] 无可用STUN-over-TCP服务器，回退端口保留模式"
-                        + "(公共端点出站维持CGNAT映射，展示端口取同端口UDP STUN估计、入站不保证可达；登记可用TCP STUN服务器可获得精确映射)");
+            // natmap 双链路升级：长连接候选全败后，改用「短连接探测」——同端口向 STUN/TCP
+            // 服务器即连即用即弃，单事务型服务器完全可用；双源一致才作为精确映射（见 probeSplitMapped）
+            String splitMapped = null;
+            if (System.currentTimeMillis() < deadline - 15_000) { // 预留端点连接预算，避免启动拖到分钟级
+                splitMapped = probeSplitMapped(localPort, deadline - 15_000);
             }
-            probeFailAt = System.currentTimeMillis();
+            if (splitMapped != null) {
+                lastSplitMapped = splitMapped;
+            } else {
+                if (System.currentTimeMillis() - probeFailAt > 300_000) {
+                    // 刚进入新的退避期才告警（含首次）：避免每个保活周期重复刷屏
+                    Logs.warn(Logs.STUN, "任务[" + taskName + "] 长连接与短连接探测均无可用STUN-over-TCP服务器，"
+                            + "回退端口保留模式(公共端点出站维持CGNAT映射，展示端口取同端口UDP STUN估计、"
+                            + "入站不保证可达；登记可用TCP STUN服务器可获得精确映射)");
+                }
+                probeFailAt = System.currentTimeMillis();
+            }
+            return establishEndpoint(localPort, splitMapped);
         }
+        return establishEndpoint(localPort, null);
+    }
+
+    /** 端点连接段（双链路保活段/端口保留兜底）：依次连接公共出站端点，探测到精确映射则升级双链路 */
+    private Link establishEndpoint(int localPort, String splitMapped) {
         for (String[] ep : outboundCandidates()) {
             Socket s;
             try {
-                s = StunClient.connectOutboundEx(ep[0], Integer.parseInt(ep[1]), localPort, 2500);
+                s = StunClient.connectOutboundEx(ep[0], Integer.parseInt(ep[1]), srcIp, localPort, 2500);
             } catch (Exception e) {
                 // 端点失效原因告警仅首次：端点被网络策略拦截时无法从外部观察，这是定位关键
                 if (warnedEndpoints.add(ep[0] + ":" + ep[1])) {
@@ -334,9 +484,49 @@ final class TcpPunch {
             }
             outEndpoint = ep[0] + ":" + ep[1];
             warnedEndpoints.remove(outEndpoint); // 端点恢复可用：复位告警以便下次失效再提示
+            if (splitMapped != null) {
+                // 双链路（natmap 式）：端点连接仅负责保活，展示地址用同端口 STUN 短连接探测所得
+                // （EIM 端口保持 NAT 下同源端口的出站映射与目标无关，二者为同一映射）
+                return install(new Link(s, true, outEndpoint, splitMapped,
+                        System.currentTimeMillis(), true));
+            }
             return install(new Link(s, false, outEndpoint, null, System.currentTimeMillis()));
         }
         return null;
+    }
+
+    /**
+     * 双链路探测（natmap 式）：从同本地端口向 STUN/TCP 服务器新建短连接探测映射地址，
+     * 依次取两台不同服务器各探测一次——映射一致（EIM 端口保持特征）确认为保活链路的精确映射；
+     * 不一致是对称型特征（映射随目标变化，探测地址不代表保活连接的真实映射）返回 null 退端口保留。
+     * 仅一台可达时接受单源结果（有总比无好，对称型下端口保留的 UDP 估计同样不准）。
+     */
+    private String probeSplitMapped(int localPort, long deadline) {
+        String first = null;
+        for (String addr : stunProbeCandidates()) {
+            if (System.currentTimeMillis() >= deadline) break;
+            String m = probeOnce(addr, localPort, false); // 监听未开：新建绑定即可，spare 留给监听开启后
+            if (m == null) continue;
+            if (first == null) {
+                first = m;
+                probeServer = addr;
+                persistProbeServer(addr);
+                continue;
+            }
+            if (m.equals(first)) {
+                Logs.info(Logs.STUN, "任务[" + taskName + "] 双源STUN探测映射一致(端口保持/EIM特征): "
+                        + first + "，作为保活链路精确映射");
+                return first;
+            }
+            Logs.warn(Logs.STUN, "任务[" + taskName + "] 不同STUN服务器探测映射不一致(对称型NAT特征): "
+                    + first + " vs " + m + "，探测地址不代表保活链路映射，退端口保留模式展示");
+            return null;
+        }
+        if (first != null) {
+            Logs.info(Logs.STUN, "任务[" + taskName + "] STUN短连接探测: " + first
+                    + "（仅单源可达，未做双源校验）");
+        }
+        return first;
     }
 
     /** 持久化最近成功的 STUN/TCP 服务器：容器/任务重启后优先复用，免去逐候选探测的启动延迟 */
@@ -346,6 +536,18 @@ final class TcpPunch {
         } catch (Exception ignored) {
             // 写入失败不影响主流程：运行期内仍有内存态 tcpStunServer 兜底
         }
+    }
+
+    /**
+     * 双链路探测候选（短连接即连即弃）：上次探测成功服务器优先（重启快路径）→ 持久型优先的
+     * 长连接候选 → 单事务型兜底。单事务型服务器在本模式下完全可用（不要求保持连接）。
+     */
+    private LinkedHashSet<String> stunProbeCandidates() {
+        LinkedHashSet<String> all = new LinkedHashSet<>();
+        if (probeServer != null) all.add(probeServer);
+        all.addAll(stunCandidates());
+        all.addAll(singleTx); // 单事务型兜底：长连接黑名单仅约束保活链路选择，探测不受限
+        return all;
     }
 
     /** STUN-over-TCP 候选：上次成功服务器 → 持久化的上次成功（重启快路径） → 配置服务器 → 内置列表（实测可达优先） → 维护列表 */
@@ -409,7 +611,7 @@ final class TcpPunch {
             Socket spare = spares.poll();
             if (spare == null) return null;
             Link link = connectOutbound(spare, ep);
-            if (link != null) return install(link);
+            if (link != null) return installEndpointLink(link, localPort);
         }
         return null;
     }
@@ -433,13 +635,19 @@ final class TcpPunch {
                     return install(link);
                 }
             }
+            // 弹跳窗口备用充足：顺带做一次双源探测（长连接候选全败时升级双链路，单事务型可用）
+            String splitMapped = probeSplitMapped(localPort, System.currentTimeMillis() + 10_000);
+            if (splitMapped != null) {
+                lastSplitMapped = splitMapped;
+                return establishEndpoint(localPort, splitMapped);
+            }
             probeFailAt = System.currentTimeMillis(); // 全部候选失败：进入退避期，快速路径期间不再逐个探测
         }
         for (String[] ep : outboundCandidates()) {
             Socket spare = spares.poll();
             if (spare == null) return null;
             Link link = connectOutbound(spare, ep);
-            if (link != null) return install(link);
+            if (link != null) return installEndpointLink(link, localPort);
         }
         return null;
     }
@@ -515,8 +723,7 @@ final class TcpPunch {
         for (int i = 0; i < count; i++) {
             try {
                 Socket s = new Socket();
-                s.setReuseAddress(true);
-                s.bind(new InetSocketAddress(localPort));
+                StunClient.bindOutbound(s, srcIp, localPort);
                 spares.add(s);
             } catch (Exception e) {
                 Logs.warn(Logs.STUN, "任务[" + taskName + "] 预绑定备用出站socket失败(端口" + localPort + "): "

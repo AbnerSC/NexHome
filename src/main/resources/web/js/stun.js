@@ -31,7 +31,8 @@ async function renderStun() {
       <div class="tip">
         <b>穿透通道支持承载 UDP / TCP / HTTP 数据传输；任务运行中 ≠ 外网可访问。</b>
         受限锥形 NAT 仅允许已打洞的对端连入，<b>对称型（Symmetric）NAT 纯 STUN 无法穿透</b>，请改用路由器端口转发，并确认防火墙已放行监听端口。
-        穿透启动时自动尝试 <b>UPnP 端口映射</b>（WAN 口为公网时即权威入站通道）；CGNAT 或未启用 UPnP 时，TCP 任务经支持 TCP 的 STUN 服务器出站建立映射并保活，自测通过即代表互联网可达。
+        穿透启动时自动尝试 <b>UPnP 端口映射</b>（WAN 口为公网时即权威入站通道）；CGNAT 或未启用 UPnP 时，TCP 任务按优先级自动选择出站通道：STUN 长连接精确映射 →
+        <b>双链路模式</b>（参考 natmap：公共端点出站保活 + 同端口 STUN 短连接探测精确映射，单事务型 STUN 服务器亦可复用）→ 端口保留兜底。
         穿透成功后系统自动自测一次（映射保活 + 公网入站可达），可在操作列点「自测」手动复测。
       </div>
       <div class="toolbar"><div class="spacer"></div>
@@ -168,7 +169,8 @@ async function renderStunServers() {
     $('#pageBody').innerHTML = `
       <div class="tip">维护常用 STUN 服务器列表，穿透任务新增/编辑时从下拉中选择（按列表顺序展示）。
         可用 <b>↑/↓</b> 调整顺序：排在前面的服务器优先作为穿透探测与保活的兜底候选。
-        <b>支持 TCP</b> 表示服务器支持 STUN-over-TCP：TCP 穿透任务需经支持 TCP 的服务器出站，才能在运营商 CGNAT 上建立真实 TCP 映射。</div>
+        <b>支持 TCP</b> 表示服务器支持 STUN-over-TCP：TCP 穿透任务经支持 TCP 的服务器出站，才能在运营商 CGNAT 上建立真实 TCP 映射；
+        双链路模式下服务器只需响应一次绑定请求即可提供精确映射（不要求保持长连接）。</div>
       <div class="toolbar">
         <button class="btn small" onclick="renderStun()">← 返回穿透任务</button>
         <div class="spacer"></div>
