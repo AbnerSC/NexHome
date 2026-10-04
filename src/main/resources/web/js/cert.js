@@ -1,6 +1,12 @@
 /* ============ SSL 证书管理模块 ============ */
 'use strict';
 
+/** 主域名（作为保存文件名）：取第一个域名，泛域名去除 *. 前缀，与后端 primaryDomain 保持一致 */
+function certPrimaryDomain(domains) {
+    const first = (domains || '').split(/[,;\s]+/).filter(Boolean)[0] || '';
+    return first.replace(/^\*\./, '').replace(/[^a-zA-Z0-9.\-]/g, '_');
+}
+
 async function renderCert() {
     const tasks = await api('GET', '/api/cert/tasks');
     let s = {};
@@ -78,6 +84,7 @@ window.certAutoRenew = async (id, checked) => {
         await api('PUT', '/api/cert/tasks/' + id, {
             name: t.name, provider: t.provider, domains: t.domains,
             challenge_type: t.challenge_type, provider_config_id: t.provider_config_id ?? null,
+            save_dir: t.save_dir || '', webhook_url: t.webhook_url || '',
             auto_renew: checked
         });
         toast(checked ? '已开启自动续期' : '已关闭自动续期');
@@ -136,7 +143,7 @@ window.certForm = async (id) => {
             <option value="ZEROSSL" ${t.provider === 'ZEROSSL' ? 'selected' : ''}>ZeroSSL</option>
           </select></div>
         <div class="field full"><label>域名列表 <b>*</b>（逗号分隔，支持 *.example.com 通配，仅 DNS01）</label>
-          <input name="domains" required placeholder="example.com, www.example.com" value="${esc(t.domains || '')}"></div>
+          <input name="domains" id="certDomains" required placeholder="example.com, www.example.com" value="${esc(t.domains || '')}" oninput="certPreviewPath()"></div>
         <div class="field"><label>验证方式 <b>*</b></label>
           <select name="challenge_type" onchange="certChallengeChanged(this.value)">
             <option value="HTTP01" ${t.challenge_type !== 'DNS01' ? 'selected' : ''}>HTTP01（自动，需80端口）</option>
@@ -148,6 +155,25 @@ window.certForm = async (id) => {
           </select></div>
         <div class="field"><label>自动续期</label>
           <select name="auto_renew"><option value="true" ${t.auto_renew !== 0 ? 'selected' : ''}>开启（到期前21天）</option><option value="false" ${t.auto_renew === 0 ? 'selected' : ''}>关闭</option></select></div>
+        <div class="field full"><label>证书保存目录（可选，留空则仅存默认任务目录）</label>
+          <input name="save_dir" id="certSaveDir" placeholder="填写目录，签发后以主域名作为文件名保存，例如 /etc/nginx/certs 或 D:\\certs" value="${esc(t.save_dir || '')}" oninput="certPreviewPath()">
+          <div class="small muted" id="certPathPreview" style="margin-top:4px;word-break:break-all"></div></div>
+        <div class="field full"><label>Webhook 地址（可选，签发成功后 POST 证书完整内容同步到其他系统）</label>
+          <input name="webhook_url" placeholder="https://example.com/hooks/cert，留空则不推送" value="${esc(t.webhook_url || '')}">
+          <div class="small muted" style="margin-top:6px;line-height:1.7">
+            以 <b>Content-Type: application/json</b> 的 <b>HTTP POST</b> 发送如下请求体，接收端按此字段解析即可（签发/续期成功后自动触发，失败不影响证书，仅在日志告警）：
+            <pre style="background:#f1f5f9;padding:8px 10px;border-radius:6px;white-space:pre-wrap;font-size:12px;margin:6px 0 0;word-break:break-all">{
+  "event": "certificate.issued",
+  "taskId": "任务ID",
+  "name": "任务名称",
+  "domains": ["example.com", "www.example.com"],
+  "notBefore": "生效时间(ISO8601)",
+  "notAfter": "到期时间(ISO8601)",
+  "keyPem": "-----BEGIN PRIVATE KEY----- ...",
+  "certPem": "-----BEGIN CERTIFICATE----- ...",
+  "fullchainPem": "完整证书链 PEM"
+}</pre>
+            提示：证书含<b>私钥</b>，请仅推送到可信地址，建议使用 <b>HTTPS</b>；若接收端校验来源，可在网关侧配置固定 Token/白名单。</div></div>
         <div class="form-foot full">
           <button type="button" class="btn" onclick="closeModal()">取消</button>
           <button class="btn primary">保存</button>
@@ -157,11 +183,25 @@ window.certForm = async (id) => {
         $('#fDnsProvider').classList.toggle('hidden', v !== 'DNS01');
     };
     window.certChallengeChanged(t.challenge_type || 'HTTP01');
+    window.certPreviewPath = () => {
+        const el = $('#certPathPreview');
+        if (!el) return;
+        const dir = ($('#certSaveDir').value || '').trim();
+        if (!dir) { el.textContent = ''; return; }
+        const primary = certPrimaryDomain($('#certDomains').value);
+        if (!primary) { el.textContent = '请先填写域名'; return; }
+        const sep = (dir.includes('\\') && !dir.includes('/')) ? '\\' : '/';
+        const base = dir.replace(/[\\/]+$/, '') + sep + primary;
+        el.innerHTML = '完整保存路径：<b>' + esc(base) + '.key</b>、<b>' + esc(base) + '.pem</b>、<b>' + esc(base) + '.fullchain.pem</b>';
+    };
+    window.certPreviewPath();
     $('#certFormEl').addEventListener('submit', async e => {
         e.preventDefault();
         const body = Object.fromEntries(new FormData(e.target).entries());
         body.provider_config_id = body.provider_config_id ? Number(body.provider_config_id) : null;
         body.auto_renew = body.auto_renew === 'true';
+        body.save_dir = (body.save_dir || '').trim();
+        body.webhook_url = (body.webhook_url || '').trim();
         try {
             if (id) await api('PUT', '/api/cert/tasks/' + id, body);
             else await api('POST', '/api/cert/tasks', body);

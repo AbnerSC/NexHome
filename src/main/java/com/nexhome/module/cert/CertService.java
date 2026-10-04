@@ -28,6 +28,10 @@ import org.shredzone.acme4j.util.CSRBuilder;
 
 import java.io.ByteArrayInputStream;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyFactory;
@@ -78,6 +82,11 @@ public final class CertService {
 
     /** 续期提前天数：到期前 21 天自动续期 */
     private static final int RENEW_AHEAD_DAYS = 21;
+
+    /** 证书同步 webhook 使用的共享 HTTP 客户端 */
+    private static final HttpClient WEBHOOK_HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
 
     private CertService() {
     }
@@ -140,6 +149,8 @@ public final class CertService {
     public static void init() throws SQLException {
         Security.addProvider(new BouncyCastleProvider());
         ensureColumn("provider_config_id", "INTEGER"); // 旧库升级：DNS01 自动验证引用凭证配置
+        ensureColumn("save_dir", "TEXT");             // 旧库升级：可选的证书保存目录
+        ensureColumn("webhook_url", "TEXT");          // 旧库升级：可选的证书同步 webhook
         // 每小时检查一次证书有效期
         Tasks.every(60, 3600, CertService::autoRenewCheck);
         Logs.info(Logs.CERT, "证书自动续期检查已启动（每小时，到期前 " + RENEW_AHEAD_DAYS + " 天续期）");
@@ -171,13 +182,15 @@ public final class CertService {
         JsonObject b = ctx.body();
         validate(b);
         long id = Database.insert("""
-                INSERT INTO cert_task(name, provider, domains, challenge_type, provider_config_id, auto_renew)
-                VALUES(?,?,?,?,?,?)""",
+                INSERT INTO cert_task(name, provider, domains, challenge_type, provider_config_id, auto_renew, save_dir, webhook_url)
+                VALUES(?,?,?,?,?,?,?,?)""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "provider"),
                 normalizeDomains(JsonUtils.str(b, "domains")),
                 JsonUtils.str(b, "challenge_type"),
                 ProviderConfigService.parseId(b, "provider_config_id"),
-                JsonUtils.bool(b, "auto_renew", true) ? 1 : 0);
+                JsonUtils.bool(b, "auto_renew", true) ? 1 : 0,
+                JsonUtils.str(b, "save_dir").trim(),
+                JsonUtils.str(b, "webhook_url").trim());
         Logs.info(Logs.CERT, "新增证书任务: " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
     }
@@ -188,12 +201,14 @@ public final class CertService {
         JsonObject b = ctx.body();
         validate(b);
         Database.update("""
-                UPDATE cert_task SET name=?, provider=?, domains=?, challenge_type=?, provider_config_id=?, auto_renew=? WHERE id=?""",
+                UPDATE cert_task SET name=?, provider=?, domains=?, challenge_type=?, provider_config_id=?, auto_renew=?, save_dir=?, webhook_url=? WHERE id=?""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "provider"),
                 normalizeDomains(JsonUtils.str(b, "domains")),
                 JsonUtils.str(b, "challenge_type"),
                 ProviderConfigService.parseId(b, "provider_config_id"),
-                JsonUtils.bool(b, "auto_renew", true) ? 1 : 0, id);
+                JsonUtils.bool(b, "auto_renew", true) ? 1 : 0,
+                JsonUtils.str(b, "save_dir").trim(),
+                JsonUtils.str(b, "webhook_url").trim(), id);
         Logs.info(Logs.CERT, "更新证书任务 #" + id + ": " + JsonUtils.str(b, "name"));
         ctx.ok(mustGet(id));
     }
@@ -226,6 +241,10 @@ public final class CertService {
             if (!d.matches("(\\*\\.)?[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+")) {
                 throw new IllegalArgumentException("域名格式不正确: " + d);
             }
+        }
+        String webhook = JsonUtils.str(b, "webhook_url").trim();
+        if (!webhook.isEmpty() && !webhook.startsWith("http://") && !webhook.startsWith("https://")) {
+            throw new IllegalArgumentException("Webhook 地址必须以 http:// 或 https:// 开头");
         }
     }
 
@@ -361,7 +380,9 @@ public final class CertService {
 
         // 域名私钥：RSA 2048（兼容性最好）
         KeyPair domainKeyPair = generateRsaKeyPair();
-        writePem(dir.resolve("domain.key.pem"), "PRIVATE KEY", domainKeyPair.getPrivate().getEncoded());
+        byte[] keyDer = domainKeyPair.getPrivate().getEncoded();
+        String keyPem = pem("PRIVATE KEY", keyDer);
+        Files.writeString(dir.resolve("domain.key.pem"), keyPem);
 
         // 构造 CSR 并提交订单
         CSRBuilder csrb = new CSRBuilder();
@@ -376,20 +397,26 @@ public final class CertService {
         // 保存证书与完整证书链
         Certificate cert = order.getCertificate();
         X509Certificate leaf = cert.getCertificate();
-        writePem(dir.resolve("cert.pem"), "CERTIFICATE", leaf.getEncoded());
+        byte[] leafDer = leaf.getEncoded();
+        String certPem = pem("CERTIFICATE", leafDer);
+        Files.writeString(dir.resolve("cert.pem"), certPem);
         StringBuilder chain = new StringBuilder();
         for (X509Certificate c : cert.getCertificateChain()) {
-            chain.append("-----BEGIN CERTIFICATE-----\n")
-                    .append(Base64.getMimeEncoder(64, "\n".getBytes()).encodeToString(c.getEncoded()))
-                    .append("\n-----END CERTIFICATE-----\n");
+            chain.append(pem("CERTIFICATE", c.getEncoded()));
         }
-        Files.writeString(dir.resolve("fullchain.pem"), chain.toString());
+        String fullchainPem = chain.toString();
+        Files.writeString(dir.resolve("fullchain.pem"), fullchainPem);
 
         Database.update("""
                 UPDATE cert_task SET status='ISSUED', message=?, dns_hint=NULL, not_after=?, cert_dir=? WHERE id=?""",
                 "证书签发成功", leaf.getNotAfter().toInstant().toString(), dir.toString(), taskId);
         Logs.info(Logs.CERT, "任务[" + task.get("name") + "] 证书签发成功，域名: " + domains
                 + "，有效期至 " + leaf.getNotAfter());
+
+        // 可选：按任务配置同步到自定义保存目录、推送到 webhook（任一失败不影响已签发证书，仅记日志）
+        saveToCustomDir(str(task, "save_dir"), domains, keyDer, leafDer, fullchainPem);
+        pushWebhook(str(task, "webhook_url"), task, domains, keyPem, certPem, fullchainPem,
+                leaf.getNotBefore().toInstant(), leaf.getNotAfter().toInstant());
     }
 
     /** 定时自动续期：到期前 RENEW_AHEAD_DAYS 天自动重新申请 */
@@ -617,8 +644,13 @@ public final class CertService {
     }
 
     private static void writePem(Path file, String type, byte[] der) throws Exception {
+        Files.writeString(file, pem(type, der));
+    }
+
+    /** DER 编码转 PEM 文本（64 字符折行） */
+    private static String pem(String type, byte[] der) {
         String b64 = Base64.getMimeEncoder(64, "\n".getBytes()).encodeToString(der);
-        Files.writeString(file, "-----BEGIN " + type + "-----\n" + b64 + "\n-----END " + type + "-----\n");
+        return "-----BEGIN " + type + "-----\n" + b64 + "\n-----END " + type + "-----\n";
     }
 
     private static byte[] parsePem(Path file, String type) throws Exception {
@@ -653,6 +685,78 @@ public final class CertService {
 
     private static Path taskDir(long id) {
         return AppConfig.DATA_DIR.resolve("certs").resolve("task-" + id);
+    }
+
+    /** 主域名（作为保存文件名）：取第一个域名，泛域名去除 *. 前缀，非安全字符替换为下划线 */
+    static String primaryDomain(List<String> domains) {
+        String d = domains.isEmpty() ? "cert" : domains.get(0);
+        if (d.startsWith("*.")) d = d.substring(2);
+        return d.replaceAll("[^a-zA-Z0-9.-]", "_");
+    }
+
+    /**
+     * 可选：将证书以主域名作为文件名写入自定义保存目录。
+     * 生成 {domain}.key / {domain}.pem / {domain}.fullchain.pem 三个文件。
+     * 失败不阻断签发主流程（文件已存于默认任务目录），仅记日志。
+     */
+    private static void saveToCustomDir(String saveDir, List<String> domains, byte[] keyDer, byte[] leafDer, String fullchainPem) {
+        if (saveDir == null || saveDir.isBlank()) return;
+        String base = primaryDomain(domains);
+        try {
+            Path dir = Path.of(saveDir.trim());
+            Files.createDirectories(dir);
+            writePem(dir.resolve(base + ".key"), "PRIVATE KEY", keyDer);
+            writePem(dir.resolve(base + ".pem"), "CERTIFICATE", leafDer);
+            Files.writeString(dir.resolve(base + ".fullchain.pem"), fullchainPem);
+            Logs.info(Logs.CERT, "证书已保存到自定义目录: " + dir + "/" + base + ".*");
+        } catch (Exception e) {
+            Logs.warn(Logs.CERT, "保存证书到自定义目录失败(" + saveDir + "): " + e.getMessage());
+        }
+    }
+
+    /**
+     * 可选：签发成功后将证书完整内容（证书/私钥/证书链 PEM）POST 推送到 webhook，用于同步到其他系统。
+     * 失败不阻断签发主流程，仅记日志。
+     */
+    private static void pushWebhook(String url, Map<String, Object> task, List<String> domains,
+                                    String keyPem, String certPem, String fullchainPem,
+                                    Instant notBefore, Instant notAfter) {
+        if (url == null || url.isBlank()) return;
+        try {
+            JsonObject payload = new JsonObject();
+            payload.addProperty("event", "certificate.issued");
+            payload.addProperty("taskId", str(task, "id"));
+            payload.addProperty("name", str(task, "name"));
+            JsonArray arr = new JsonArray();
+            domains.forEach(arr::add);
+            payload.add("domains", arr);
+            payload.addProperty("notBefore", notBefore.toString());
+            payload.addProperty("notAfter", notAfter.toString());
+            payload.addProperty("keyPem", keyPem);
+            payload.addProperty("certPem", certPem);
+            payload.addProperty("fullchainPem", fullchainPem);
+            String json = JsonUtils.GSON.toJson(payload);
+
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url.trim()))
+                    .timeout(Duration.ofSeconds(20))
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> resp = WEBHOOK_HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
+                Logs.info(Logs.CERT, "证书已推送 webhook: " + url + " (HTTP " + resp.statusCode() + ")");
+            } else {
+                Logs.warn(Logs.CERT, "推送 webhook 返回非 2xx: HTTP " + resp.statusCode()
+                        + " " + truncate(resp.body()));
+            }
+        } catch (Exception e) {
+            Logs.warn(Logs.CERT, "推送 webhook 失败(" + url + "): " + e.getMessage());
+        }
+    }
+
+    private static String truncate(String s) {
+        if (s == null) return "";
+        return s.length() > 200 ? s.substring(0, 200) + "..." : s;
     }
 
     private static void setStatus(long taskId, String status, String message, String notAfter) {
