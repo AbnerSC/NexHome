@@ -203,7 +203,9 @@ public final class AliyunClient {
         }
         if (!query.isEmpty()) query.deleteCharAt(query.length() - 1);
 
-        String date = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
+        // x-acs-date 必须为 yyyy-MM-dd'T'HH:mm:ss'Z'（无小数秒），
+        // 直接用 ISO_INSTANT 会带上纳秒导致阿里云报 InvalidTimeStamp.Format
+        String date = ISO_Z.format(Instant.now().atZone(ZoneOffset.UTC));
         String nonce = UUID.randomUUID().toString();
         String hashedEmptyBody = sha256Hex("");
 
