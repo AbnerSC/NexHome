@@ -145,16 +145,38 @@ public final class AliyunClient {
 
     /** 查询站点下指定记录名的解析列表 */
     public static JsonArray esaListRecords(String ak, String sk, String siteId, String recordName) throws Exception {
-        JsonObject resp = esaCall(ak, sk, "ListRecords", Map.of(
+        JsonObject resp = esaCall(ak, sk, "GET", "ListRecords", Map.of(
                 "SiteId", siteId,
                 "RecordName", recordName));
         return resp.has("Records") ? resp.get("Records").getAsJsonArray() : new JsonArray();
     }
 
+    /**
+     * 查询账号下全部 ESA 站点（自动分页），返回元素含 SiteId / SiteName / Status。
+     * 用于创建 ESA 任务时校验站点是否存在、供前端下拉选择。
+     */
+    public static JsonArray esaListSites(String ak, String sk) throws Exception {
+        JsonArray all = new JsonArray();
+        int page = 1;
+        int pageSize = 100;
+        while (page <= 50) { // 安全上限，避免异常分页导致死循环
+            JsonObject resp = esaCall(ak, sk, "GET", "ListSites", Map.of(
+                    "PageNumber", String.valueOf(page),
+                    "PageSize", String.valueOf(pageSize)));
+            checkEsaError(resp);
+            JsonArray sites = resp.has("Sites") ? resp.getAsJsonArray("Sites") : new JsonArray();
+            for (var el : sites) all.add(el);
+            int total = resp.has("TotalCount") ? resp.get("TotalCount").getAsInt() : all.size();
+            if (sites.isEmpty() || all.size() >= total) break;
+            page++;
+        }
+        return all;
+    }
+
     /** 新增 ESA 解析记录，返回 RecordId */
     public static String esaCreateRecord(String ak, String sk, String siteId, String recordName,
                                          String type, String value, int ttl) throws Exception {
-        JsonObject resp = esaCall(ak, sk, "CreateRecord", Map.of(
+        JsonObject resp = esaCall(ak, sk, "POST", "CreateRecord", Map.of(
                 "SiteId", siteId,
                 "RecordName", recordName,
                 "Type", type,
@@ -167,7 +189,7 @@ public final class AliyunClient {
     /** 更新 ESA 解析记录 */
     public static void esaUpdateRecord(String ak, String sk, String recordId,
                                        String type, String value, int ttl) throws Exception {
-        JsonObject resp = esaCall(ak, sk, "UpdateRecord", Map.of(
+        JsonObject resp = esaCall(ak, sk, "POST", "UpdateRecord", Map.of(
                 "RecordId", recordId,
                 "Type", type,
                 "Data.Value", value,
@@ -177,7 +199,7 @@ public final class AliyunClient {
 
     /** 删除 ESA 解析记录 */
     public static void esaDeleteRecord(String ak, String sk, String recordId) throws Exception {
-        JsonObject resp = esaCall(ak, sk, "DeleteRecord", Map.of(
+        JsonObject resp = esaCall(ak, sk, "POST", "DeleteRecord", Map.of(
                 "RecordId", recordId));
         checkEsaError(resp);
     }
@@ -193,7 +215,7 @@ public final class AliyunClient {
      * ESA API 调用：签名算法 3.0（ACS3-HMAC-SHA256）。
      * 流程：构造规范请求 -> SHA256 摘要 -> HMAC-SHA256 签名 -> Authorization 头。
      */
-    private static JsonObject esaCall(String ak, String sk, String action, Map<String, String> params) throws Exception {
+    private static JsonObject esaCall(String ak, String sk, String method, String action, Map<String, String> params) throws Exception {
         TreeMap<String, String> sorted = new TreeMap<>(params);
 
         // 规范化查询串（参数名排序，URL 编码）
@@ -218,8 +240,8 @@ public final class AliyunClient {
                 + "x-acs-version:2024-09-10\n";
         String signedHeaders = "host;x-acs-action;x-acs-content-sha256;x-acs-date;x-acs-signature-nonce;x-acs-version";
 
-        // 规范请求
-        String canonicalRequest = "GET\n/\n" + query + "\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + hashedEmptyBody;
+        // 规范请求（第一行 HTTPMethod 必须与实际请求方法一致，否则签名校验失败）
+        String canonicalRequest = method + "\n/\n" + query + "\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + hashedEmptyBody;
         // 待签名字符串
         String stringToSign = "ACS3-HMAC-SHA256\n" + sha256Hex(canonicalRequest);
         // 计算签名
@@ -230,7 +252,7 @@ public final class AliyunClient {
                 + ",SignedHeaders=" + signedHeaders + ",Signature=" + signature;
 
         String url = "https://" + ESA_HOST + "/?" + query;
-        return httpGetJson(url, Map.of(
+        return httpJson(method, url, Map.of(
                 "x-acs-action", action,
                 "x-acs-version", "2024-09-10",
                 "x-acs-date", date,
@@ -242,9 +264,17 @@ public final class AliyunClient {
     // ==================== 底层工具 ====================
 
     private static JsonObject httpGetJson(String url, Map<String, String> headers) throws Exception {
+        return httpJson("GET", url, headers);
+    }
+
+    private static JsonObject httpJson(String method, String url, Map<String, String> headers) throws Exception {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofSeconds(15))
-                .GET();
+                .timeout(Duration.ofSeconds(15));
+        if ("POST".equalsIgnoreCase(method)) {
+            b.method("POST", HttpRequest.BodyPublishers.noBody());
+        } else {
+            b.GET();
+        }
         headers.forEach(b::header);
         HttpResponse<String> resp = HTTP.send(b.build(), HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {

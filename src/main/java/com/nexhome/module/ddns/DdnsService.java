@@ -51,6 +51,20 @@ public final class DdnsService {
             cfg.put("local_nic", JsonUtils.str(b, "local_nic"));
             ctx.ok(Map.of("ip", IpResolver.resolve(cfg)));
         });
+        // 拉取阿里云 ESA 站点列表：供前端下拉选择；凭证可来自配置或手动填写
+        WebServer.route("POST", "/api/ddns/esa/sites", ctx -> {
+            String[] cred = credentialsFrom(ctx.body());
+            JsonArray out = new JsonArray();
+            for (var el : AliyunClient.esaListSites(cred[0], cred[1])) {
+                JsonObject s = el.getAsJsonObject();
+                JsonObject o = new JsonObject();
+                o.addProperty("site_id", s.has("SiteId") ? String.valueOf(s.get("SiteId").getAsLong()) : "");
+                o.addProperty("site_name", s.has("SiteName") ? s.get("SiteName").getAsString() : "");
+                o.addProperty("status", s.has("Status") ? s.get("Status").getAsString() : "");
+                out.add(o);
+            }
+            ctx.ok(Map.of("sites", out));
+        });
         WebServer.route("POST", "/api/ddns/tasks", DdnsService::create);
         WebServer.route("PUT", "/api/ddns/tasks/{id}", DdnsService::update);
         WebServer.route("DELETE", "/api/ddns/tasks/{id}", DdnsService::delete);
@@ -90,6 +104,7 @@ public final class DdnsService {
     private static void create(Ctx ctx) throws Exception {
         JsonObject b = ctx.body();
         validate(b, true);
+        validateEsaSiteExists(b);
         Long cfgId = ProviderConfigService.parseId(b, "provider_config_id");
         long id = Database.insert("""
                 INSERT INTO ddns_task(name, provider, domain, rr, type, ttl, ip_mode, manual_ip, local_nic,
@@ -110,9 +125,13 @@ public final class DdnsService {
 
     private static void update(Ctx ctx) throws Exception {
         long id = ctx.paramLong("id");
-        mustGet(id);
+        Map<String, Object> old = mustGet(id);
         JsonObject b = ctx.body();
         validate(b, false);
+        // 仅当 ESA 站点发生变化时回源校验，避免每次开关定时同步都请求阿里云
+        if (!JsonUtils.str(b, "esa_site_id").trim().equals(str(old, "esa_site_id"))) {
+            validateEsaSiteExists(b);
+        }
         Long cfgId = ProviderConfigService.parseId(b, "provider_config_id");
         Database.update("""
                 UPDATE ddns_task SET name=?, provider=?, domain=?, rr=?, type=?, ttl=?, ip_mode=?,
@@ -194,6 +213,31 @@ public final class DdnsService {
         if ("MANUAL".equals(JsonUtils.str(b, "ip_mode")) && JsonUtils.str(b, "manual_ip").isBlank()) {
             throw new IllegalArgumentException("手动模式必须填写 IP 地址");
         }
+    }
+
+    /** 从请求体解析生效凭证：优先配置引用，否则手动 AccessKey */
+    private static String[] credentialsFrom(JsonObject b) throws SQLException {
+        Long cfgId = ProviderConfigService.parseId(b, "provider_config_id");
+        if (cfgId != null) return ProviderConfigService.credentials(cfgId);
+        return new String[]{JsonUtils.str(b, "access_key_id"), JsonUtils.str(b, "access_key_secret")};
+    }
+
+    /**
+     * ESA 任务：校验所选站点存在于阿里云 ESA 站点列表。
+     * 不存在（如尚未在阿里云添加站点）时抛出面向用户的提示，引导去控制台添加。
+     */
+    private static void validateEsaSiteExists(JsonObject b) throws Exception {
+        if (!"ALIYUN_ESA".equals(JsonUtils.str(b, "provider"))) return;
+        String siteId = JsonUtils.str(b, "esa_site_id").trim();
+        if (siteId.isBlank()) throw new IllegalArgumentException("请选择 ESA 站点");
+        String[] cred = credentialsFrom(b);
+        JsonArray sites = AliyunClient.esaListSites(cred[0], cred[1]);
+        for (var el : sites) {
+            JsonObject s = el.getAsJsonObject();
+            if (s.has("SiteId") && String.valueOf(s.get("SiteId").getAsLong()).equals(siteId)) return;
+        }
+        throw new IllegalArgumentException("ESA 站点(SiteId=" + siteId
+                + ") 未在阿里云站点列表中找到，请先到阿里云 ESA 控制台添加该站点后再保存");
     }
 
     // ---------- 同步执行 ----------

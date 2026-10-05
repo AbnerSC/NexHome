@@ -120,7 +120,13 @@ window.ddnsForm = async (id) => {
           </select></div>
         <div class="field hidden" id="fAkId"><label>AccessKey ID <b>*</b></label><input name="access_key_id" value="${esc(t.access_key_id || '')}"></div>
         <div class="field hidden" id="fAkSecret"><label>AccessKey Secret <b>*</b></label><input name="access_key_secret" type="password" value="${esc(t.access_key_secret || '')}"></div>
-        <div class="field hidden" id="fSiteId"><label>ESA 站点 SiteId <b>*</b></label><input name="esa_site_id" value="${esc(t.esa_site_id || '')}" placeholder="数字站点ID"></div>
+        <div class="field full hidden" id="fSiteId"><label>ESA 站点 <b>*</b></label>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <select name="esa_site_id" id="esaSiteSel" style="flex:1;min-width:220px"><option value="">请先选择凭证后点击“加载站点”</option></select>
+            <button type="button" class="btn" onclick="ddnsLoadEsaSites()">加载站点</button>
+          </div>
+          <div id="esaSiteHint" class="small muted" style="margin-top:6px"></div>
+        </div>
         <div class="field"><label>同步间隔（秒，最小60）</label><input name="interval_sec" type="number" min="60" value="${t.interval_sec ?? 300}"></div>
         <div class="field"><label>启用定时同步</label><select name="enabled"><option value="true" ${t.enabled !== 0 ? 'selected' : ''}>启用</option><option value="false" ${t.enabled === 0 ? 'selected' : ''}>停用</option></select></div>
         <div class="form-foot full">
@@ -128,20 +134,54 @@ window.ddnsForm = async (id) => {
           <button class="btn primary">保存</button>
         </div>
       </form>`);
-    window.ddnsProviderChanged = p => { $('#fSiteId').classList.toggle('hidden', p !== 'ALIYUN_ESA'); };
-    window.ddnsCredChanged = v => {
+    window.ddnsProviderChanged = (p, initial) => {
+        $('#fSiteId').classList.toggle('hidden', p !== 'ALIYUN_ESA');
+        if (!initial && p === 'ALIYUN_ESA') ddnsLoadEsaSites();
+    };
+    window.ddnsCredChanged = (v, initial) => {
         const manual = !v; // 未选配置时手动填写 AccessKey
         $('#fAkId').classList.toggle('hidden', !manual);
         $('#fAkSecret').classList.toggle('hidden', !manual);
         $('#fAkId input').required = manual;
         $('#fAkSecret input').required = manual;
-        if (!manual) {
-            // 配置中保存了 ESA SiteId 时自动带出（仍可按任务覆盖）
-            const c = configs.find(x => String(x.id) === String(v));
-            if (c && c.esa_site_id) {
-                const site = $('#ddnsFormEl [name=esa_site_id]');
-                if (!site.value) site.value = c.esa_site_id;
+        // 凭证变化后重新拉取站点列表（ESA 且站点字段可见时）
+        if (!initial && !$('#fSiteId').classList.contains('hidden')) ddnsLoadEsaSites();
+    };
+    window.ddnsLoadEsaSites = async () => {
+        const f = new FormData($('#ddnsFormEl'));
+        const sel = $('#esaSiteSel');
+        const hint = $('#esaSiteHint');
+        const cur = sel.value || (t.esa_site_id ? String(t.esa_site_id) : '');
+        hint.className = 'small muted'; hint.style.color = ''; hint.textContent = '';
+        const cfgId = f.get('provider_config_id') || '', akId = f.get('access_key_id') || '', akSecret = f.get('access_key_secret') || '';
+        if (!cfgId && (!akId || !akSecret)) { // 凭证未就绪，不发起无谓请求
+            sel.innerHTML = '<option value="">请先选择/填写凭证</option>';
+            hint.textContent = '请先选择凭证配置或填写 AccessKey，再加载站点。';
+            return;
+        }
+        sel.innerHTML = '<option value="">站点加载中…</option>';
+        try {
+            const r = await api('POST', '/api/ddns/esa/sites', {
+                provider_config_id: f.get('provider_config_id') || '',
+                access_key_id: f.get('access_key_id') || '',
+                access_key_secret: f.get('access_key_secret') || ''
+            });
+            const sites = r.sites || [];
+            if (!sites.length) {
+                sel.innerHTML = '<option value="">无可用站点</option>';
+                hint.className = 'small'; hint.style.color = 'var(--red)';
+                hint.textContent = '未在阿里云 ESA 找到可用站点，请先到阿里云 ESA 控制台添加站点后再创建任务。';
+                return;
             }
+            sel.innerHTML = '<option value="">请选择站点</option>' + sites.map(s =>
+                `<option value="${esc(s.site_id)}" ${cur === String(s.site_id) ? 'selected' : ''}>${esc(s.site_name)}（SiteId: ${esc(s.site_id)}${s.status ? '，' + esc(s.status) : ''}）</option>`).join('');
+            // 编辑时原 SiteId 不在列表：保留该项并提示，避免回显丢失
+            if (cur && !sites.some(s => String(s.site_id) === cur)) {
+                sel.insertAdjacentHTML('afterbegin', `<option value="${esc(cur)}" selected>${esc(cur)}（当前站点，未在阿里云列表中找到）</option>`);
+            }
+        } catch (e) {
+            sel.innerHTML = '<option value="">加载失败</option>';
+            hint.className = 'small'; hint.style.color = 'var(--red)'; hint.textContent = e.message;
         }
     };
     window.ddnsModeChanged = m => {
@@ -169,9 +209,10 @@ window.ddnsForm = async (id) => {
             p.style.color = 'var(--red)';
         }
     };
-    window.ddnsProviderChanged(t.provider || 'ALIYUN_DNS');
+    window.ddnsProviderChanged(t.provider || 'ALIYUN_DNS', true);
     window.ddnsModeChanged(t.ip_mode || 'PUBLIC');
-    window.ddnsCredChanged(t.provider_config_id ? String(t.provider_config_id) : '');
+    window.ddnsCredChanged(t.provider_config_id ? String(t.provider_config_id) : '', true);
+    if ((t.provider || 'ALIYUN_DNS') === 'ALIYUN_ESA') ddnsLoadEsaSites();
     $('#ddnsFormEl').addEventListener('submit', async e => {
         e.preventDefault();
         const f = new FormData(e.target);
