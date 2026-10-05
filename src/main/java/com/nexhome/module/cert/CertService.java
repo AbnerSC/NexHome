@@ -155,6 +155,13 @@ public final class CertService {
         ensureColumn("provider_config_id", "INTEGER"); // 旧库升级：DNS01 自动验证引用凭证配置
         ensureColumn("save_dir", "TEXT");             // 旧库升级：可选的证书保存目录
         ensureColumn("webhook_url", "TEXT");          // 旧库升级：可选的证书同步 webhook
+        // 重启恢复：ISSUING 是纯内存的在途状态，进程重启后不会有线程继续。
+        // 若残留说明上次签发被中断（容器重启/异常退出/Error 绕过捕获），置为 ERROR 提示重新申请，
+        // 避免前端永久停留在“正在签发证书...”的假象。
+        int stale = Database.update(
+                "UPDATE cert_task SET status='ERROR', message=? WHERE status='ISSUING'",
+                "上次签发未完成（程序可能已重启或异常退出），请重新点击「申请」");
+        if (stale > 0) Logs.warn(Logs.CERT, "已重置 " + stale + " 个中断的证书签发任务（ISSUING → ERROR）");
         // 每小时检查一次证书有效期
         Tasks.every(60, 3600, CertService::autoRenewCheck);
         Logs.info(Logs.CERT, "证书自动续期检查已启动（每小时，到期前 " + RENEW_AHEAD_DAYS + " 天续期）");
@@ -331,8 +338,10 @@ public final class CertService {
                     cleanupTxt(cred, addedTxt); // 验证完成/失败后均清理自动写入的 TXT
                 }
             }
-        } catch (Exception e) {
-            fail(taskId, trigger + "失败: " + e.getMessage());
+        } catch (Throwable e) {
+            // 捕获 Throwable（含 Error）：签发链路任何未预期错误都要落库为 ERROR，
+            // 否则任务会永久卡在 ISSUING（如 NoClassDefFoundError、OOM 等）
+            fail(taskId, trigger + "失败: " + e);
         }
     }
 
@@ -358,8 +367,8 @@ public final class CertService {
             }
             waitAuthorizations(order, Duration.ofSeconds(180));
             finalizeAndDownload(taskId, task, order, domainList(str(task, "domains")));
-        } catch (Exception e) {
-            fail(taskId, "DNS验证失败: " + e.getMessage());
+        } catch (Throwable e) {
+            fail(taskId, "DNS验证失败: " + e);
         }
     }
 
