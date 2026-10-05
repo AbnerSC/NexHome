@@ -39,11 +39,24 @@
             <artifactId>acme4j-client</artifactId>
             <version>5.1.0</version>
         </dependency>
-        <!-- acme4j 的 CSR 构造(CSRBuilder)需要 BouncyCastle，仅证书申请链路使用 -->
+        <!-- acme4j 的 CSR 构造(CSRBuilder)需要 BouncyCastle，仅证书申请链路使用。
+             BC 三件套(bcprov/bcpkix/bcutil)必须同版本：acme4j 传递依赖会带入较旧的 bcprov，
+             若与 bcpkix 主版本不一致会在运行时抛 NoClassDefFoundError（如 IANAObjectIdentifiers），
+             故显式锁定 bcprov/bcutil 与 bcpkix 同版本，直接声明可覆盖 acme4j 的传递版本。 -->
         <dependency>
             <groupId>org.bouncycastle</groupId>
             <artifactId>bcpkix-jdk18on</artifactId>
-            <version>1.85</version>
+            <version>1.86</version>
+        </dependency>
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcprov-jdk18on</artifactId>
+            <version>1.86</version>
+        </dependency>
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcutil-jdk18on</artifactId>
+            <version>1.86</version>
         </dependency>
         <!-- acme4j 使用 slf4j 门面，绑定 JDK 内置日志，避免额外引入 logback/log4j -->
         <dependency>
