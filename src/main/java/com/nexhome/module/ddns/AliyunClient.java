@@ -179,8 +179,8 @@ public final class AliyunClient {
         JsonObject resp = esaCall(ak, sk, "POST", "CreateRecord", Map.of(
                 "SiteId", siteId,
                 "RecordName", recordName,
-                "Type", type,
-                "Data.Value", value,
+                "Type", esaRecordType(type),
+                "Data", esaDataJson(value),
                 "Ttl", String.valueOf(ttl)));
         checkEsaError(resp);
         return resp.get("RecordId").getAsString();
@@ -191,10 +191,22 @@ public final class AliyunClient {
                                        String type, String value, int ttl) throws Exception {
         JsonObject resp = esaCall(ak, sk, "POST", "UpdateRecord", Map.of(
                 "RecordId", recordId,
-                "Type", type,
-                "Data.Value", value,
+                "Type", esaRecordType(type),
+                "Data", esaDataJson(value),
                 "Ttl", String.valueOf(ttl)));
         checkEsaError(resp);
+    }
+
+    /** ESA 地址类记录的类型枚举为合并的 "A/AAAA"（与云解析 DNS 的 A/AAAA 不同） */
+    private static String esaRecordType(String type) {
+        return ("A".equalsIgnoreCase(type) || "AAAA".equalsIgnoreCase(type)) ? "A/AAAA" : type;
+    }
+
+    /** ESA 的 Data 为复合对象参数，需以 JSON 字符串传递，如 {"Value":"1.2.3.4"} */
+    private static String esaDataJson(String value) {
+        JsonObject d = new JsonObject();
+        d.addProperty("Value", value);
+        return d.toString();
     }
 
     /** 删除 ESA 解析记录 */

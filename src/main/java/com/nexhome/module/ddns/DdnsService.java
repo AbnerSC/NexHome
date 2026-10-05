@@ -320,14 +320,12 @@ public final class DdnsService {
                 }
             }
         } else {
-            // ESA
+            // ESA：响应类型字段为 RecordType（地址记录统一为 A/AAAA），按名称 + 类型/地址族匹配
             records = AliyunClient.esaListRecords(cred[0], cred[1], str(task, "esa_site_id"), fullDomain);
             for (var el : records) {
                 JsonObject r = el.getAsJsonObject();
-                // 部分记录类型（如 NS）无 Data.Value 结构，跳过避免 NPE
-                if (r.get("RecordName").getAsString().equalsIgnoreCase(fullDomain)
-                        && r.get("Type").getAsString().equalsIgnoreCase(type)
-                        && r.has("Data") && r.get("Data").isJsonObject()) {
+                if (r.has("RecordName") && r.get("RecordName").getAsString().equalsIgnoreCase(fullDomain)
+                        && esaRecordMatches(type, r)) {
                     return r;
                 }
             }
@@ -336,6 +334,22 @@ public final class DdnsService {
         Logs.info(Logs.DDNS, "任务[" + task.get("name") + "] 线上未匹配到 " + fullDomain + "/" + type
                 + "（接口返回 " + records.size() + " 条: " + summarize(records) + "）");
         return null;
+    }
+
+    /**
+     * ESA 记录类型匹配：地址类记录线上 RecordType 为合并的 A/AAAA，再按 IP 地址族区分 A 与 AAAA；
+     * 非地址类型直接比对 RecordType。
+     */
+    private static boolean esaRecordMatches(String taskType, JsonObject r) {
+        String rt = r.has("RecordType") ? r.get("RecordType").getAsString()
+                : (r.has("Type") ? r.get("Type").getAsString() : "");
+        boolean addr = "A".equalsIgnoreCase(taskType) || "AAAA".equalsIgnoreCase(taskType);
+        if (!addr) return rt.equalsIgnoreCase(taskType);
+        if (!rt.equalsIgnoreCase("A/AAAA")) return false;
+        String val = (r.has("Data") && r.get("Data").isJsonObject() && r.getAsJsonObject("Data").has("Value"))
+                ? r.getAsJsonObject("Data").get("Value").getAsString() : "";
+        boolean v6 = val.contains(":");
+        return "AAAA".equalsIgnoreCase(taskType) == v6;
     }
 
     /** 解析记录列表摘要：RR/Type 列表（最多 10 条） */
@@ -349,8 +363,10 @@ public final class DdnsService {
                 break;
             }
             if (sb.length() > 0) sb.append(", ");
+            String t = r.has("Type") ? r.get("Type").getAsString()
+                    : (r.has("RecordType") ? r.get("RecordType").getAsString() : "?");
             sb.append(r.has("RR") ? r.get("RR").getAsString() : r.get("RecordName").getAsString())
-                    .append('/').append(r.get("Type").getAsString());
+                    .append('/').append(t);
         }
         return sb.toString();
     }
