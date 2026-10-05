@@ -119,6 +119,15 @@ window.stunForm = async (id) => {
           </select></div>
         <div class="field ${custom ? '' : 'hidden'}" id="fStunHost"><label>STUN 地址 <b>*</b></label><input name="stun_host" value="${esc(t.stun_host || '')}" placeholder="stun.miwifi.com"></div>
         <div class="field ${custom ? '' : 'hidden'}" id="fStunPort"><label>STUN 端口</label><input name="stun_port" type="number" min="1" max="65535" value="${t.stun_port ?? 3478}"></div>
+        <div class="field full">
+          <label>Webhook 同步（可选，穿透成功 / 映射地址变化时将结果推送到以下地址，支持多个）</label>
+          <div id="stunWhList"></div>
+          <div style="margin-top:6px"><button type="button" class="btn small" onclick="stunWhAdd()">＋ 添加 Webhook</button></div>
+          <div class="small muted" style="margin-top:6px;line-height:1.7">
+            每条可选 <b>GET / POST</b>：<b>POST</b> 以 application/json 发送结果字段+自定义参数；<b>GET</b> 拼为查询串。
+            <b>请求头</b>每行一个 <code>key: value</code>（如 <code>Authorization: Bearer xxx</code>）；<b>自定义参数</b>每行一个 <code>key=value</code>；地址、请求头与参数值均支持占位符 <code>\${字段}</code>。
+            触发时机：首次穿透成功、外网映射地址变化；每条会显示最近一次调用时间与结果，推送失败仅记日志，不影响穿透。
+            结果字段：<code>event, id, name, protocol, target_ip, target_port, mapped_addr, nat_type, punched_at, check_result, status</code>。</div></div>
         <div class="form-foot full">
           <button type="button" class="btn" onclick="closeModal()">取消</button>
           <button class="btn primary">保存</button>
@@ -128,6 +137,10 @@ window.stunForm = async (id) => {
         $('#fStunHost').classList.toggle('hidden', v !== 'custom');
         $('#fStunPort').classList.toggle('hidden', v !== 'custom');
     };
+    let whs = [], whst = {};
+    try { whs = t.webhook_config ? JSON.parse(t.webhook_config) : []; } catch (e) { whs = []; }
+    try { whst = t.webhook_status ? JSON.parse(t.webhook_status) : {}; } catch (e) { whst = {}; }
+    whs.forEach(w => window.stunWhAdd(w, whst[w.url]));
     $('#stunFormEl').addEventListener('submit', async e => {
         e.preventDefault();
         const body = Object.fromEntries(new FormData(e.target).entries());
@@ -143,12 +156,50 @@ window.stunForm = async (id) => {
         body.target_port = Number(body.target_port); body.bind_port = Number(body.bind_port || 0);
         body.keepalive_sec = Number(body.keepalive_sec || 25);
         body.upnp_enabled = body.upnp_enabled === 'true';
+        body.webhooks = [...document.querySelectorAll('#stunWhList .wh-row')].map(r => {
+            const params = {};
+            r.querySelector('.wh-params').value.split(/\r?\n/).forEach(line => {
+                const i = line.indexOf('=');
+                if (i > 0) params[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+            });
+            const headers = {};
+            r.querySelector('.wh-headers').value.split(/\r?\n/).forEach(line => {
+                const i = line.indexOf(':');
+                if (i > 0) headers[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+            });
+            return { method: r.querySelector('.wh-method').value, url: r.querySelector('.wh-url').value.trim(), headers, params };
+        }).filter(w => w.url);
         try {
             if (id) await api('PUT', '/api/stun/tasks/' + id, body);
             else await api('POST', '/api/stun/tasks', body);
             closeModal(); toast('保存成功'); renderStun();
         } catch (err) { toast(err.message, 'err'); }
     });
+};
+
+/** 新增一条 Webhook 编辑行（w 为空时为空白新行；编辑时回填已存配置；status 为上次调用结果 {time,result}） */
+window.stunWhAdd = (w, status) => {
+    w = w || { url: '', method: 'POST', headers: {}, params: {} };
+    const list = document.getElementById('stunWhList');
+    if (!list) return;
+    const row = document.createElement('div');
+    row.className = 'wh-row';
+    row.style.cssText = 'display:flex;gap:6px;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;padding:8px;border:1px solid #e2e8f0;border-radius:8px';
+    const headersText = Object.entries(w.headers || {}).map(([k, v]) => k + ': ' + v).join('\n');
+    const paramsText = Object.entries(w.params || {}).map(([k, v]) => k + '=' + v).join('\n');
+    const st = status && status.result
+        ? `上次调用：<span>${esc(status.time || '')}</span> `
+          + `<b style="color:${String(status.result).startsWith('OK') ? '#16a34a' : '#dc2626'}">${esc(status.result)}</b>`
+        : '尚未调用';
+    row.innerHTML = `
+      <select class="wh-method" style="width:80px"><option ${w.method !== 'GET' ? 'selected' : ''}>POST</option><option ${w.method === 'GET' ? 'selected' : ''}>GET</option></select>
+      <input class="wh-url" style="flex:1;min-width:220px" placeholder="https://example.com/hooks/stun" value="${esc(w.url || '')}">
+      <button type="button" class="btn small danger" title="删除此条">✕</button>
+      <textarea class="wh-headers" style="flex-basis:100%;min-height:34px" placeholder="请求头，每行 key: value，如 Authorization: Bearer xxx">${esc(headersText)}</textarea>
+      <textarea class="wh-params" style="flex-basis:100%;min-height:34px" placeholder="自定义参数，每行 key=value，支持 \${mapped_addr} 等占位符">${esc(paramsText)}</textarea>
+      <div class="wh-status small muted" style="flex-basis:100%">${st}</div>`;
+    row.querySelector('button').addEventListener('click', () => row.remove());
+    list.appendChild(row);
 };
 
 /** STUN 服务器维护视图：穿透任务表单下拉选择的数据源 */

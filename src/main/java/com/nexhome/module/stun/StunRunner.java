@@ -912,6 +912,7 @@ final class StunRunner {
     private void updateMapped(String mapped, String natType, boolean authoritative) {
         try {
             boolean writeMapped = false;
+            boolean wasPunched = punched; // 记录本次调用前是否已穿透，用于区分「首次穿透」与「映射地址变化」
             if (mapped != null && !mapped.isBlank()) {
                 lastMappedAt = System.currentTimeMillis(); // 保活/穿透有效：刷新映射时间，供巡检判断保活是否失效
                 if (!punched) {
@@ -963,8 +964,20 @@ final class StunRunner {
             } else if (writeMapped) {
                 Database.update("UPDATE stun_task SET mapped_addr=? WHERE id=?", mapped, id);
             }
+            // 映射地址落库后推送穿透结果（writeMapped 仅在首次穿透或接受真实变更时为 true）
+            if (writeMapped) notifyWebhook(wasPunched ? "stun.mapped_changed" : "stun.punched");
         } catch (Exception e) {
             Logs.error(Logs.STUN, "更新映射状态失败: " + e.getMessage());
+        }
+    }
+
+    /** 穿透结果变化（首次穿透成功 / 外网映射地址变更）时按任务配置推送 webhook（读取最新行，异步推送，失败仅日志） */
+    private void notifyWebhook(String event) {
+        try {
+            Map<String, Object> row = Database.queryOne("SELECT * FROM stun_task WHERE id=?", id);
+            if (row != null) StunWebhook.push(row, event);
+        } catch (Exception e) {
+            Logs.warn(Logs.STUN, "任务[" + name + "] 触发穿透结果 webhook 失败: " + e.getMessage());
         }
     }
 

@@ -6,6 +6,8 @@ import com.nexhome.core.Logs;
 import com.nexhome.web.Ctx;
 import com.nexhome.web.WebServer;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import java.net.DatagramSocket;
@@ -122,6 +124,8 @@ public final class StunService {
         ensureColumn("check_time", "TEXT");
         ensureColumn("check_result", "TEXT");
         ensureColumn("upnp_enabled", "INTEGER NOT NULL DEFAULT 1");
+        ensureColumn("webhook_config", "TEXT");
+        ensureColumn("webhook_status", "TEXT");
     }
 
     private static void ensureColumn(String name, String type) throws SQLException {
@@ -139,13 +143,14 @@ public final class StunService {
         validate(b);
         long id = Database.insert("""
                 INSERT INTO stun_task(name, protocol, target_ip, target_port, bind_port,
-                    stun_host, stun_port, keepalive_sec, peer_addr, upnp_enabled, enabled)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    stun_host, stun_port, keepalive_sec, peer_addr, upnp_enabled, webhook_config, enabled)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "protocol"), JsonUtils.str(b, "target_ip"),
                 JsonUtils.num(b, "target_port", 0), JsonUtils.num(b, "bind_port", 0),
                 JsonUtils.str(b, "stun_host"), JsonUtils.num(b, "stun_port", 19302),
                 JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"),
                 JsonUtils.bool(b, "upnp_enabled", true) ? 1 : 0,
+                serializeWebhooks(b),
                 JsonUtils.bool(b, "enabled", false) ? 1 : 0);
         Logs.info(Logs.STUN, "新增穿透任务: " + JsonUtils.str(b, "name"));
         // 创建即要求启动的场景：前端传 enabled=1 时自动启动
@@ -162,12 +167,12 @@ public final class StunService {
         validate(b);
         Database.update("""
                 UPDATE stun_task SET name=?, protocol=?, target_ip=?, target_port=?, bind_port=?,
-                    stun_host=?, stun_port=?, keepalive_sec=?, peer_addr=?, upnp_enabled=? WHERE id=?""",
+                    stun_host=?, stun_port=?, keepalive_sec=?, peer_addr=?, upnp_enabled=?, webhook_config=? WHERE id=?""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "protocol"), JsonUtils.str(b, "target_ip"),
                 JsonUtils.num(b, "target_port", 0), JsonUtils.num(b, "bind_port", 0),
                 JsonUtils.str(b, "stun_host"), JsonUtils.num(b, "stun_port", 19302),
                 JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"),
-                JsonUtils.bool(b, "upnp_enabled", true) ? 1 : 0, id);
+                JsonUtils.bool(b, "upnp_enabled", true) ? 1 : 0, serializeWebhooks(b), id);
         Logs.info(Logs.STUN, "更新穿透任务 #" + id + ": " + JsonUtils.str(b, "name"));
         // 运行中修改配置 -> 重启任务使配置生效
         if (wasRunning) {
@@ -256,6 +261,59 @@ public final class StunService {
                 throw new IllegalArgumentException("对端公网地址端口需为数字");
             }
         }
+        validateWebhooks(b);
+    }
+
+    /** Webhook 配置校验：地址须为 http/https，请求方式仅 GET/POST（空地址忽略） */
+    private static void validateWebhooks(JsonObject b) {
+        if (!b.has("webhooks") || !b.get("webhooks").isJsonArray()) return;
+        for (JsonElement el : b.getAsJsonArray("webhooks")) {
+            if (!el.isJsonObject()) continue;
+            JsonObject w = el.getAsJsonObject();
+            String url = JsonUtils.str(w, "url").trim();
+            if (url.isEmpty()) continue;
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                throw new IllegalArgumentException("Webhook 地址必须以 http:// 或 https:// 开头: " + url);
+            }
+            String method = JsonUtils.str(w, "method").trim().toUpperCase();
+            if (!method.isEmpty() && !"GET".equals(method) && !"POST".equals(method)) {
+                throw new IllegalArgumentException("Webhook 请求方式只能为 GET 或 POST");
+            }
+        }
+    }
+
+    /** 将前端提交的 webhooks 数组规范化为存储用 JSON 串（过滤空地址、默认 POST、params 统一为字符串值） */
+    private static String serializeWebhooks(JsonObject b) {
+        if (!b.has("webhooks") || !b.get("webhooks").isJsonArray()) return "";
+        JsonArray in = b.getAsJsonArray("webhooks");
+        JsonArray out = new JsonArray();
+        for (JsonElement el : in) {
+            if (!el.isJsonObject()) continue;
+            JsonObject w = el.getAsJsonObject();
+            String url = JsonUtils.str(w, "url").trim();
+            if (url.isEmpty()) continue;
+            String method = JsonUtils.str(w, "method").trim().toUpperCase();
+            if (!"GET".equals(method)) method = "POST";
+            JsonObject o = new JsonObject();
+            o.addProperty("url", url);
+            o.addProperty("method", method);
+            o.add("headers", normalizeStringMap(w, "headers"));
+            o.add("params", normalizeStringMap(w, "params"));
+            out.add(o);
+        }
+        return out.size() == 0 ? "" : out.toString();
+    }
+
+    /** 将 webhook 项内的对象字段（headers/params）规范化为字符串值对象，缺失时返回空对象 */
+    private static JsonObject normalizeStringMap(JsonObject w, String key) {
+        JsonObject out = new JsonObject();
+        if (w.has(key) && w.get(key).isJsonObject()) {
+            for (Map.Entry<String, JsonElement> pe : w.getAsJsonObject(key).entrySet()) {
+                JsonElement pv = pe.getValue();
+                out.addProperty(pe.getKey(), pv == null || pv.isJsonNull() ? "" : pv.getAsString());
+            }
+        }
+        return out;
     }
 
     private static Map<String, Object> mustGet(long id) throws SQLException {

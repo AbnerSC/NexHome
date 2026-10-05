@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS ddns_task (
 -- upnp_enabled : 是否启用 UPnP 端口映射（路由器不支持 UPnP 时可关闭，避免无谓的 SSDP 发现等待）
 -- punched_at   : 穿透成功时间（本次运行首次取得外网映射地址的时刻）
 -- check_time / check_result : 可用性自测（穿透后测试一次）的时间与结果
+-- webhook_config : 可选，穿透结果同步的 webhook 列表（JSON 数组，每项 {url,method(GET/POST),headers,params}），
+--                  穿透成功 / 外网映射地址变化时推送结果，支持多个、自定义请求头与参数（值支持 ${字段} 占位符）
+-- webhook_status : 各 webhook 最近一次调用结果（JSON 对象，url -> {time,result}），result 为成功/失败原因（如 OK(HTTP 200) / FAIL(...)）
 CREATE TABLE IF NOT EXISTS stun_task (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
@@ -87,6 +90,8 @@ CREATE TABLE IF NOT EXISTS stun_task (
     punched_at    TEXT,
     check_time    TEXT,
     check_result  TEXT,
+    webhook_config TEXT,
+    webhook_status TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
