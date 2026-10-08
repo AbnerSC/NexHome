@@ -45,8 +45,8 @@ final class StunWebhook {
     /** 结果字段：作为 POST 请求体 / GET 查询串的内容，同时供 ${字段} 占位符引用 */
     private static final String[] FIELDS = {
             "id", "name", "protocol", "target_ip", "target_port", "bind_port",
-            "stun_host", "stun_port", "peer_addr", "mapped_addr", "nat_type",
-            "punched_at", "check_time", "check_result", "status"
+            "stun_host", "stun_port", "peer_addr", "mapped_addr", "mapped_ip", "mapped_port",
+            "nat_type", "punched_at", "check_time", "check_result", "status"
     };
 
     private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{(\\w+)\\}");
@@ -87,16 +87,18 @@ final class StunWebhook {
             if (!"GET".equals(method)) method = "POST";
             Map<String, String> headers = readMap(w, "headers", data);
             Map<String, String> params = readMap(w, "params", data);
+            String bodyTemplate = w.has("body") && !w.get("body").isJsonNull() ? w.get("body").getAsString() : null;
             final String target = replace(url, data);
             final String verb = method;
             final String key = url; // 状态以配置的原始 URL（含占位符）为键，与前端 webhook_config 一致便于回显
-            EXEC.submit(() -> recordResult(taskId, key, send(name, target, verb, data, params, headers)));
+            final String bodyTpl = bodyTemplate != null ? replace(bodyTemplate, data) : null;
+            EXEC.submit(() -> recordResult(taskId, key, send(name, target, verb, data, params, headers, bodyTpl)));
         }
     }
 
     /** 执行一次 webhook 推送，返回调用结果文案（OK(HTTP xxx) / FAIL(...)），仅记日志不抛出 */
     private static String send(String taskName, String url, String method,
-                             Map<String, String> data, Map<String, String> params, Map<String, String> headers) {
+                             Map<String, String> data, Map<String, String> params, Map<String, String> headers, String bodyTpl) {
         try {
             String target = url;
             if ("GET".equals(method)) {
@@ -120,11 +122,19 @@ final class StunWebhook {
             if ("GET".equals(method)) {
                 rb.GET();
             } else {
-                JsonObject payload = new JsonObject();
-                data.forEach(payload::addProperty);
-                params.forEach(payload::addProperty);
+                String payloadStr;
+                if (bodyTpl != null && !bodyTpl.isBlank()) {
+                    // 用户自定义 JSON 请求体（已做占位符替换）
+                    payloadStr = bodyTpl;
+                } else {
+                    // 兼容旧模式：结果字段 + 自定义参数合并为 JSON
+                    JsonObject payload = new JsonObject();
+                    data.forEach(payload::addProperty);
+                    params.forEach(payload::addProperty);
+                    payloadStr = JsonUtils.GSON.toJson(payload);
+                }
                 if (!hasContentType) rb.header("Content-Type", "application/json; charset=utf-8");
-                rb.POST(HttpRequest.BodyPublishers.ofString(JsonUtils.GSON.toJson(payload), StandardCharsets.UTF_8));
+                rb.POST(HttpRequest.BodyPublishers.ofString(payloadStr, StandardCharsets.UTF_8));
             }
             HttpResponse<String> resp = HTTP.send(rb.build(), HttpResponse.BodyHandlers.ofString());
             int code = resp.statusCode();
@@ -175,6 +185,16 @@ final class StunWebhook {
         Map<String, String> data = new LinkedHashMap<>();
         data.put("event", event);
         for (String f : FIELDS) data.put(f, str(task, f));
+        // 从 mapped_addr (如 "1.2.3.4:5678") 拆分出独立的 mapped_ip 和 mapped_port
+        String mappedAddr = data.getOrDefault("mapped_addr", "");
+        if (!mappedAddr.isEmpty() && mappedAddr.lastIndexOf(':') > 0) {
+            int idx = mappedAddr.lastIndexOf(':');
+            data.put("mapped_ip", mappedAddr.substring(0, idx));
+            data.put("mapped_port", mappedAddr.substring(idx + 1));
+        } else {
+            data.putIfAbsent("mapped_ip", mappedAddr);
+            data.putIfAbsent("mapped_port", "");
+        }
         return data;
     }
 

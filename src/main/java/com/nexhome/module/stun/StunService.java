@@ -282,7 +282,7 @@ public final class StunService {
         }
     }
 
-    /** 将前端提交的 webhooks 数组规范化为存储用 JSON 串（过滤空地址、默认 POST、params 统一为字符串值） */
+    /** 将前端提交的 webhooks 数组规范化为存储用 JSON 串（过滤空地址、默认 POST、params 统一为字符串值、保留 body 字段） */
     private static String serializeWebhooks(JsonObject b) {
         if (!b.has("webhooks") || !b.get("webhooks").isJsonArray()) return "";
         JsonArray in = b.getAsJsonArray("webhooks");
@@ -299,6 +299,11 @@ public final class StunService {
             o.addProperty("method", method);
             o.add("headers", normalizeStringMap(w, "headers"));
             o.add("params", normalizeStringMap(w, "params"));
+            // 保留用户自定义 JSON 请求体（POST 模式）
+            if (w.has("body") && !w.get("body").isJsonNull()) {
+                String bodyVal = w.get("body").getAsString().trim();
+                if (!bodyVal.isEmpty()) o.addProperty("body", bodyVal);
+            }
             out.add(o);
         }
         return out.size() == 0 ? "" : out.toString();

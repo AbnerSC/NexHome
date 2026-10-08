@@ -552,6 +552,9 @@ tr:hover td { background: #f8fafc; }
 /* 宽模态框：Docker 详情 / Compose 容器列表 / 编排脚本等信息密集弹窗 */
 .modal.wide { width: 980px; }
 
+/* 超宽模态框：STUN 穿透任务编辑等复杂表单 */
+.modal.xwide { width: 1240px; }
+
 /* 可排序表头（Docker 容器列表）：点击切换升/降序 */
 th.docker-sort { cursor: pointer; user-select: none; }
 th.docker-sort:hover { color: var(--primary); }

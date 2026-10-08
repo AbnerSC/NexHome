@@ -122,7 +122,7 @@ function confirmBox(opts) {
         };
         const onOk = () => done(true);
         const onCancel = () => done(false);
-        const onMask = e => { if (e.target === mask) done(false); };
+        const onMask = () => {}; // 不再点击遮罩关闭，需主动点击按钮
         const onKey = e => {
             if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(false); }
             else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); done(true); }
@@ -191,7 +191,6 @@ $('#btnLogout').addEventListener('click', async () => {
 });
 
 $('#modalClose').addEventListener('click', closeModal);
-$('#modalMask').addEventListener('click', e => { if (e.target === $('#modalMask')) closeModal(); });
 
 async function loadSysInfo() {
     try {
