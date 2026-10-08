@@ -12,6 +12,7 @@ async function renderStun() {
         <td>${t.nat_type ? `<div class="small">${esc(t.nat_type)}</div>` : '-'}</td>
         <td>${t.mapped_addr ? badge(t.mapped_addr, 'info') : '-'}</td>
         <td>${t.punched_at ? `<span class="small">${esc(t.punched_at)}</span>` : '-'}</td>
+        <td>${fmtTrafficBytes(t.total_bytes)}</td>
         <td>${t.check_result
             ? `<div>${badge(t.check_result, t.check_result.startsWith('OK') ? 'ok'
                 : t.check_result.startsWith('FAIL') ? 'err' : 'warn')}</div>
@@ -23,6 +24,7 @@ async function renderStun() {
             : `<button class="btn small success" onclick="stunCmd(${t.id},'start')">启动</button>`}
           <button class="btn small" onclick="stunCmd(${t.id},'test')">探测</button>
           ${t.status === 'RUNNING' ? `<button class="btn small" onclick="stunCmd(${t.id},'verify')">自测</button>` : ''}
+          <button class="btn small" onclick="stunTraffic(${t.id})">流量</button>
           <button class="btn small" onclick="stunForm(${t.id})">编辑</button>
           <button class="btn small danger" onclick="stunDelete(${t.id})">删除</button>
         </td>
@@ -48,11 +50,12 @@ async function renderStun() {
                 <th style="width: 7%">NAT类型</th>
                 <th style="width: 13%">外网映射地址</th>
                 <th style="width: 13%">穿透成功时间</th>
+                <th style="width: 9%">流量</th>
                 <th>可用性自测</th>
                 <th style="width: 320px">操作</th>
             </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="9" class="muted">暂无任务</td></tr>'}</tbody>
+        <tbody>${rows || '<tr><td colspan="10" class="muted">暂无任务</td></tr>'}</tbody>
       </table></div>`;
     setRefresh(renderStun, 5000);
 }
@@ -352,5 +355,34 @@ window.stunServerMove = async (id, dir) => {
     try {
         await api('POST', `/api/stun/servers/${id}/move`, { dir });
         renderStunServers();
+    } catch (e) { toast(e.message, 'err'); }
+};
+
+/** 字节数转人类可读（B/KB/MB/GB/TB/PB）；独立命名避免与 docker.js 的全局 fmtBytes 相互覆盖 */
+function fmtTrafficBytes(b) {
+    b = Number(b || 0);
+    if (b < 1024) return b + ' B';
+    const u = ['KB', 'MB', 'GB', 'TB', 'PB'];
+    let i = -1;
+    do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
+    return b.toFixed(b >= 100 ? 0 : b >= 10 ? 1 : 2) + ' ' + u[i];
+}
+
+/** 单任务流量明细弹窗：总量 + 按小时/天/月归档 */
+window.stunTraffic = async id => {
+    try {
+        const d = await api('GET', `/api/stun/tasks/${id}/traffic`);
+        const tbl = (list, label) => `
+          <table><thead><tr><th>${label}</th><th style="text-align:right">流量</th></tr></thead>
+          <tbody>${(list && list.length)
+            ? list.map(x => `<tr><td class="small">${esc(x.key)}</td><td style="text-align:right">${fmtTrafficBytes(x.bytes)}</td></tr>`).join('')
+            : '<tr><td colspan="2" class="muted">暂无数据</td></tr>'}</tbody></table>`;
+        modal('流量统计', `
+          <div class="tip">总流量：<b>${fmtTrafficBytes(d.total)}</b>（连接重建不清零，统计含双向转发字节；按小时/天/月归档，数值为已落库 + 实时增量）</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:12px">
+            <div><h4>按小时（近 48）</h4>${tbl(d.hours, '时段')}</div>
+            <div><h4>按天（近 60）</h4>${tbl(d.days, '日期')}</div>
+            <div><h4>按月（近 24）</h4>${tbl(d.months, '月份')}</div>
+          </div>`, 'wide');
     } catch (e) { toast(e.message, 'err'); }
 };

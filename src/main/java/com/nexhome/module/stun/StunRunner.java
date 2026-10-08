@@ -420,6 +420,7 @@ final class StunRunner {
         });
         if (session != null) {
             session.send(new DatagramPacket(pkt.getData(), pkt.getLength()));
+            TrafficStats.record(id, pkt.getLength()); // 入站方向（对端 -> 目标）计入流量
         }
     }
 
@@ -433,6 +434,7 @@ final class StunRunner {
                 session.receive(p);
                 if (udpSocket != null && !udpSocket.isClosed()) {
                     udpSocket.send(new DatagramPacket(p.getData(), p.getLength(), peer));
+                    TrafficStats.record(id, p.getLength()); // 出站方向（目标 -> 对端）计入流量
                 }
             }
         } catch (Exception ignored) {
@@ -801,11 +803,17 @@ final class StunRunner {
         }
     }
 
-    private static void copy(Socket from, Socket to) {
+    private void copy(Socket from, Socket to) {
         try {
             InputStream in = from.getInputStream();
             OutputStream out = to.getOutputStream();
-            in.transferTo(out);
+            byte[] buf = new byte[16384];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                TrafficStats.record(id, n); // 每块无锁累加，不逐包写库，不影响转发性能
+            }
+            out.flush();
         } catch (Exception ignored) {
             // 任一端断开即结束管道
         } finally {

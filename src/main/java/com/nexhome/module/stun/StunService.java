@@ -33,8 +33,10 @@ public final class StunService {
 
     /** 注册 REST 接口 */
     public static void registerRoutes() {
-        WebServer.route("GET", "/api/stun/tasks", ctx -> ctx.ok(Database.query(
-                "SELECT * FROM stun_task ORDER BY id")));
+        WebServer.route("GET", "/api/stun/tasks", StunService::list);
+        // 单任务流量明细：总量 + 按小时/天/月归档（连接重建不清零，落库+内存实时增量合并）
+        WebServer.route("GET", "/api/stun/tasks/{id}/traffic", ctx ->
+                ctx.ok(TrafficStats.detail(ctx.paramLong("id"))));
         WebServer.route("POST", "/api/stun/tasks", StunService::create);
         WebServer.route("PUT", "/api/stun/tasks/{id}", StunService::update);
         WebServer.route("DELETE", "/api/stun/tasks/{id}", StunService::delete);
@@ -138,6 +140,15 @@ public final class StunService {
 
     // ---------- 增删改 ----------
 
+    /** 任务列表：在原始行基础上附带每个任务的累计总流量 total_bytes（含内存未落库增量） */
+    private static void list(Ctx ctx) throws Exception {
+        List<Map<String, Object>> rows = Database.query("SELECT * FROM stun_task ORDER BY id");
+        for (Map<String, Object> r : rows) {
+            if (r.get("id") instanceof Number n) r.put("total_bytes", TrafficStats.totalBytes(n.longValue()));
+        }
+        ctx.ok(rows);
+    }
+
     private static void create(Ctx ctx) throws Exception {
         JsonObject b = ctx.body();
         validate(b);
@@ -187,6 +198,7 @@ public final class StunService {
         Map<String, Object> task = mustGet(id);
         stop(id);
         Database.update("DELETE FROM stun_task WHERE id=?", id);
+        TrafficStats.clear(id); // 清理流量统计（内存计数 + stun_traffic 落库行）
         Logs.info(Logs.STUN, "删除穿透任务 #" + id + ": " + task.get("name"));
         ctx.ok("已删除");
     }

@@ -89,6 +89,35 @@ public final class Database {
         }
     }
 
+    /**
+     * 批量执行同一 UPDATE/INSERT（单事务），用于高频统计落库：一次提交多行，
+     * 减少逐条写库与数据库锁竞争（如穿透流量增量合并）。返回提交行数。
+     */
+    public static synchronized int updateBatch(String sql, List<Object[]> paramsList) throws SQLException {
+        if (paramsList == null || paramsList.isEmpty()) return 0;
+        boolean oldAutoCommit = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            for (Object[] params : paramsList) {
+                bind(ps, params);
+                ps.addBatch();
+            }
+            int total = 0;
+            for (int n : ps.executeBatch()) total += Math.max(n, 0);
+            conn.commit();
+            return total;
+        } catch (SQLException e) {
+            try {
+                conn.rollback();
+            } catch (SQLException ignored) {
+                // 回滚失败：向上抛出原异常
+            }
+            throw e;
+        } finally {
+            conn.setAutoCommit(oldAutoCommit);
+        }
+    }
+
     /** 查询多行，每行转为 列名->值 的有序 Map */
     public static synchronized List<Map<String, Object>> query(String sql, Object... params) throws SQLException {
         List<Map<String, Object>> rows = new ArrayList<>();

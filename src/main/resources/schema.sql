@@ -95,6 +95,19 @@ CREATE TABLE IF NOT EXISTS stun_task (
     created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
+-- STUN 穿透流量统计表（按任务累积转发字节，连接重建不清零）
+-- period_type : TOTAL（累计总量，period_key 恒为 all）/ HOUR / DAY / MONTH
+-- period_key  : HOUR=yyyy-MM-dd HH / DAY=yyyy-MM-dd / MONTH=yyyy-MM / TOTAL=all（键字典序即时间序）
+-- bytes       : 该时间桶累计转发的字节数（双向合计）
+CREATE TABLE IF NOT EXISTS stun_traffic (
+    task_id     INTEGER NOT NULL,
+    period_type TEXT NOT NULL,
+    period_key  TEXT NOT NULL,
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    PRIMARY KEY (task_id, period_type, period_key)
+);
+
 -- STUN 服务器维护表（穿透任务新增/编辑时下拉选择，按 sort_order 排序展示）
 -- tcp_support : 是否支持 STUN-over-TCP（TCP 穿透任务需经支持 TCP 的服务器出站，在 CGNAT 上建立真实 TCP 映射）
 CREATE TABLE IF NOT EXISTS stun_server (

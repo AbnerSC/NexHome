@@ -12,6 +12,7 @@ import com.nexhome.module.nav.NavService;
 import com.nexhome.module.provider.ProviderConfigService;
 import com.nexhome.module.stun.StunServerService;
 import com.nexhome.module.stun.StunService;
+import com.nexhome.module.stun.TrafficStats;
 import com.nexhome.module.wol.WolService;
 import com.nexhome.web.SystemRoutes;
 import com.nexhome.web.WebServer;
@@ -59,6 +60,7 @@ public final class NexHomeApp {
             DdnsService.init();      // 恢复 DDNS 定时同步
             StunServerService.init(); // 播种 STUN 服务器列表
             StunService.init();      // 恢复运行中的穿透任务
+            TrafficStats.init();     // 启动穿透流量统计周期落库
             NavService.init();       // 清理孤儿导航图标文件
 
             // 6. 启动内置 Web 服务器（前端静态资源 + API 同一端口）
@@ -71,6 +73,7 @@ public final class NexHomeApp {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 Logs.info(Logs.SYS, "正在关闭...");
                 StunService.stopAll();
+                TrafficStats.flushNow(); // 落库最后不足一个周期的流量增量，避免丢失
                 Tasks.shutdown();
                 Database.close();
             }));
