@@ -8,6 +8,11 @@ const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
 let TOKEN = localStorage.getItem('nx_token') || '';
+/** API 基础前缀：启用安全入口后面板挂在 /{入口} 下，所有模块请求需带上该前缀（根路径访问时为空串） */
+const API_BASE = (() => {
+    const p = location.pathname.replace(/\/+$/, '');
+    return p.length > 1 ? p : '';
+})();
 let currentPage = 'home';
 let refreshTimer = null;          // 状态实时刷新定时器
 
@@ -32,7 +37,7 @@ async function api(method, path, body) {
         opt.headers['Content-Type'] = 'application/json';
         opt.body = JSON.stringify(body);
     }
-    const resp = await fetch(path, opt);
+    const resp = await fetch(API_BASE + path, opt);
     let data = {};
     try { data = await resp.json(); } catch (e) { /* 非 JSON 响应 */ }
     if (resp.status === 401 && !path.endsWith('/login') && !path.endsWith('/check')) {

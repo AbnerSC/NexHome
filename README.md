@@ -49,7 +49,9 @@ java --enable-native-access=ALL-UNNAMED -jar target/nexhome.jar
 
 - 首次启动自动生成配置文件 `nexhome.properties`、数据库 `data/nexhome.db`
 - **默认登录密码：`admin`**，登录后请立即在「系统设置」中修改
-- 自定义端口：修改运行目录 `nexhome.properties` 中的 `server.port`，重启生效
+- **访问端口 / HTTPS / 安全入口**：登录后在「系统设置 → 访问与安全设置」中修改，保存后自动重启生效（绑定失败自动回滚）；
+  HTTPS 证书自动适配「SSL 证书管理」中已签发的证书；开启安全入口后必须通过 `http://地址:端口/入口路径/` 访问面板；
+  数据库配置优先于 `nexhome.properties` 中的 `server.port` 引导项
 
 低内存环境可选：`java -Xmx128m --enable-native-access=ALL-UNNAMED -jar nexhome.jar`
 

@@ -8,10 +8,17 @@ function maskAk(id) {
 }
 
 async function renderSettings() {
-    let info = {}, configs = [], types = {};
+    let info = {}, configs = [], types = {}, metrics = {};
     try { info = await api('GET', '/api/system/info'); } catch (e) { /* ignore */ }
     try { configs = await api('GET', '/api/provider/configs'); } catch (e) { /* ignore */ }
     try { types = await api('GET', '/api/provider/types'); } catch (e) { /* ignore */ }
+    // 系统物理内存：与顶栏监控同源，避免此处显示 JVM 堆内存造成混淆
+    try { metrics = await api('GET', '/api/system/metrics'); } catch (e) { /* ignore */ }
+    // 访问与安全配置（端口 / HTTPS / 安全入口）+ 已签发证书清单（HTTPS 证书下拉）
+    let ws = {}, certTasks = [];
+    try { ws = await api('GET', '/api/system/web-settings'); } catch (e) { /* ignore */ }
+    try { certTasks = (await api('GET', '/api/cert/tasks')).filter(t => t.status === 'ISSUED'); } catch (e) { /* ignore */ }
+    const memPct = metrics.memTotalMB > 0 ? Math.round(metrics.memUsedMB * 100 / metrics.memTotalMB) : 0;
     const typeName = code => types[code] || code;
     const cfgRows = configs.map(c => `
       <tr>
@@ -31,10 +38,45 @@ async function renderSettings() {
           <tr><th style="width:120px">版本</th><td>${esc(info.version || '')}</td></tr>
           <tr><th>Java 版本</th><td>${esc(info.javaVersion || '')}</td></tr>
           <tr><th>操作系统</th><td>${esc(info.os || '')}</td></tr>
-          <tr><th>服务端口</th><td>${info.port ?? ''}（修改请编辑运行目录 nexhome.properties 后重启）</td></tr>
+          <tr><th>服务端口</th><td>${info.port ?? ''}${info.httpsEnabled ? '（HTTPS 已启用，需从新端口访问）' : '（可在下方「访问与安全设置」中修改）'}</td></tr>
           <tr><th>运行时长</th><td>${Math.floor((info.uptimeSec || 0) / 3600)} 小时 ${Math.floor((info.uptimeSec || 0) % 3600 / 60)} 分钟</td></tr>
-          <tr><th>内存占用</th><td>${info.usedMemoryMB ?? ''} MB / 上限 ${info.maxMemoryMB ?? ''} MB</td></tr>
+          <tr><th>内存占用</th><td>${metrics.memUsedMB != null ? `${fmtMB(metrics.memUsedMB)} / ${fmtMB(metrics.memTotalMB)}（${memPct}%）` : ''}</td></tr>
         </table>
+      </div>
+      <div class="panel">
+        <h3 style="font-size:14px;margin-bottom:12px">访问与安全设置</h3>
+        ${ws.lastError ? `<div class="tip" style="color:var(--red);margin-bottom:10px">⚠️ ${esc(ws.lastError)}</div>` : ''}
+        <div class="tip" style="margin-bottom:12px">端口 / HTTPS / 安全入口保存后，内置 Web 服务将<b>自动重启</b>并应用新配置
+          （绑定失败自动回滚，此处配置优先于 nexhome.properties）；重启后需重新登录。
+          开启安全入口后必须通过 <b>http://地址:端口/入口路径/</b> 访问面板，其余路径一律 404。</div>
+        <form id="accessForm" class="form-grid">
+          <div class="field"><label>HTTP 端口 <b>*</b></label>
+            <input name="port" type="number" min="1" max="65535" required value="${ws.port ?? 8090}"></div>
+          <div class="field"><label>HTTPS</label>
+            <select name="httpsEnabled" onchange="accHttpsChanged(this.value)">
+              <option value="0" ${!ws.httpsEnabled ? 'selected' : ''}>关闭</option>
+              <option value="1" ${ws.httpsEnabled ? 'selected' : ''}>开启</option>
+            </select></div>
+          <div class="field" id="accHttpsPort"><label>HTTPS 端口</label>
+            <input name="httpsPort" type="number" min="1" max="65535" value="${ws.httpsPort ?? 8443}"></div>
+          <div class="field" id="accRedirect"><label>HTTP 跳转 HTTPS</label>
+            <select name="httpsRedirect">
+              <option value="0" ${!ws.httpsRedirect ? 'selected' : ''}>否</option>
+              <option value="1" ${ws.httpsRedirect ? 'selected' : ''}>是</option>
+            </select></div>
+          <div class="field full" id="accCert"><label>HTTPS 证书</label>
+            <select name="certTaskId">
+              <option value="" ${!ws.certTaskId ? 'selected' : ''}>自动选择（有效期最长的有效证书）</option>
+              ${certTasks.map(t => `<option value="${t.id}" ${Number(ws.certTaskId) === t.id ? 'selected' : ''}>${esc(t.name)}（有效期至 ${(t.not_after || '').slice(0, 10)}）</option>`).join('')}
+            </select>
+            <div class="small muted">自动适应已申请的证书：未指定时自动选用有效期最长的有效证书，续期后自动加载新证书。
+              ${ws.activeCertTaskId > 0 ? `当前使用: <b>${esc(ws.activeCertName || ('#' + ws.activeCertTaskId))}</b>，有效期至 ${(ws.activeCertNotAfter || '').slice(0, 10) || '-'}` : ''}
+              ${ws.httpsEnabled && !ws.httpsActive ? ' <span style="color:var(--red)">（HTTPS 未生效，已降级为仅 HTTP，请检查证书）</span>' : ''}</div>
+          </div>
+          <div class="field full"><label>安全入口路径（留空关闭）</label>
+            <input name="entryPath" placeholder="如 my-secret-entry，4-64 位字母数字-_，访问时需带上 /路径/" value="${esc(ws.entryPath || '')}"></div>
+          <div class="form-foot full" style="margin-top:6px"><button class="btn primary">保存并应用</button></div>
+        </form>
       </div>
       <div class="panel">
         <h3 style="font-size:14px;margin-bottom:12px">服务商凭证配置</h3>
@@ -69,6 +111,55 @@ async function renderSettings() {
             TOKEN = '';
             localStorage.removeItem('nx_token');
             showLogin();
+        } catch (err) { toast(err.message, 'err'); }
+    });
+
+    // HTTPS 相关字段随开关显示/隐藏
+    window.accHttpsChanged = v => {
+        ['accHttpsPort', 'accRedirect', 'accCert'].forEach(id => $('#' + id).classList.toggle('hidden', v !== '1'));
+    };
+    window.accHttpsChanged(ws.httpsEnabled ? '1' : '0');
+
+    // 保存访问与安全设置：确认后提交，服务自动重启，展示新地址并倒计时跳转
+    $('#accessForm').addEventListener('submit', async e => {
+        e.preventDefault();
+        const f = new FormData(e.target);
+        const port = f.get('port'), httpsPort = f.get('httpsPort');
+        if (f.get('httpsEnabled') === '1' && port === httpsPort) { toast('HTTPS 端口不能与 HTTP 端口相同', 'err'); return; }
+        const entry = String(f.get('entryPath') || '').trim().replace(/^\/+|\/+$/g, '');
+        const entryPart = entry ? '/' + entry : '';
+        const host = location.hostname;
+        const httpUrl = `http://${host}:${port}${entryPart}`;
+        const httpsUrl = f.get('httpsEnabled') === '1' ? `https://${host}:${httpsPort}${entryPart}` : '';
+        const primary = httpsUrl || httpUrl;
+        if (!(await confirmBox({
+            title: '应用访问配置',
+            message: `保存后服务将立即重启并应用新配置（需重新登录），\n请牢记新访问地址：\n${primary}\n\n确定继续？`,
+            confirmText: '保存并重启'
+        }))) return;
+        try {
+            await api('PUT', '/api/system/web-settings', {
+                port: Number(port),
+                httpsEnabled: f.get('httpsEnabled') === '1',
+                httpsPort: Number(httpsPort),
+                httpsRedirect: f.get('httpsRedirect') === '1',
+                certTaskId: f.get('certTaskId') || '',
+                entryPath: entry
+            });
+            let left = 6;
+            modal('服务正在重启', `
+              <p>新配置应用中，请稍候。新的访问地址：</p>
+              <p>${httpsUrl ? `<b><a href="${esc(httpsUrl)}" target="_blank">${esc(httpsUrl)}</a></b><br>` : ''}
+                 <b><a href="${esc(httpUrl)}" target="_blank">${esc(httpUrl)}</a></b></p>
+              <p class="muted small">重启后需重新登录；若端口或入口已变更，请使用上方新地址访问。</p>
+              <p id="accCountdown" class="muted small">${left} 秒后自动跳转 ${esc(primary)} ...</p>`);
+            const timer = setInterval(() => {
+                const el = $('#accCountdown');
+                if (!el) { clearInterval(timer); return; }
+                left -= 1;
+                if (left <= 0) { clearInterval(timer); location.href = primary; return; }
+                el.textContent = `${left} 秒后自动跳转 ${primary} ...`;
+            }, 1000);
         } catch (err) { toast(err.message, 'err'); }
     });
 }

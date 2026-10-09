@@ -11,6 +11,7 @@ import com.nexhome.module.ddns.AliyunApiException;
 import com.nexhome.module.ddns.AliyunClient;
 import com.nexhome.module.provider.ProviderConfigService;
 import com.nexhome.web.Ctx;
+import com.nexhome.web.WebAccessConfig;
 import com.nexhome.web.WebServer;
 
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -176,9 +177,12 @@ public final class CertService {
         }
     }
 
-    /** 供 WebServer 分发 /.well-known/acme-challenge/{token} */
+    /** 供 WebServer 分发 /.well-known/acme-challenge/{token}（安全入口模式下兼容带前缀的路径） */
     public static void serveChallenge(Ctx ctx) throws Exception {
-        String token = ctx.path().substring("/.well-known/acme-challenge/".length());
+        String marker = "/.well-known/acme-challenge/";
+        int i = ctx.path().indexOf(marker);
+        String token = i < 0 ? ctx.path().substring(ctx.path().lastIndexOf('/') + 1)
+                : ctx.path().substring(i + marker.length());
         String auth = CHALLENGES.get(token);
         if (auth == null) {
             ctx.text(404, "challenge not found", "text/plain");
@@ -281,9 +285,10 @@ public final class CertService {
             Database.setConfig("cert." + taskId + ".order", order.getLocation().toString());
 
             if ("HTTP01".equals(challengeType)) {
-                if (AppConfig.port() != 80) {
+                int httpPort = WebAccessConfig.httpPortQuiet();
+                if (httpPort != 80) {
                     Logs.warn(Logs.CERT, "任务[" + name + "] 当前服务端口非 80，http-01 验证需保证 CA 能访问 80 端口" +
-                            "（可配置路由器端口转发 80 -> " + AppConfig.port() + "）");
+                            "（可配置路由器端口转发 80 -> " + httpPort + "）");
                 }
                 CHALLENGES.clear();
                 for (Authorization auth : order.getAuthorizations()) {
@@ -430,6 +435,8 @@ public final class CertService {
         saveToCustomDir(str(task, "save_dir"), domains, keyDer, leafDer, fullchainPem);
         pushWebhook(str(task, "webhook_url"), task, domains, keyPem, certPem, fullchainPem,
                 leaf.getNotBefore().toInstant(), leaf.getNotAfter().toInstant());
+        // HTTPS 正在使用该证书时自动重启 Web 服务，加载续期后的新证书
+        WebServer.onCertRenewed(taskId);
     }
 
     /** 定时自动续期：到期前 RENEW_AHEAD_DAYS 天自动重新申请 */

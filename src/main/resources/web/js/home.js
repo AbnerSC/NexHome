@@ -4,6 +4,11 @@
 let navSmartMode = null;          // null=自动, 'lan'/'wan' 手动
 let netSourceLan = null;          // 服务端按连接源 IP 识别的访问来源（null=未知，回退 hostname 判断）
 
+/** 图标展示地址：本地图标存的是相对 URL（/nav-icons/xxx），安全入口模式下需补上 API 前缀才能命中路由 */
+function iconSrc(u) {
+    return u && u.startsWith('/') ? API_BASE + u : u;
+}
+
 function isLanVisit() {
     if (netSourceLan !== null) return netSourceLan;
     const h = location.hostname;
@@ -49,7 +54,7 @@ async function renderHome() {
             const fallback = !preferred;
             const kind = (preferred ? lanFirst : !lanFirst) ? '内网地址' : '外网地址';
             const icon = it.icon_url
-                ? `<img src="${esc(it.icon_url)}" onerror="this.replaceWith(document.createTextNode('🌍'))">`
+                ? `<img src="${esc(iconSrc(it.icon_url))}" onerror="this.replaceWith(document.createTextNode('🌍'))">`
                 : '🌍';
             html += `
             <div class="nav-card" onclick="window.open('${esc(url)}','_blank')">
@@ -77,7 +82,7 @@ async function renderNavManage() {
     let rows = items.map(it => `
         <tr draggable="true" data-id="${it.id}" class="drag-row">
           <td style="cursor:move">⠿</td>
-          <td>${it.icon_url ? `<img class="nav-thumb" src="${esc(it.icon_url)}" onerror="this.replaceWith(document.createTextNode('🌍'))">` : ''}</td>
+          <td>${it.icon_url ? `<img class="nav-thumb" src="${esc(iconSrc(it.icon_url))}" onerror="this.replaceWith(document.createTextNode('🌍'))">` : ''}</td>
           <td>${esc(it.name)}</td>
           <td class="small muted">${esc(it.lan_url) || '-'}</td>
           <td class="small muted">${esc(it.wan_url) || '-'}</td>
@@ -159,7 +164,7 @@ window.navForm = async (id) => {
     const syncIconPreview = () => {
         const v = iconInput.value.trim();
         iconPreview.innerHTML = v
-            ? `<img src="${esc(v)}" onerror="this.replaceWith(document.createTextNode('🌍'))">`
+            ? `<img src="${esc(iconSrc(v))}" onerror="this.replaceWith(document.createTextNode('🌍'))">`
             : '🌍';
     };
     syncIconPreview();
@@ -173,7 +178,7 @@ window.navForm = async (id) => {
         try {
             const fd = new FormData();
             fd.append('file', file);
-            const resp = await fetch('/api/nav/icons', { method: 'POST', headers: { 'X-Token': TOKEN }, body: fd });
+            const resp = await fetch(API_BASE + '/api/nav/icons', { method: 'POST', headers: { 'X-Token': TOKEN }, body: fd });
             const data = await resp.json().catch(() => ({}));
             if (!data.ok) throw new Error(data.error || ('上传失败 ' + resp.status));
             iconInput.value = data.data.url;

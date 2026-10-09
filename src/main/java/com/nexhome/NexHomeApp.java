@@ -63,8 +63,8 @@ public final class NexHomeApp {
             TrafficStats.init();     // 启动穿透流量统计周期落库
             NavService.init();       // 清理孤儿导航图标文件
 
-            // 6. 启动内置 Web 服务器（前端静态资源 + API 同一端口）
-            WebServer.start(AppConfig.port());
+            // 6. 启动内置 Web 服务器（前端静态资源 + API 同端口，HTTPS/安全入口见系统设置）
+            WebServer.start();
 
             Logs.info(Logs.SYS, "NexHome 启动完成，数据目录: " + AppConfig.DATA_DIR);
 

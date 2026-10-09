@@ -112,9 +112,9 @@ window.certDownload = id => {
     modal('下载证书文件', `
       <p class="muted small" style="margin-bottom:12px">私钥文件请妥善保管，切勿泄露。</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <a class="btn" href="/api/cert/tasks/${id}/download?file=fullchain&token=${t}">fullchain.pem（证书链）</a>
-        <a class="btn" href="/api/cert/tasks/${id}/download?file=cert&token=${t}">cert.pem（证书）</a>
-        <a class="btn" href="/api/cert/tasks/${id}/download?file=key&token=${t}">domain.key.pem（私钥）</a>
+        <a class="btn" href="${API_BASE}/api/cert/tasks/${id}/download?file=fullchain&token=${t}">fullchain.pem（证书链）</a>
+        <a class="btn" href="${API_BASE}/api/cert/tasks/${id}/download?file=cert&token=${t}">cert.pem（证书）</a>
+        <a class="btn" href="${API_BASE}/api/cert/tasks/${id}/download?file=key&token=${t}">domain.key.pem（私钥）</a>
       </div>`);
 };
 
