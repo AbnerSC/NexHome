@@ -5,7 +5,6 @@ import com.nexhome.core.AppConfig;
 import com.nexhome.core.Database;
 import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
-import com.nexhome.core.Tasks;
 import com.nexhome.module.cert.CertService;
 import io.javalin.Javalin;
 import io.javalin.config.RoutesConfig;
@@ -27,6 +26,8 @@ import org.eclipse.jetty.util.ssl.SslContextFactory;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -69,10 +70,19 @@ public final class WebServer {
     /** 路由缓冲区：模块在 start 前注册，start（含每次重启）时统一回放到 Javalin 实例 */
     private static final List<Route> ROUTES = new ArrayList<>();
 
+    static {
+        // fat-jar 部署时前端资源位于 jar 内的 /web：Jetty 停止实例时会关闭 JDK 全局缓存的 JarFile，
+        // 导致进程内重启再次解析 classpath 目录失败（Static resource directory '/web' does not exist）。
+        // 关闭 jar 连接缓存，使每次解析独立打开文件，重启后仍可读取内置资源。
+        java.net.URLConnection.setDefaultUseCaches("jar", false);
+    }
+
     /** 当前运行的 Javalin 实例（进程内重启时替换） */
     private static volatile Javalin app;
     /** 当前生效的访问配置快照 */
     private static volatile WebAccessConfig.Snapshot cfg;
+    /** 实际监听的 HTTP 端口（启动期端口自愈后可能与配置值不同；未启动为 -1） */
+    private static volatile int boundPort = -1;
     /** HTTPS 当前实际使用的证书任务 ID（未启用或降级为 -1） */
     private static volatile long activeCertTaskId = -1;
 
@@ -98,12 +108,49 @@ public final class WebServer {
     public static void onCertRenewed(long taskId) {
         if (activeCertTaskId == taskId) {
             Logs.info(Logs.SYS, "HTTPS 证书 #" + taskId + " 已续期，即将重启 Web 服务加载新证书");
-            Tasks.delay(1, WebServer::restart);
+            scheduleRestart(1);
         }
     }
 
-    /** 启动服务：读取数据库中的访问配置并构建实例 */
+    /**
+     * 延迟触发进程内重启（响应已发出后再停服）。
+     * <p>
+     * 必须使用<b>非守护线程</b>承载：Jetty 停止后其线程全部退出，若重启任务跑在守护线程上，
+     * stop 与 start 之间的空档 JVM 会因「无非守护线程」直接退出，
+     * 关停钩子随即关闭数据库，导致新配置未生效且回滚也无法执行（面板彻底失联）。
+     */
+    public static void scheduleRestart(long delaySec) {
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(delaySec * 1000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            restart();
+        }, "nexhome-web-restart");
+        t.setDaemon(false);
+        t.start();
+    }
+
+    /** 当前实际生效的 HTTP 端口（供接口与日志展示，尚未绑定时回退配置端口） */
+    public static int httpPort() {
+        int p = boundPort;
+        return p > 0 ? p : WebAccessConfig.httpPortQuiet();
+    }
+
+    /**
+     * 启动服务：读取数据库中的访问配置并构建实例。
+     * <p>
+     * 进程首次启动带<b>端口自愈</b>：期望端口被占用时向后逐个探测备选端口，仍全部不可用则由内核
+     * 分配随机端口，保证面板可达且进程不退出（避免容器 restart 策略陷入反复重启），
+     * 实际端口与漂移原因写日志并落 {@code web.last_error} 供设置页展示；
+     * 数据库里的 {@code web.port} 不改写，冲突解除后重启进程即回到期望端口。
+     */
     public static synchronized void start() {
+        startInternal(true);
+    }
+
+    private static void startInternal(boolean selfHeal) {
         WebAccessConfig.Snapshot snapshot;
         try {
             snapshot = WebAccessConfig.load();
@@ -133,11 +180,57 @@ public final class WebServer {
         final boolean https = httpsOn;
         final WebAccessConfig.CertInfo cert = certInfo;
 
+        if (!selfHeal) {
+            // 进程内重启：严格按配置端口绑定，失败抛出交由 restart() 回滚旧配置（不擅自漂移到其他端口）
+            boundPort = -1;
+            launch(snap, webDir, https, cert, snap.httpPort(), false);
+            return;
+        }
+
+        // 启动期自愈：期望端口不可用时逐个试候选端口，首个绑定成功即生效
+        int wanted = snap.httpPort();
+        List<Integer> candidates = portCandidates(wanted, https ? snap.httpsPort() : -1);
+        Exception last = null;
+        for (int p : candidates) {
+            if (p != wanted && !canBind(p)) {
+                Logs.warn(Logs.SYS, "端口 " + p + " 预绑探测不可用，跳过");
+                continue;
+            }
+            boundPort = -1;
+            try {
+                launch(snap, webDir, https, cert, p, true);
+            } catch (Exception e) {
+                last = e;
+                stopQuietly();
+                boundPort = -1;
+                Logs.warn(Logs.SYS, "端口 " + p + " 启动失败，继续尝试备选: " + e.getMessage());
+                continue;
+            }
+            if (p != wanted) {
+                String msg = "配置的 HTTP 端口 " + wanted + " 启动时已被占用，面板临时改用端口 " + p;
+                if (https && !httpsActive()) {
+                    msg += "；HTTPS 端口 " + snap.httpsPort() + " 同样不可用，已临时降级为仅 HTTP 访问";
+                }
+                msg += "（web.port 配置未改动，释放原端口后重启进程即恢复）";
+                Logs.warn(Logs.SYS, msg);
+                setLastError(msg);
+            } else if (!(https && !httpsActive())) {
+                // 完全按期望配置生效：清掉历史告警，避免设置页挂着已过期的降级/漂移提示
+                // （HTTPS 降级提示由 launch 内写入，此时保留）
+                setLastError("");
+            }
+            return;
+        }
+        throw new IllegalStateException("Web 服务启动失败，已尝试端口 " + candidates + ": "
+                + (last == null ? "无可用端口" : last.getMessage()), last);
+    }
+
+    /** 构建并启动一个 Web 实例（HTTP 连接器 + 可选 HTTPS 扩展连接器），绑定失败抛出异常 */
+    private static void launch(WebAccessConfig.Snapshot snap, Path webDir, boolean https,
+                               WebAccessConfig.CertInfo cert, int httpPort, boolean selfHeal) {
         Javalin created = Javalin.create(config -> {
             // 图标上传（multipart）需突破框架默认 1MB 请求体限制；业务层另有 2MB 上限并友好报错
             config.http.maxRequestSize = 8_000_000L;
-            // HTTPS：向 Jetty 追加 SSL 连接器（与 Javalin 默认 HTTP 连接器同属一个 Server，共享全部路由）
-            if (https) addHttpsConnector(config.jetty, snap.httpsPort(), cert);
 
             // 前端静态资源：外部目录（开发热更新）或 classpath 的 /web 目录映射到根路径
             config.staticFiles.add(sf -> {
@@ -224,22 +317,49 @@ public final class WebServer {
                 }
             }
 
-            // 安全入口面板入口：/entry 301 补全斜杠（保证相对资源解析到前缀下），
-            // /entry/ 返回首页，其余前缀路径手动分发静态资源（置于业务路由之后，避免抢占精确匹配）
+            // 安全入口面板入口：Javalin 将 /entry 与 /entry/ 视为同一路由，故只注册一个处理器按实际路径分流：
+            // 未带尾斜杠时 302 补全（保证页面内相对资源解析到前缀下），带尾斜杠返回首页；
+            // 其余前缀路径手动分发静态资源（置于业务路由之后，避免抢占精确匹配）
             if (entryOn) {
-                routes.get(prefix, ctx -> ctx.redirect(prefix + "/"));
-                routes.get(prefix + "/", ctx -> serveIndex(ctx, webDir));
-                routes.get(prefix + "/*", ctx -> servePrefixedStatic(ctx, webDir, snap.entry()));
+                routes.get(prefix, ctx -> {
+                    if (ctx.path().endsWith("/")) serveIndex(ctx, webDir);
+                    else ctx.redirect(prefix + "/");
+                });
+                routes.get(prefix + "/*", ctx -> servePrefixedStatic(ctx, webDir, prefix));
             }
         });
 
         // HTTP 连接器始终绑定（HTTPS 开启时用于跳转或并存访问）
-        created.start(snap.httpPort());
+        created.start(httpPort);
         app = created;
+        int actual = created.port();
+        boundPort = actual > 0 ? actual : httpPort;
 
-        StringBuilder addr = new StringBuilder("Web 服务已启动: http://localhost:").append(snap.httpPort());
-        if (!snap.entry().isEmpty()) addr.append('/').append(snap.entry()).append('/');
+        // HTTPS 连接器必须在 Javalin 建好默认 HTTP 连接器之后再追加：
+        // Javalin 仅在「Server 尚无任何连接器」时才按 start(port) 创建 HTTP 连接器，
+        // 若在 create 阶段先挂上 SSL 连接器，start(httpPort) 会被静默忽略，HTTP 入口彻底消失
+        boolean httpsMounted = true;
         if (https) {
+            try {
+                addHttpsConnector(created.jettyServer().server(), snap.httpsPort(), cert);
+            } catch (Exception e) {
+                if (!selfHeal) {
+                    stopQuietly(); // 运行期重启：绑定失败交由 restart() 回滚旧配置
+                    throw new IllegalStateException("挂载 HTTPS 连接器失败: " + e.getMessage(), e);
+                }
+                // 启动期：HTTPS 端口冲突不该拖垮整个面板，降级为仅 HTTP 访问并提示
+                httpsMounted = false;
+                activeCertTaskId = -1;
+                String msg = "HTTPS 端口 " + snap.httpsPort() + " 启动时已被占用，已临时降级为仅 HTTP 访问: "
+                        + e.getMessage();
+                Logs.error(Logs.SYS, msg);
+                setLastError(msg);
+            }
+        }
+
+        StringBuilder addr = new StringBuilder("Web 服务已启动: http://localhost:").append(boundPort);
+        if (!snap.entry().isEmpty()) addr.append('/').append(snap.entry()).append('/');
+        if (httpsMounted) {
             addr.append("（HTTPS: https://localhost:").append(snap.httpsPort());
             if (snap.httpsRedirect()) addr.append("，HTTP 强制跳转");
             addr.append("）");
@@ -254,12 +374,15 @@ public final class WebServer {
      * 进程内重启：停止旧实例后按数据库最新配置重建。
      * 新配置绑定失败（端口占用等）时自动回滚旧配置并重启，保证面板不失联；
      * 回滚提示写入 web.last_error 供设置页展示。
+     * <p>
+     * 此处不启用启动期的端口自愈：运行期改端口失败时用户需要确实的失败回音，
+     * 暗地改用其他端口反而会让用户以为新端口已生效。
      */
     public static synchronized void restart() {
         WebAccessConfig.Snapshot old = cfg;
         stopQuietly();
         try {
-            start();
+            startInternal(false);
             setLastError("");
             Logs.info(Logs.SYS, "Web 服务已按新访问配置重启完成");
         } catch (Exception e) {
@@ -268,7 +391,7 @@ public final class WebServer {
             try {
                 if (old != null) old.persist();
                 stopQuietly();
-                start();
+                startInternal(false);
             } catch (Exception e2) {
                 msg = "应用新访问配置失败且回滚异常，请检查端口占用后重启进程: " + e2.getMessage();
                 Logs.error(Logs.SYS, "回滚旧访问配置失败: " + e2);
@@ -299,27 +422,54 @@ public final class WebServer {
         }
     }
 
-    /** 向 Jetty 追加 HTTPS 连接器：SSL 上下文由已签发证书（PEM）构建 */
-    private static void addHttpsConnector(io.javalin.config.JettyConfig jetty, int httpsPort,
-                                          WebAccessConfig.CertInfo cert) {
-        jetty.modifyServer(server -> {
-            try {
-                SslContextFactory.Server sslFactory = new SslContextFactory.Server();
-                sslFactory.setSslContext(WebAccessConfig.buildSslContext(cert.certFile(), cert.keyFile()));
-                sslFactory.setIncludeProtocols("TLSv1.2", "TLSv1.3");
-                HttpConfiguration httpsConfig = new HttpConfiguration();
-                httpsConfig.addCustomizer(new SecureRequestCustomizer());
-                ServerConnector sslConnector = new ServerConnector(server,
-                        new SslConnectionFactory(sslFactory, HttpVersion.HTTP_1_1.asString()),
-                        new HttpConnectionFactory(httpsConfig));
-                sslConnector.setPort(httpsPort);
-                server.addConnector(sslConnector);
-                Logs.info(Logs.SYS, "HTTPS 连接器已挂载，端口: " + httpsPort
-                        + "，证书任务 #" + cert.taskId() + " " + cert.name());
-            } catch (Exception e) {
-                throw new IllegalStateException("初始化 HTTPS 失败: " + e.getMessage(), e);
-            }
-        });
+    /**
+     * 启动期候选端口：期望端口 → 向后连续 {@code server.port.autoFallback} 个端口 → 内核随机端口。
+     * 跳过 HTTPS 端口避免自撞；末尾的 0 由内核分配空闲端口，保证「面板可达」优先于「端口可预测」。
+     */
+    private static List<Integer> portCandidates(int wanted, int httpsPort) {
+        List<Integer> list = new ArrayList<>();
+        list.add(wanted);
+        int span = AppConfig.portFallbackSpan();
+        for (int i = 1; i <= span; i++) {
+            long p = (long) wanted + i;
+            if (p > 65535) break;
+            int port = (int) p;
+            if (port != httpsPort && !list.contains(port)) list.add(port);
+        }
+        list.add(0);
+        return list;
+    }
+
+    /**
+     * 预绑探测：指定端口能否建立监听（0 为内核分配，直接视为可用）。
+     * 仅作预筛以减少无谓的实例创建与异常噪声；探测与实际绑定之间仍有竞态窗口，
+     * 真正的冲突依旧由绑定异常兜底（循环下一个候选）。
+     */
+    private static boolean canBind(int port) {
+        if (port <= 0) return true;
+        try (ServerSocket probe = new ServerSocket()) {
+            probe.bind(new InetSocketAddress(port));
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** 向已启动的 Jetty Server 追加 HTTPS 连接器：SSL 上下文由已签发证书（PEM）构建 */
+    private static void addHttpsConnector(Server server, int httpsPort, WebAccessConfig.CertInfo cert) throws Exception {
+        SslContextFactory.Server sslFactory = new SslContextFactory.Server();
+        sslFactory.setSslContext(WebAccessConfig.buildSslContext(cert.certFile(), cert.keyFile()));
+        sslFactory.setIncludeProtocols("TLSv1.2", "TLSv1.3");
+        HttpConfiguration httpsConfig = new HttpConfiguration();
+        httpsConfig.addCustomizer(new SecureRequestCustomizer());
+        ServerConnector sslConnector = new ServerConnector(server,
+                new SslConnectionFactory(sslFactory, HttpVersion.HTTP_1_1.asString()),
+                new HttpConnectionFactory(httpsConfig));
+        sslConnector.setPort(httpsPort);
+        server.addConnector(sslConnector);
+        sslConnector.start(); // 立即绑定，端口冲突时在此抛出，由 restart() 回滚
+        Logs.info(Logs.SYS, "HTTPS 连接器已挂载，端口: " + httpsPort
+                + "，证书任务 #" + cert.taskId() + " " + cert.name());
     }
 
     /** 构造 HTTPS 跳转地址：同 host，端口替换为 HTTPS 端口，保留路径与查询参数 */
@@ -349,17 +499,27 @@ public final class WebServer {
     /**
      * 安全入口模式下的前缀化静态资源分发：/{入口}/xxx -> web 目录下 xxx。
      * 相对路径请求（style.css / js/app.js 等）会自动带上前缀到达此处；
-     * 拒绝 .. 目录穿越，根路径回退 index.html。
+     * 仅接受前缀下的相对路径（拒绝 .. 、绝对路径与盘符），空路径回退 index.html。
      */
-    private static void servePrefixedStatic(Context ctx, Path webDir, String entry) throws IOException {
+    private static void servePrefixedStatic(Context ctx, Path webDir, String prefix) throws IOException {
         String path = ctx.path();
-        String rel = path.length() > entry.length() + 1 ? path.substring(entry.length() + 1) : "index.html";
+        String rel = path.length() > prefix.length() + 1 ? path.substring(prefix.length() + 1) : "";
         if (rel.isEmpty() || rel.endsWith("/")) rel = rel + "index.html";
-        if (rel.contains("..")) {
+        if (rel.contains("..") || rel.startsWith("/") || rel.contains(":") || rel.contains("\\")) {
             ctx.status(404).result("404 Not Found");
             return;
         }
-        byte[] data = webDir != null ? readFile(webDir.resolve(rel)) : readResource("/web/" + rel);
+        byte[] data;
+        if (webDir != null) {
+            Path file = webDir.resolve(rel).normalize();
+            if (!file.startsWith(webDir)) {
+                ctx.status(404).result("404 Not Found");
+                return;
+            }
+            data = readFile(file);
+        } else {
+            data = readResource("/web/" + rel);
+        }
         if (data == null) {
             ctx.status(404).result("404 Not Found");
             return;

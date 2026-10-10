@@ -11,7 +11,6 @@ import com.nexhome.module.ddns.AliyunApiException;
 import com.nexhome.module.ddns.AliyunClient;
 import com.nexhome.module.provider.ProviderConfigService;
 import com.nexhome.web.Ctx;
-import com.nexhome.web.WebAccessConfig;
 import com.nexhome.web.WebServer;
 
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -285,7 +284,8 @@ public final class CertService {
             Database.setConfig("cert." + taskId + ".order", order.getLocation().toString());
 
             if ("HTTP01".equals(challengeType)) {
-                int httpPort = WebAccessConfig.httpPortQuiet();
+                // 以实际监听端口为准（启动期端口自愈后可能与配置值不同），否则转发提示会误导
+                int httpPort = WebServer.httpPort();
                 if (httpPort != 80) {
                     Logs.warn(Logs.CERT, "任务[" + name + "] 当前服务端口非 80，http-01 验证需保证 CA 能访问 80 端口" +
                             "（可配置路由器端口转发 80 -> " + httpPort + "）");

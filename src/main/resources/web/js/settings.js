@@ -48,10 +48,13 @@ async function renderSettings() {
         ${ws.lastError ? `<div class="tip" style="color:var(--red);margin-bottom:10px">⚠️ ${esc(ws.lastError)}</div>` : ''}
         <div class="tip" style="margin-bottom:12px">端口 / HTTPS / 安全入口保存后，内置 Web 服务将<b>自动重启</b>并应用新配置
           （绑定失败自动回滚，此处配置优先于 nexhome.properties）；重启后需重新登录。
-          开启安全入口后必须通过 <b>http://地址:端口/入口路径/</b> 访问面板，其余路径一律 404。</div>
+          开启安全入口后必须通过 <b>http://地址:端口/入口路径/</b> 访问面板，其余路径一律 404。
+          进程启动时若端口已被占用，会自动改用备选端口继续提供面板（实际端口与原因见上方提示），不会改写此处配置值。</div>
         <form id="accessForm" class="form-grid">
           <div class="field"><label>HTTP 端口 <b>*</b></label>
-            <input name="port" type="number" min="1" max="65535" required value="${ws.port ?? 8090}"></div>
+            <input name="port" type="number" min="1" max="65535" required value="${ws.port ?? 8090}">
+            ${ws.boundPort && ws.boundPort !== ws.port
+              ? `<div class="small" style="color:var(--red)">当前实际监听 ${esc(ws.boundPort)}（配置端口被占用，启动时已临时改用）</div>` : ''}</div>
           <div class="field"><label>HTTPS</label>
             <select name="httpsEnabled" onchange="accHttpsChanged(this.value)">
               <option value="0" ${!ws.httpsEnabled ? 'selected' : ''}>关闭</option>
@@ -71,7 +74,7 @@ async function renderSettings() {
             </select>
             <div class="small muted">自动适应已申请的证书：未指定时自动选用有效期最长的有效证书，续期后自动加载新证书。
               ${ws.activeCertTaskId > 0 ? `当前使用: <b>${esc(ws.activeCertName || ('#' + ws.activeCertTaskId))}</b>，有效期至 ${(ws.activeCertNotAfter || '').slice(0, 10) || '-'}` : ''}
-              ${ws.httpsEnabled && !ws.httpsActive ? ' <span style="color:var(--red)">（HTTPS 未生效，已降级为仅 HTTP，请检查证书）</span>' : ''}</div>
+              ${ws.httpsEnabled && !ws.httpsActive ? ' <span style="color:var(--red)">（HTTPS 未生效，已临时降级为仅 HTTP 访问，请检查证书文件或端口占用）</span>' : ''}</div>
           </div>
           <div class="field full"><label>安全入口路径（留空关闭）</label>
             <input name="entryPath" placeholder="如 my-secret-entry，4-64 位字母数字-_，访问时需带上 /路径/" value="${esc(ws.entryPath || '')}"></div>

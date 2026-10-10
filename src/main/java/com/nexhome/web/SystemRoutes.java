@@ -4,7 +4,6 @@ import com.google.gson.JsonObject;
 import com.nexhome.auth.AuthService;
 import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
-import com.nexhome.core.Tasks;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -75,7 +74,8 @@ public final class SystemRoutes {
             info.put("version", VERSION);
             info.put("javaVersion", System.getProperty("java.version"));
             info.put("os", System.getProperty("os.name") + " " + System.getProperty("os.arch"));
-            info.put("port", WebAccessConfig.httpPortQuiet());
+            // 实际监听端口（启动期可端口自愈，与配置值不一致时以此为准）
+            info.put("port", WebServer.httpPort());
             info.put("httpsEnabled", WebServer.httpsActive());
             info.put("uptimeSec", ManagementFactory.getRuntimeMXBean().getUptime() / 1000);
             info.put("usedMemoryMB", (rt.totalMemory() - rt.freeMemory()) / 1024 / 1024);
@@ -105,8 +105,8 @@ public final class SystemRoutes {
         WebServer.route("PUT", "/api/system/web-settings", ctx -> {
             WebAccessConfig.apply(ctx.body());
             Logs.info(Logs.SYS, "访问配置已更新，服务即将重启应用新配置");
-            // 延迟重启：确保本次响应送达客户端后再停服
-            Tasks.delay(1, WebServer::restart);
+            // 延迟重启：确保本次响应送达客户端后再停服（非守护线程承载，避免 JVM 随之退出）
+            WebServer.scheduleRestart(1);
             ctx.ok("已保存，服务正在以新配置重启");
         });
 

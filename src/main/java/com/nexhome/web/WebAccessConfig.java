@@ -42,7 +42,7 @@ public final class WebAccessConfig {
     public static final String KEY_HTTPS_REDIRECT = "web.https.redirect";
     public static final String KEY_HTTPS_CERT_TASK = "web.https.cert_task_id";
     public static final String KEY_ENTRY = "web.entry";
-    /** 最近一次应用新访问配置失败的回滚提示（设置页展示，成功后清空） */
+    /** 最近一次应用新访问配置失败的回滚提示，或启动期端口自愈/降级的告警（设置页展示，成功后清空） */
     public static final String KEY_LAST_ERROR = "web.last_error";
 
     private WebAccessConfig() {
@@ -208,6 +208,8 @@ public final class WebAccessConfig {
         Snapshot s = load();
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("port", s.httpPort());
+        // 实际监听的 HTTP 端口：启动期端口自愈（期望端口被占用）时与上面的配置值不一致
+        m.put("boundPort", WebServer.httpPort());
         m.put("httpsEnabled", s.httpsEnabled());
         m.put("httpsPort", s.httpsPort());
         m.put("httpsRedirect", s.httpsRedirect());

@@ -33,7 +33,9 @@ public final class AppConfig {
         if (!Files.exists(CONFIG_FILE)) {
             props.setProperty("server.port", "8090");
             try (OutputStream out = Files.newOutputStream(CONFIG_FILE)) {
-                props.store(out, "NexHome configuration. server.port: Web service port. server.web.dir: optional external web static dir.");
+                props.store(out, "NexHome configuration. server.port: Web service port."
+                        + " server.port.autoFallback: startup port self-healing span, 0 = random port only."
+                        + " server.web.dir: optional external web static dir (use forward slashes).");
             }
             return;
         }
@@ -48,6 +50,22 @@ public final class AppConfig {
             return Integer.parseInt(props.getProperty("server.port", "8090").trim());
         } catch (NumberFormatException e) {
             return 8090;
+        }
+    }
+
+    /**
+     * 启动期端口自愈跨度（配置项 {@code server.port.autoFallback}，默认 5）。
+     * <p>
+     * 进程启动时若期望端口被占用，向后依次探测 {@code 期望端口+1 .. 期望端口+跨度} 能否绑定，
+     * 全部不可用再由内核分配随机端口，保证面板可达、进程不退出（避免容器 restart 策略反复重启）。
+     * 配 0 表示关闭连续探测，直接回退随机端口。
+     */
+    public static int portFallbackSpan() {
+        try {
+            int v = Integer.parseInt(props.getProperty("server.port.autoFallback", "5").trim());
+            return v < 0 ? 5 : v;
+        } catch (NumberFormatException e) {
+            return 5;
         }
     }
 
