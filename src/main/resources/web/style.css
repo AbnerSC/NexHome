@@ -59,7 +59,8 @@ body {
 .login-card .small { margin-top: 14px; display: block; }
 
 /* ---------- 布局 ---------- */
-.layout { display: flex; min-height: 100vh; }
+/* 锁定视口高度：整页不滚动，滚动只发生在右侧 .page-body 内，左侧菜单保持固定 */
+.layout { display: flex; height: 100vh; overflow: hidden; }
 
 .sidebar {
     width: 210px;
@@ -68,6 +69,8 @@ body {
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
+    /* 菜单项超出视口时侧栏内部自行滚动，不撑破布局 */
+    overflow-y: auto;
 }
 
 .brand {
@@ -98,7 +101,7 @@ body {
 
 .sidebar-foot { padding: 12px 16px; border-top: 1px solid #1f2a3d; }
 
-.content { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.content { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 .topbar {
     background: var(--panel);
@@ -157,7 +160,7 @@ body {
 .metric-bar.warn i { background: var(--orange); }
 .metric-bar.err i { background: var(--red); }
 
-.page-body { padding: 20px 24px; flex: 1; }
+.page-body { padding: 20px 24px; flex: 1; overflow-y: auto; }
 
 /* ---------- 通用组件 ---------- */
 .btn {
@@ -572,7 +575,8 @@ th.docker-sort:hover { color: var(--primary); }
 }
 
 @media (max-width: 860px) {
-    .layout { flex-direction: column; }
+    /* 窄屏上下堆叠，恢复整页滚动 */
+    .layout { flex-direction: column; height: auto; min-height: 100vh; overflow: visible; }
     .topbar { flex-wrap: wrap; }
     /* 窄屏下监控条换行到顶栏下一行，避免挤压标题与按钮 */
     .sys-metrics { order: 3; width: 100%; justify-content: flex-start; margin: 10px 0 0; }
@@ -581,5 +585,6 @@ th.docker-sort:hover { color: var(--primary); }
     .nav-item { white-space: nowrap; margin: 0 2px; }
     .brand { border: none; white-space: nowrap; }
     .sidebar-foot { display: none; }
+    .page-body { overflow-y: visible; }
     .form-grid { grid-template-columns: 1fr; }
 }

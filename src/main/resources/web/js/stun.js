@@ -126,25 +126,37 @@ window.stunForm = async (id) => {
           <label>Webhook 同步（可选，穿透成功 / 映射地址变化时将结果推送到以下地址，支持多个）</label>
           <div id="stunWhList"></div>
           <div style="margin-top:6px"><button type="button" class="btn small" onclick="stunWhAdd()">＋ 添加 Webhook</button></div>
-          <div class="small muted" style="margin-top:10px;line-height:1.8;padding:10px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0">
-            <b>可用占位符（在 URL、请求头、参数值、JSON 请求体中引用）：</b><br>
-            <code>\${event}</code> —— 事件类型（如 stun.punched / stun.mapped_changed）<br>
-            <code>\${id}</code> —— 任务 ID（如 1）<br>
-            <code>\${name}</code> —— 任务名称（如 Local-https）<br>
-            <code>\${protocol}</code> —— 穿透协议（UDP 或 TCP）<br>
-            <code>\${target_ip}</code> —— 内网目标 IP（如 172.17.1.213）<br>
-            <code>\${target_port}</code> —— 内网目标端口（如 443）<br>
-            <code>\${bind_port}</code> —— 本地绑定端口（0=随机）<br>
-            <code>\${stun_host}</code> —— STUN 服务器地址（如 stun.nextcloud.com）<br>
-            <code>\${stun_port}</code> —— STUN 服务器端口（如 3478）<br>
-            <code>\${peer_addr}</code> —— 对端公网地址（如 203.0.113.5:8080）<br>
-            <code>\${mapped_addr}</code> —— 穿透后外网映射地址（如 1.2.3.4:5678）<br>
-            <code>\${mapped_ip}</code> —— 穿透后外网 IP（如 1.2.3.4）<br>
-            <code>\${mapped_port}</code> —— 穿透后外网端口（如 5678）<br>
-            <code>\${nat_type}</code> —— NAT 类型（如 受限锥形、对称型）<br>
-            <code>\${punched_at}</code> —— 穿透成功时间（如 2026-10-08 13:50:49）<br>
-            <code>\${check_result}</code> —— 自测结果（如 OK(TCP映射保活存活...)）<br>
-            <code>\${status}</code> —— 任务状态（RUNNING / STOPPED / ERROR）
+          <div class="small muted" style="margin-top:10px;padding:10px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0">
+            <b>可用占位符（在 URL、请求头、参数值、JSON 请求体中引用）：</b>
+            <div style="display:flex;gap:16px;align-items:flex-start;margin-top:6px">
+              <table style="flex:1">
+                <thead><tr><th style="width:38%">占位符</th><th>说明</th></tr></thead>
+                <tbody>
+                  <tr><td><code>\${event}</code></td><td>事件类型（stun.punched / stun.mapped_changed）</td></tr>
+                  <tr><td><code>\${id}</code></td><td>任务 ID（如 1）</td></tr>
+                  <tr><td><code>\${name}</code></td><td>任务名称（如 Local-https）</td></tr>
+                  <tr><td><code>\${protocol}</code></td><td>穿透协议（UDP / TCP）</td></tr>
+                  <tr><td><code>\${target_ip}</code></td><td>内网目标 IP（如 172.17.1.213）</td></tr>
+                  <tr><td><code>\${target_port}</code></td><td>内网目标端口（如 443）</td></tr>
+                  <tr><td><code>\${bind_port}</code></td><td>本地绑定端口（0=随机）</td></tr>
+                  <tr><td><code>\${stun_host}</code></td><td>STUN 服务器地址（如 stun.nextcloud.com）</td></tr>
+                  <tr><td><code>\${stun_port}</code></td><td>STUN 服务器端口（如 3478）</td></tr>
+                  <tr><td><code>\${peer_addr}</code></td><td>对端公网地址（如 203.0.113.5:8080）</td></tr>
+                </tbody>
+              </table>
+              <table style="flex:1">
+                <thead><tr><th style="width:38%">占位符</th><th>说明</th></tr></thead>
+                <tbody>
+                  <tr><td><code>\${mapped_addr}</code></td><td>穿透后外网映射地址（如 1.2.3.4:5678）</td></tr>
+                  <tr><td><code>\${mapped_ip}</code></td><td>穿透后外网 IP（如 1.2.3.4）</td></tr>
+                  <tr><td><code>\${mapped_port}</code></td><td>穿透后外网端口（如 5678）</td></tr>
+                  <tr><td><code>\${nat_type}</code></td><td>NAT 类型（如 受限锥形、对称型）</td></tr>
+                  <tr><td><code>\${punched_at}</code></td><td>穿透成功时间（如 2026-10-08 13:50:49）</td></tr>
+                  <tr><td><code>\${check_result}</code></td><td>自测结果（如 OK(TCP映射保活存活...)）</td></tr>
+                  <tr><td><code>\${status}</code></td><td>任务状态（RUNNING / STOPPED / ERROR）</td></tr>
+                </tbody>
+              </table>
+            </div>
           </div>
           <div class="small muted" style="margin-top:6px;line-height:1.7">
             每条可选 <b>GET / POST</b>：<b>POST</b> 支持填写自定义 JSON 请求体（占位符会被替换为实际值）；<b>GET</b> 将结果字段+自定义参数拼为查询串。
