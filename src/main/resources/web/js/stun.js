@@ -5,9 +5,9 @@ async function renderStun() {
     const tasks = await api('GET', '/api/stun/tasks');
     const rows = tasks.map(t => `
       <tr>
-        <td>${esc(t.name)} <span class="small muted">${esc(t.protocol)}</span></td>
+        <td>${esc(t.name)} <div class="small muted">${esc(t.protocol)}</div></td>
         <td>${esc(t.target_ip)}:${t.target_port}${t.peer_addr ? `<div class="small muted">对端: ${esc(t.peer_addr)}</div>` : ''}</td>
-        <td class="small">${esc(t.stun_host)}:${t.stun_port}${t.upnp_enabled === 0 ? '<div class="muted">UPnP 已关闭</div>' : ''}</td>
+        <td class="small">${esc(t.stun_host)}:${t.stun_port}${t.upnp_enabled === 0 ? '<div class="small muted">UPnP 已关闭</div>' : ''}</td>
         <td>${t.status === 'RUNNING' ? badge('运行中', 'ok') : t.status === 'ERROR' ? badge('错误', 'err') : badge('已停止', 'gray')}</td>
         <td>${t.nat_type ? `<div class="small">${esc(t.nat_type)}</div>` : '-'}</td>
         <td>${t.mapped_addr ? badge(t.mapped_addr, 'info') : '-'}</td>
@@ -43,14 +43,14 @@ async function renderStun() {
       <div class="panel"><table>
         <thead>
             <tr>
-                <th style="width: 8%">任务</th>
-                <th style="width: 10%">内网目标</th>
-                <th style="width: 12%">STUN服务器</th>
-                <th style="width: 7%">状态</th>
-                <th style="width: 7%">NAT类型</th>
-                <th style="width: 13%">外网映射地址</th>
-                <th style="width: 13%">穿透成功时间</th>
-                <th style="width: 9%">流量</th>
+                <th style="width: 110px">任务</th>
+                <th style="width: 160px">内网目标</th>
+                <th style="width: 180px">STUN服务器</th>
+                <th style="width: 110px">状态</th>
+                <th style="width: 130px">NAT类型</th>
+                <th style="width: 160px">外网映射地址</th>
+                <th style="width: 150px">穿透成功时间</th>
+                <th style="width: 100px">流量</th>
                 <th>可用性自测</th>
                 <th style="width: 320px">操作</th>
             </tr>
