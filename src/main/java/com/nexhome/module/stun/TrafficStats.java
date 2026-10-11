@@ -88,9 +88,9 @@ public final class TrafficStats {
         Map<String, Long> pend = pendingFor(taskId);
         Map<String, Object> res = new LinkedHashMap<>();
         res.put("total", totalBytes(taskId));
-        res.put("hours", series(taskId, "HOUR", pend, 48));
-        res.put("days", series(taskId, "DAY", pend, 60));
-        res.put("months", series(taskId, "MONTH", pend, 24));
+        res.put("hours", series(taskId, "HOUR", pend, 24));
+        res.put("days", series(taskId, "DAY", pend, 30));
+        res.put("months", series(taskId, "MONTH", pend, 12));
         return res;
     }
 

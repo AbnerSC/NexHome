@@ -380,21 +380,169 @@ function fmtTrafficBytes(b) {
     return b.toFixed(b >= 100 ? 0 : b >= 10 ? 1 : 2) + ' ' + u[i];
 }
 
-/** 单任务流量明细弹窗：总量 + 按小时/天/月归档 */
+/* ---------- 流量折线图（纯 SVG 实现，无第三方依赖） ---------- */
+
+/** 三个维度的主题色与标题（小时蓝 / 天紫 / 月绿，避免同色单调） */
+const TF_THEMES = {
+    hour: { color: '#0ea5e9', label: '按小时（近 24 小时）' },
+    day: { color: '#8b5cf6', label: '按天（近 30 天）' },
+    month: { color: '#10b981', label: '按月（近 12 月）' },
+};
+
+const tfPad = n => String(n).padStart(2, '0');
+const tfDateKey = d => `${d.getFullYear()}-${tfPad(d.getMonth() + 1)}-${tfPad(d.getDate())}`;
+
+/**
+ * 倒序明细序列 → 升序完整时间窗（缺失时段补 0）：
+ * 折线图横轴连续、空档归零，比仅画有流量的孤立点更直观。
+ */
+function tfFillWindow(list, span, keyOf) {
+    const m = new Map((list || []).map(x => [x.key, x.bytes]));
+    const out = [];
+    for (let i = span - 1; i >= 0; i--) {
+        const k = keyOf(i);
+        out.push({ key: k, bytes: m.get(k) || 0 });
+    }
+    return out;
+}
+
+/** 取“好看”的纵轴上限（1/2/2.5/5 × 10^n），网格刻度避免零碎小数 */
+function tfNiceMax(v) {
+    const exp = Math.pow(10, Math.floor(Math.log10(Math.max(v, 1))));
+    for (const f of [1, 2, 2.5, 5, 10]) if (v <= f * exp * 1.0001) return f * exp;
+    return 10 * exp;
+}
+
+/**
+ * 渲染单个流量折线图：Catmull-Rom 平滑曲线 + 主题色渐变面积 + 虚线网格
+ * + 悬浮十字引导线与最近点吸附气泡，最新时段末端常亮高亮点。
+ */
+function tfRenderChart(host, name, points, theme, tickFmt, tipFmt) {
+    const W = Math.max(host.clientWidth || 0, 240), H = 170;
+    const P = { l: 46, r: 12, t: 14, b: 22 };
+    const iw = W - P.l - P.r, ih = H - P.t - P.b;
+    const peak = Math.max(...points.map(p => p.bytes));
+    const nice = tfNiceMax(peak);
+    const c = theme.color;
+    const X = i => P.l + (points.length < 2 ? iw / 2 : (iw * i) / (points.length - 1));
+    const Y = v => P.t + ih - (Math.max(v, 0) / nice) * ih;
+    const pts = points.map((p, i) => ({ x: +X(i).toFixed(1), y: +Y(p.bytes).toFixed(1), key: p.key, bytes: p.bytes }));
+
+    // Catmull-Rom 转三次贝塞尔（控制点钳制在绘图区内，防平滑越界穿过基线）
+    const line = (() => {
+        if (!pts.length) return '';
+        if (pts.length === 1) return `M${pts[0].x},${pts[0].y}`;
+        const cl = y => Math.min(P.t + ih, Math.max(P.t, y));
+        let d = `M${pts[0].x},${pts[0].y}`;
+        for (let i = 0; i < pts.length - 1; i++) {
+            const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+            d += `C${(p1.x + (p2.x - p0.x) / 6).toFixed(1)},${cl(p1.y + (p2.y - p0.y) / 6).toFixed(1)} `
+                + `${(p2.x - (p3.x - p1.x) / 6).toFixed(1)},${cl(p2.y - (p3.y - p1.y) / 6).toFixed(1)} `
+                + `${p2.x},${p2.y}`;
+        }
+        return d;
+    })();
+    const area = pts.length > 1 ? `${line}L${pts[pts.length - 1].x},${P.t + ih}L${pts[0].x},${P.t + ih}Z` : '';
+
+    // 网格 + 纵轴刻度（基线实线，其余虚线）
+    let grid = '';
+    for (let g = 0; g <= 4; g++) {
+        const y = (P.t + ih - (ih * g) / 4).toFixed(1);
+        grid += `<line x1="${P.l}" y1="${y}" x2="${W - P.r}" y2="${y}" stroke="${g ? '#eef2f8' : '#e2e8f0'}" stroke-dasharray="${g ? '3 4' : ''}"/>`
+            + `<text x="${P.l - 7}" y="${+y + 3.5}" text-anchor="end" font-size="9.5" fill="#94a3b8">${fmtTrafficBytes((nice * g) / 4)}</text>`;
+    }
+    // 横轴刻度（最多 ~6 个，末尾必显）
+    let ticks = '';
+    const step = Math.max(1, Math.ceil(pts.length / 5));
+    pts.forEach((p, i) => {
+        if (i % step && i !== pts.length - 1) return;
+        ticks += `<text x="${p.x}" y="${H - 6}" text-anchor="middle" font-size="9.5" fill="#94a3b8">${esc(tickFmt(p.key))}</text>`;
+    });
+
+    const last = pts[pts.length - 1];
+    host.innerHTML = `
+      <svg width="${W}" height="${H}" style="display:block;overflow:visible">
+        <defs>
+          <linearGradient id="tfa-${name}" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="${c}" stop-opacity=".30"/>
+            <stop offset=".65" stop-color="${c}" stop-opacity=".07"/>
+            <stop offset="1" stop-color="${c}" stop-opacity="0"/>
+          </linearGradient>
+          <filter id="tfg-${name}" x="-30%" y="-30%" width="160%" height="160%">
+            <feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="${c}" flood-opacity=".35"/>
+          </filter>
+        </defs>
+        ${grid}${ticks}
+        ${area ? `<path d="${area}" fill="url(#tfa-${name})"/>` : ''}
+        <path d="${line}" fill="none" stroke="${c}" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" filter="url(#tfg-${name})"/>
+        ${peak > 0 && last ? `<circle cx="${last.x}" cy="${last.y}" r="3.4" fill="#fff" stroke="${c}" stroke-width="2.2"/>` : ''}
+        ${peak === 0 ? `<text x="${P.l + iw / 2}" y="${P.t + ih / 2}" text-anchor="middle" font-size="11" fill="#b7c1cf">该时段暂无流量</text>` : ''}
+        <line id="tf-guide-${name}" y1="${P.t}" y2="${P.t + ih}" stroke="${c}" stroke-width="1.2" stroke-dasharray="4 3" opacity="0"/>
+        <circle id="tf-cursor-${name}" r="4.2" fill="${c}" stroke="#fff" stroke-width="1.6" opacity="0"/>
+        <rect id="tf-hit-${name}" x="${P.l}" y="${P.t}" width="${iw}" height="${ih}" fill="transparent" style="cursor:crosshair"/>
+      </svg>
+      <div class="tf-tip" id="tf-tip-${name}" style="display:none"></div>`;
+
+    // 悬浮交互：最近点吸附 + 十字引导线 + 深色气泡提示
+    const svg = host.querySelector('svg');
+    const guide = host.querySelector(`#tf-guide-${name}`);
+    const cursor = host.querySelector(`#tf-cursor-${name}`);
+    const tip = host.querySelector(`#tf-tip-${name}`);
+    const move = e => {
+        const mx = e.clientX - svg.getBoundingClientRect().left;
+        let best = 0, dist = Infinity;
+        pts.forEach((p, i) => { const dd = Math.abs(p.x - mx); if (dd < dist) { dist = dd; best = i; } });
+        const p = pts[best];
+        guide.setAttribute('x1', p.x); guide.setAttribute('x2', p.x); guide.setAttribute('opacity', '.55');
+        cursor.setAttribute('cx', p.x); cursor.setAttribute('cy', p.y); cursor.setAttribute('opacity', '1');
+        tip.style.display = '';
+        tip.innerHTML = `${esc(tipFmt(p.key))}<br><b>${fmtTrafficBytes(p.bytes)}</b>`;
+        const half = tip.offsetWidth / 2 || 40; // 靠近左右边缘时钳制，防气泡溢出
+        tip.style.left = Math.max(half + 2, Math.min(W - half - 2, p.x)) + 'px';
+        tip.style.top = Math.max(p.y - 10, 30) + 'px';
+    };
+    const leave = () => {
+        guide.setAttribute('opacity', '0'); cursor.setAttribute('opacity', '0'); tip.style.display = 'none';
+    };
+    const hit = host.querySelector(`#tf-hit-${name}`);
+    hit.addEventListener('mousemove', move);
+    hit.addEventListener('mouseleave', leave);
+}
+
+/** 单任务流量明细弹窗：总量 + 按小时/天/月三张折线图 */
 window.stunTraffic = async id => {
     try {
         const d = await api('GET', `/api/stun/tasks/${id}/traffic`);
-        const tbl = (list, label) => `
-          <table><thead><tr><th>${label}</th><th style="text-align:right">流量</th></tr></thead>
-          <tbody>${(list && list.length)
-            ? list.map(x => `<tr><td class="small">${esc(x.key)}</td><td style="text-align:right">${fmtTrafficBytes(x.bytes)}</td></tr>`).join('')
-            : '<tr><td colspan="2" class="muted">暂无数据</td></tr>'}</tbody></table>`;
+        const now = new Date();
+        const hours = tfFillWindow(d.hours, 24, i => {
+            const t = new Date(now); t.setHours(t.getHours() - i);
+            return tfDateKey(t) + ' ' + tfPad(t.getHours());
+        });
+        const days = tfFillWindow(d.days, 30, i => {
+            const t = new Date(now); t.setDate(t.getDate() - i);
+            return tfDateKey(t);
+        });
+        const months = tfFillWindow(d.months, 12, i => {
+            const t = new Date(now); t.setMonth(t.getMonth() - i);
+            return `${t.getFullYear()}-${tfPad(t.getMonth() + 1)}`;
+        });
+        const data = { hour: hours, day: days, month: months };
+        const peak = k => fmtTrafficBytes(Math.max(...data[k].map(p => p.bytes), 0));
         modal('流量统计', `
           <div class="tip">总流量：<b>${fmtTrafficBytes(d.total)}</b>（连接重建不清零，统计含双向转发字节；按小时/天/月归档，数值为已落库 + 实时增量）</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:12px">
-            <div><h4>按小时（近 48）</h4>${tbl(d.hours, '时段')}</div>
-            <div><h4>按天（近 60）</h4>${tbl(d.days, '日期')}</div>
-            <div><h4>按月（近 24）</h4>${tbl(d.months, '月份')}</div>
+          <div class="tf-grid">
+            ${['hour', 'day', 'month'].map(k => `
+              <div class="tf-card">
+                <div class="tf-head"><span class="tf-dot" style="background:${TF_THEMES[k].color};box-shadow:0 0 0 3px ${TF_THEMES[k].color}22"></span>${TF_THEMES[k].label}
+                  <span class="tf-peak">峰值 ${peak(k)}</span></div>
+                <div class="tf-body" id="tf-chart-${k}"></div>
+              </div>`).join('')}
           </div>`, 'wide');
+        tfRenderChart($('#tf-chart-hour'), 'hour', hours, TF_THEMES.hour,
+            k => k.slice(11) + '时', k => k + '时');
+        tfRenderChart($('#tf-chart-day'), 'day', days, TF_THEMES.day,
+            k => k.slice(5), k => k);
+        tfRenderChart($('#tf-chart-month'), 'month', months, TF_THEMES.month,
+            k => k.slice(5) + '月', k => k.replace('-', '年') + '月');
     } catch (e) { toast(e.message, 'err'); }
 };
