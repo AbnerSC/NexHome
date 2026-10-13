@@ -79,3 +79,7 @@ docker compose up -d
    ② 受限锥形需填写「对端公网地址」由本端主动打洞，或在对端配合下互打；③ 确认主机防火墙已放行监听端口（Windows：允许 Java 通过专用/公用网络的入站规则）。
 6. **Docker 模块提示未连接**：容器部署需 `-v /var/run/docker.sock:/var/run/docker.sock` 挂载；
    报权限错误（Permission denied）说明容器内用户无 socket 读写权限；远程 Docker 检查 `DOCKER_HOST` 与网络连通性。
+
+## 四、参与开发
+1. 启动入口：`src/main/java/com/nexhome/NexHomeApp.java`
+2. 登录密码：`123456789012`

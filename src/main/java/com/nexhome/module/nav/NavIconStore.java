@@ -8,7 +8,10 @@ import com.nexhome.web.Ctx;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -83,6 +86,35 @@ public final class NavIconStore {
         } catch (Exception e) {
             Logs.warn(Logs.NAV, "删除本地图标失败 " + iconUrl + ": " + e.getMessage());
         }
+    }
+
+    /** 图片管理：目录内全部图片的元数据（相对 URL / 字节大小 / 修改时间毫秒），按修改时间倒序 */
+    public static List<Map<String, Object>> list() throws IOException {
+        if (!Files.isDirectory(DIR)) return List.of();
+        List<Map<String, Object>> out = new ArrayList<>();
+        try (var stream = Files.list(DIR)) {
+            for (Path p : stream.toList()) {
+                if (!Files.isRegularFile(p)) continue;
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("url", URL_PREFIX + p.getFileName());
+                m.put("size", Files.size(p));
+                m.put("mtime", Files.getLastModifiedTime(p).toMillis());
+                out.add(m);
+            }
+        }
+        out.sort((a, b) -> Long.compare((Long) b.get("mtime"), (Long) a.get("mtime")));
+        return out;
+    }
+
+    /** 图片管理手动删除：删除指定图片文件，返回是否实际删除（引用校验由 NavService 负责） */
+    public static boolean delete(String file) throws IOException {
+        if (file == null || !NAME.matcher(file).matches()) throw new IllegalArgumentException("图片不存在: " + file);
+        return Files.deleteIfExists(DIR.resolve(file));
+    }
+
+    /** 扩展名 -> Content-Type（图片展示路由共用），未知扩展回退二进制流 */
+    public static String typeOf(String name) {
+        return TYPES.getOrDefault(extOf(name), "application/octet-stream");
     }
 
     /** 启动维护：清理目录中未被任何导航条目引用的残留文件（如上传后取消表单遗留） */

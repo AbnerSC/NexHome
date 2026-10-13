@@ -38,7 +38,6 @@ async function renderSettings() {
           <tr><th style="width:120px">版本</th><td>${esc(info.version || '')}</td></tr>
           <tr><th>Java 版本</th><td>${esc(info.javaVersion || '')}</td></tr>
           <tr><th>操作系统</th><td>${esc(info.os || '')}</td></tr>
-          <tr><th>服务端口</th><td>${info.port ?? ''}${info.httpsEnabled ? '（HTTPS 已启用，需从新端口访问）' : '（可在下方「访问与安全设置」中修改）'}</td></tr>
           <tr><th>运行时长</th><td>${Math.floor((info.uptimeSec || 0) / 3600)} 小时 ${Math.floor((info.uptimeSec || 0) % 3600 / 60)} 分钟</td></tr>
           <tr><th>内存占用</th><td>${metrics.memUsedMB != null ? `${fmtMB(metrics.memUsedMB)} / ${fmtMB(metrics.memTotalMB)}（${memPct}%）` : ''}</td></tr>
         </table>
@@ -49,7 +48,7 @@ async function renderSettings() {
         <div class="tip" style="margin-bottom:12px">端口 / HTTPS / 安全入口保存后，内置 Web 服务将<b>自动重启</b>并应用新配置
           （绑定失败自动回滚，此处配置优先于 nexhome.properties）；重启后需重新登录。
           开启安全入口后必须通过 <b>http://地址:端口/入口路径/</b> 访问面板，其余路径一律 404。
-          进程启动时若端口已被占用，会自动改用备选端口继续提供面板（实际端口与原因见上方提示），不会改写此处配置值。</div>
+          进程启动时若端口已被占用，会自动改用备选端口继续提供面板（实际端口与原因见 HTTP 端口下方红字提示），不会改写此处配置值。</div>
         <form id="accessForm" class="form-grid">
           <div class="field"><label>HTTP 端口 <b>*</b></label>
             <input name="port" type="number" min="1" max="65535" required value="${ws.port ?? 8090}">
@@ -78,7 +77,11 @@ async function renderSettings() {
           </div>
           <div class="field full"><label>安全入口路径（留空关闭）</label>
             <input name="entryPath" placeholder="如 my-secret-entry，4-64 位字母数字-_，访问时需带上 /路径/" value="${esc(ws.entryPath || '')}"></div>
-          <div class="form-foot full" style="margin-top:6px"><button class="btn primary">保存并应用</button></div>
+          <div class="form-foot full" style="margin-top:6px" id="accEditFoot">
+            <button type="button" class="btn" onclick="accSetEditing(false)">取消</button>
+            <button class="btn primary">保存并应用</button></div>
+          <div class="form-foot full" style="margin-top:6px" id="accViewFoot">
+            <button type="button" class="btn primary" onclick="accSetEditing(true)">编辑</button></div>
         </form>
       </div>
       <div class="panel">
@@ -116,6 +119,17 @@ async function renderSettings() {
             showLogin();
         } catch (err) { toast(err.message, 'err'); }
     });
+
+    // 访问与安全设置：默认只读查看，主动点击「编辑」后才可修改与保存
+    window.accSetEditing = on => {
+        // 取消编辑：重新渲染恢复服务端当前配置与只读状态
+        if (!on) { renderSettings(); return; }
+        $('#accessForm').querySelectorAll('input,select').forEach(el => { el.disabled = false; });
+        $('#accEditFoot').classList.remove('hidden');
+        $('#accViewFoot').classList.add('hidden');
+    };
+    $('#accessForm').querySelectorAll('input,select').forEach(el => { el.disabled = true; });
+    $('#accEditFoot').classList.add('hidden');
 
     // HTTPS 相关字段随开关显示/隐藏
     window.accHttpsChanged = v => {
