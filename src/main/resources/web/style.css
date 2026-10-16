@@ -491,7 +491,8 @@ td .badge { white-space: normal; word-break: break-all; }
 
 /* 操作列：图标按钮成组，紧凑且悬停有语义提示（title） */
 .ops { display: flex; gap: 6px; align-items: center; }
-.btn.icon { width: 30px; padding: 4px 0; justify-content: center; font-size: 14px; line-height: 1; }
+.btn.icon { width: 30px; height: 28px; padding: 0; align-items: center; justify-content: center; font-size: 14px; line-height: 1; }
+.btn.icon.invisible { visibility: hidden; pointer-events: none; }
 
 th, td {
     text-align: left;

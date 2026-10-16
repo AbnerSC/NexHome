@@ -28,9 +28,9 @@ async function refreshStunRows() {
             ? `<button class="btn small icon danger" title="停止" onclick="stunCmd(${t.id},'stop')">⏸</button>`
             : `<button class="btn small icon success" title="启动" onclick="stunCmd(${t.id},'start')">▶</button>`}
           <button class="btn small icon" title="探测 NAT 类型" onclick="stunCmd(${t.id},'test')">📡</button>
-          ${t.status === 'RUNNING' ? `<button class="btn small icon" title="可达性自测" onclick="stunCmd(${t.id},'verify')">🔎</button>` : ''}
-          ${t.esa_sync_enabled === 1 ? `<button class="btn small icon" title="ESA 同步" onclick="stunEsaSync(${t.id})">🌐</button>` : ''}
-          ${t.notify_enabled === 1 ? `<button class="btn small icon" title="通知测试" onclick="stunNotifyTest(${t.id})">🔔</button>` : ''}
+          <button class="btn small icon${t.status === 'RUNNING' ? '' : ' invisible'}" title="可达性自测" onclick="stunCmd(${t.id},'verify')">🔎</button>
+          <button class="btn small icon${t.esa_sync_enabled === 1 ? '' : ' invisible'}" title="ESA 同步" onclick="stunEsaSync(${t.id})">🌐</button>
+          <button class="btn small icon${t.notify_enabled === 1 ? '' : ' invisible'}" title="通知测试" onclick="stunNotifyTest(${t.id})">🔔</button>
           <button class="btn small icon" title="流量统计" onclick="stunTraffic(${t.id})">📊</button>
           <button class="btn small icon" title="编辑" onclick="stunForm(${t.id})">✏️</button>
           <button class="btn small icon danger" title="删除" onclick="stunDelete(${t.id})">🗑️</button>
