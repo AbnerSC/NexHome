@@ -464,6 +464,20 @@ body::after {
     box-shadow: inset 0 0 20px rgba(56, 189, 248, .06);
 }
 
+/* 全局链接：深色主题下浏览器默认色（-webkit-link 偏暗的蓝）在提示条等浅字背景上对比度不足，
+   统一为霓虹青并带 hover 发光；visited 一并覆盖，避免访问后被浏览器染成暗紫 */
+a, .tip a {
+    color: #7dd3fc;
+    text-decoration-color: rgba(125, 211, 252, .45);
+    text-underline-offset: 2px;
+}
+a:visited, .tip a:visited { color: #7dd3fc; }
+a:hover, .tip a:hover {
+    color: #67e8f9;
+    text-decoration: underline;
+    text-shadow: var(--glow-cyan);
+}
+
 /* ---------- 表格 ---------- */
 /* 固定布局：列宽以表头声明的 width 为准，剩余空间分给未声明宽度的列 */
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
