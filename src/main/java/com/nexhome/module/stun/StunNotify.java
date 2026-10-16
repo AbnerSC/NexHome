@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * STUN 穿透结果通知：穿透成功 / 外网映射地址变化时，把结果按任务勾选的渠道投递到
+ * STUN 穿透结果通知：穿透成功 / 外网映射地址变化 / 可用性自测确认失效（FAIL）时，把结果按任务勾选的渠道投递到
  * <b>统一告警通知中心</b>（渠道在「告警通知」页集中维护，任务只选择用哪些渠道，可多选）。
  * <p>
  * 配置存于 {@code stun_task}：{@code notify_enabled}（开关）、{@code notify_channels}
@@ -20,6 +20,8 @@ import java.util.Map;
  * 触发点与 {@link StunWebhook}、{@link StunEsaSync} 完全一致（{@link StunRunner} 的映射地址
  * 落库联动），事件标识为 {@code stun.punched} / {@code stun.mapped_changed}（手动试发为
  * {@code stun.notify_test}），可在通知渠道的 Webhook 模板中以 {@code ${event}} 引用。
+ * 此外，周期巡检自测首次确认通道失效（FAIL）时额外推送 {@code stun.verify_failed} 告警（仅通知中心，
+ * 不触发 webhook/ESA）：按失效边沿触发，恢复后再次失效才会重新告警，避免连续失败周期刷屏。
  * 投递在 {@link NotifyService} 的独立线程串行执行，
  * 渠道被删除或停用时跳过并记日志，<b>不影响穿透与保活</b>；每次投递写入 {@code notify_log}，
  * 可在「告警通知」页的最近发送记录中查看结果。
@@ -30,6 +32,8 @@ final class StunNotify {
     private static final String EVENT_CHANGED = "stun.mapped_changed";
     /** 手动试发事件（验证渠道勾选是否可用，结果同样落 notify_log） */
     private static final String EVENT_TEST = "stun.notify_test";
+    /** 可用性自测失败事件（巡检确认通道失效 FAIL 时推送告警） */
+    static final String EVENT_VERIFY_FAILED = "stun.verify_failed";
 
     private StunNotify() {
     }
@@ -63,6 +67,7 @@ final class StunNotify {
 
     private static String title(String event, String taskName) {
         if (EVENT_CHANGED.equals(event)) return "穿透映射地址变化：" + taskName;
+        if (EVENT_VERIFY_FAILED.equals(event)) return "穿透通道自测失败：" + taskName;
         if (EVENT_TEST.equals(event)) return "穿透通知测试：" + taskName;
         return "穿透成功：" + taskName;
     }
@@ -81,9 +86,13 @@ final class StunNotify {
         if (!punchedAt.isBlank()) sb.append("穿透时间: ").append(punchedAt).append('\n');
         sb.append("事件: ").append(switch (event) {
             case EVENT_CHANGED -> "外网映射地址已变更，后续外网访问请以此地址为准";
+            case EVENT_VERIFY_FAILED -> "可用性自测发现穿透通道不可用（FAIL），保活链路已触发重建，请检查网络或上层 NAT/防火墙";
             case EVENT_TEST -> "这是一条测试通知，渠道勾选与投递链路均正常";
             default -> "首次穿透成功";
-        }).append('\n').append("时间: ").append(Database.now());
+        }).append('\n');
+        String detail = str(task, "verify_detail");
+        if (!detail.isBlank()) sb.append("自测结果: ").append(detail).append('\n');
+        sb.append("时间: ").append(Database.now());
         return sb.toString();
     }
 

@@ -42,7 +42,7 @@ async function renderStun() {
         穿透成功后系统自动自测一次（映射保活 + 公网入站可达），可在操作列点「自测」手动复测。
         启用 <b>ESA 同步</b>后，穿透成功与映射地址变化时会自动把映射 IP 写入 ESA 解析记录、映射端口写入回源 HTTPS 端口，
         可在操作列点「ESA」手动补一次。
-        启用 <b>通知推送</b>后，同样的时机按任务勾选的渠道（在「告警通知」页集中维护，可多选）发送通知，
+        启用 <b>通知推送</b>后，穿透成功、映射地址变化以及<b>可用性自测确认失效（FAIL）</b>时，按任务勾选的渠道（在「告警通知」页集中维护，可多选）发送通知，
         发送记录见「告警通知」页。
       </div>
       <div class="toolbar"><div class="spacer"></div>
@@ -54,13 +54,13 @@ async function renderStun() {
                 <th style="width: 100px">任务</th>
                 <th style="width: 150px">内网目标</th>
                 <th style="width: 150px">STUN服务器</th>
-                <th style="width: 80px">状态</th>
+                <th style="width: 100px">状态</th>
                 <th style="width: 120px">NAT类型</th>
-                <th style="width: 160px">外网映射地址</th>
-                <th style="width: 140px">穿透成功时间</th>
-                <th style="width: 80px">流量</th>
-                <th style="width: 120px">ESA 同步</th>
-                <th style="width: 90px">通知推送</th>
+                <th style="width: 180px">外网映射地址</th>
+                <th style="width: 145px">穿透成功时间</th>
+                <th style="width: 90px">流量</th>
+                <th style="width: 145px">ESA 同步</th>
+                <th style="width: 110px">通知推送</th>
                 <th style="width: 190px">可用性自测</th>
                 <th style="width: 310px">操作</th>
             </tr>
@@ -132,7 +132,7 @@ window.stunEsaSync = async id => {
           ${r.mapped_addr ? `（映射地址 ${esc(r.mapped_addr)}）` : ''}</p>
           <div class="panel" style="margin-top:10px"><table>
             <thead><tr><th style="width:80px">类型</th><th>名称</th><th style="width:180px">变更</th>
-              <th style="width:70px">状态</th><th>说明</th></tr></thead>
+              <th style="width:100px">状态</th><th>说明</th></tr></thead>
             <tbody>${items || '<tr><td colspan="5" class="muted">无可同步项</td></tr>'}</tbody>
           </table></div>
           <p class="muted small" style="margin-top:10px">本功能只更新已勾选的解析记录与回源规则，不会新增或删除云端配置。</p>`, 'wide');
@@ -315,7 +315,7 @@ window.stunForm = async (id) => {
                   <tr><td><code>\${mapped_port}</code></td><td>穿透后外网端口（如 5678）</td></tr>
                   <tr><td><code>\${nat_type}</code></td><td>NAT 类型（如 受限锥形、对称型）</td></tr>
                   <tr><td><code>\${punched_at}</code></td><td>穿透成功时间（如 2026-10-08 13:50:49）</td></tr>
-                  <tr><td><code>\${check_result}</code></td><td>自测结果（如 OK(TCP映射保活存活...)）</td></tr>
+                  <tr><td><code>\${check_result}</code></td><td>自测结果（OK / FAIL / 重建中）</td></tr>
                   <tr><td><code>\${status}</code></td><td>任务状态（RUNNING / STOPPED / ERROR）</td></tr>
                 </tbody>
               </table>
@@ -328,7 +328,7 @@ window.stunForm = async (id) => {
             推送失败仅记日志，不影响穿透。</div></div>
         <div class="field full form-section">
           <label>通知中心推送 <span class="sec-opt">可选</span></label>
-          <div class="sec-desc">穿透成功 / 映射地址变化时，按勾选渠道发送通知，支持多个。</div>
+          <div class="sec-desc">穿透成功 / 映射地址变化 / 可用性自测失效（FAIL）时，按勾选渠道发送通知，支持多个。</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
             <select name="notify_enabled" style="width:150px" onchange="stunNotifyToggle(this.value)">
               <option value="false" ${t.notify_enabled === 1 ? '' : 'selected'}>停用</option>

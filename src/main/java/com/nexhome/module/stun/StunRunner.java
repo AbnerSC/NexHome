@@ -996,6 +996,21 @@ final class StunRunner {
         }
     }
 
+    /**
+     * 巡检自测确认通道失效（FAIL）时推送告警通知（仅通知中心，不触发 webhook/ESA）。
+     * 未启用通知或未勾选渠道时由 {@link StunNotify#trigger} 静默跳过；detail 为自测括号内完整原因。
+     */
+    private void notifyVerifyFailed(String detail) {
+        try {
+            Map<String, Object> row = Database.queryOne("SELECT * FROM stun_task WHERE id=?", id);
+            if (row == null) return;
+            if (detail != null && !detail.isBlank()) row.put("verify_detail", detail);
+            StunNotify.trigger(row, StunNotify.EVENT_VERIFY_FAILED);
+        } catch (Exception e) {
+            Logs.warn(Logs.STUN, "任务[" + name + "] 自测失败告警通知推送异常: " + e.getMessage());
+        }
+    }
+
     /** 接受映射地址真实变更：更新穿透成功时间并记日志（地址（端口）变化即重新穿透） */
     private void acceptMappedChange(String mapped, long nowMs) throws SQLException {
         punchedMapped = mapped;
@@ -1173,9 +1188,13 @@ final class StunRunner {
             }
         }
         String time = Database.now();
-        Database.update("UPDATE stun_task SET check_time=?, check_result=? WHERE id=?", time, result, id);
+        // 展示/落库只保留核心结论（OK / FAIL / 重建中），去掉括号内明细；完整明细仍写入日志便于排查
+        int paren = result.indexOf('(');
+        String shown = paren > 0 ? result.substring(0, paren) : result;
+        Database.update("UPDATE stun_task SET check_time=?, check_result=? WHERE id=?", time, shown, id);
         Logs.info(Logs.STUN, "任务[" + name + "] 可用性自测: " + result + "，映射地址: " + mapped);
-        return Map.of("time", time, "result", result);
+        // detail 保留括号内完整明细，供巡检确认失效时推送告警通知引用（result 为前端展示的简化结论）
+        return Map.of("time", time, "result", shown, "detail", result);
     }
 
     /** UDP 自测：向全部候选 STUN 服务器发绑定请求，接收线程在超时前收到响应（lastMappedAt 前进）即保活存活 */
@@ -1475,7 +1494,8 @@ final class StunRunner {
                 refreshTcpLink();
                 return;
             }
-            String result = str(verifyChannel(), "result");
+            Map<String, Object> check = verifyChannel();
+            String result = str(check, "result");
             if (result.startsWith("重建中")) {
                 return; // 弹跳重建异步进行中：本轮跳过，重建完成后下轮自测复验，不计失败
             }
@@ -1496,6 +1516,8 @@ final class StunRunner {
             // 自测失败=保活链路失效：链路重建已在自测内部触发（零监听中断优先），
             // 保活调度每周期持续重试，无需额外丢弃端口重建
             watchFails++;
+            // 首次确认失效（0→1）即推送告警通知，后续连续失败周期不重复打扰；恢复后 watchFails 归零，再次失效会重新告警
+            if (watchFails == 1) notifyVerifyFailed(str(check, "detail"));
             Logs.warn(Logs.STUN, "任务[" + name + "] 巡检自测未通过(" + result + ")，已触发链路重建"
                     + "(连续第 " + watchFails + " 次)，保活调度将持续重试)");
         } catch (Exception e) {
