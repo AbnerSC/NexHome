@@ -28,7 +28,7 @@ async function renderLogs() {
         <span class="muted small">共 ${total} 条</span>
       </div>
       <div class="panel"><table>
-        <thead><tr><th style="width:150px">时间</th><th style="width:90px">模块</th><th style="width:70px">级别</th><th>内容</th></tr></thead>
+        <thead><tr><th style="width:150px">时间</th><th style="width:110px">模块</th><th style="width:70px">级别</th><th>内容</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="4" class="muted">暂无日志</td></tr>'}</tbody>
       </table>
       <div class="pager">

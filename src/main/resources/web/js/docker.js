@@ -72,10 +72,69 @@ function dockerToolbar(ov) {
         <button class="btn ${dockerTab === 'containers' ? 'primary' : ''}" onclick="dockerSwitchTab('containers')">📦 容器列表</button>
         <button class="btn ${dockerTab === 'compose' ? 'primary' : ''}" onclick="dockerSwitchTab('compose')">🧩 Compose 项目</button>
         <div class="spacer"></div>
+        <button class="btn danger" onclick="dockerPrunePrompt()">🧹 资源清理</button>
         <span class="muted small">连接：${esc(ov.host)}</span>
         <button class="btn" onclick="renderDocker()">刷新</button>
       </div>`;
 }
+
+/** 容器行内操作按钮：运行中提供「停止/重启/日志」，停止态提供「启动/日志」 */
+function dockerActions(c) {
+    const id = esc(c.id);
+    if (c.state === 'running') {
+        return `<button class="btn small danger" onclick="dockerAction('${id}','stop')">停止</button>`
+            + `<button class="btn small" onclick="dockerAction('${id}','restart')">重启</button>`
+            + `<button class="btn small" onclick="dockerLogs('${id}')">日志</button>`;
+    }
+    return `<button class="btn small success" onclick="dockerAction('${id}','start')">启动</button>`
+        + `<button class="btn small" onclick="dockerLogs('${id}')">日志</button>`;
+}
+
+/** 容器起停/重启：宿主特权操作，二次确认后执行 */
+window.dockerAction = async (id, action) => {
+    const label = { start: '启动', stop: '停止', restart: '重启' }[action];
+    if (!(await confirmBox({
+        title: label + '容器',
+        message: `该操作将直接作用于宿主机上的容器（${label}）。\n\n确定继续？`,
+        confirmText: label, danger: action !== 'start'
+    }))) return;
+    try {
+        const msg = await api('POST', `/api/docker/containers/${id}/${action}`);
+        toast(msg);
+        setTimeout(renderDocker, 1200);
+    } catch (e) { toast(e.message, 'err'); }
+};
+
+/** 容器日志：拉取最近 N 行并以等宽滚动块展示 */
+window.dockerLogs = async (id, tail = 200) => {
+    let r;
+    try { r = await api('GET', `/api/docker/containers/${id}/logs?tail=${tail}`); }
+    catch (e) { toast(e.message, 'err'); return; }
+    const body = r.logs && r.logs.trim()
+        ? `<div class="docker-mono docker-yaml">${esc(r.logs)}</div>`
+        : '<div class="tip">该容器暂无日志输出。</div>';
+    modal(`容器日志 · 最近 ${r.tail} 行`, `
+      <div class="toolbar" style="margin-bottom:8px">
+        <span class="muted small">仅展示最近日志，加载过多可能影响性能</span>
+        <div class="spacer"></div>
+        ${[100, 200, 500, 1000, 2000].map(n => `<button class="btn small ${n === r.tail ? 'primary' : ''}" onclick="dockerLogs('${esc(id)}',${n})">${n}</button>`).join('')}
+      </div>${body}`, 'wide');
+};
+
+/** 资源清理：镜像 / 已停止容器，二次确认（danger）后执行并展示回收空间 */
+window.dockerPrunePrompt = async () => {
+    if (!(await confirmBox({
+        title: 'Docker 资源清理',
+        message: '将清理宿主机的「悬空镜像」和「已停止容器」（不可恢复）。\n\n确定继续？',
+        confirmText: '清理镜像', cancelText: '取消', danger: true
+    }))) return;
+    try {
+        const img = await api('POST', '/api/docker/prune', { kind: 'images' });
+        const cnt = await api('POST', '/api/docker/prune', { kind: 'containers' });
+        toast(`清理完成：删除镜像 ${img.deletedCount} 个、容器 ${cnt.deletedCount} 个，回收 ${fmtBytes((img.spaceReclaimed || 0) + (cnt.spaceReclaimed || 0))}`);
+        renderDocker();
+    } catch (e) { toast(e.message, 'err'); }
+};
 
 /* ---------------- 容器列表 ---------------- */
 
@@ -154,7 +213,10 @@ function paintDockerContainers() {
         <td>${c.composeProject
             ? badge(esc(c.composeProject) + (c.composeService ? '/' + esc(c.composeService) : ''), 'info')
             : '<span class="muted">-</span>'}</td>
-        <td><button class="btn small" onclick="dockerDetail('${esc(c.id)}')">详情</button></td>
+        <td><div style="display:flex;gap:5px;flex-wrap:wrap">
+          ${dockerActions(c)}
+          <button class="btn small" onclick="dockerDetail('${esc(c.id)}')">详情</button>
+        </div></td>
       </tr>`;
     }).join('');
     $('#pageBody').innerHTML = `
@@ -169,7 +231,7 @@ function paintDockerContainers() {
           ${dockerSortTh('sizeRw', '磁盘(可写)', 'width:90px')}
           ${dockerSortTh('ip', '容器 IP', 'width:120px')}
           <th>暴露端口</th><th style="width:150px">Compose</th>
-          <th style="width:70px">操作</th>
+          <th style="width:220px">操作</th>
         </tr></thead>
         <tbody>${rows || '<tr><td colspan="9" class="muted">暂无容器</td></tr>'}</tbody>
       </table></div>`;
@@ -207,6 +269,10 @@ window.dockerDetail = async id => {
     }).join('');
 
     modal(`容器详情 · ${d.name || ''}`, `
+      <div class="toolbar" style="margin-bottom:10px">${dockerActions(d)}
+        <div class="spacer"></div>
+        <span class="muted small">起停/重启/清理为宿主机特权操作，请谨慎使用</span>
+      </div>
       <table class="docker-kv">
         ${kv('容器 ID', `<span class="docker-mono">${esc(d.id)}</span>`)}
         ${kv('镜像', esc(d.image))}

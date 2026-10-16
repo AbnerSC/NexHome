@@ -18,6 +18,9 @@ async function renderSettings() {
     let ws = {}, certTasks = [];
     try { ws = await api('GET', '/api/system/web-settings'); } catch (e) { /* ignore */ }
     try { certTasks = (await api('GET', '/api/cert/tasks')).filter(t => t.status === 'ISSUED'); } catch (e) { /* ignore */ }
+    // 登录安全配置（失败锁定阈值 / 锁定时长）
+    let sec = { maxFails: 3, lockMinutes: 30 };
+    try { sec = await api('GET', '/api/auth/security'); } catch (e) { /* ignore */ }
     const memPct = metrics.memTotalMB > 0 ? Math.round(metrics.memUsedMB * 100 / metrics.memTotalMB) : 0;
     const typeName = code => types[code] || code;
     const cfgRows = configs.map(c => `
@@ -104,6 +107,21 @@ async function renderSettings() {
           <div class="field" style="width: 200px"><label>确认新密码 <b>*</b></label><input name="confirm" type="password" required></div>
           <div class="field" style="align-self:end; margin-top: 10px"><button class="btn primary">修改密码</button></div>
         </form>
+      </div>
+      <div class="panel">
+        <h3 style="font-size:14px;margin-bottom:12px">登录安全设置</h3>
+        <div class="tip" style="margin-bottom:12px">连续登录失败达到最大次数后，该来源 IP 将被临时锁定指定时长；成功登录后计数清零。
+          失败计数为进程内存态，重启后归零。系统强制<b>单点登录</b>：新设备登录会自动注销之前的会话。</div>
+        <form id="secForm" class="form-grid">
+          <div class="field"><label>最大失败次数（1~100）</label><input name="maxFails" type="number" min="1" max="100" required value="${sec.maxFails ?? 3}"></div>
+          <div class="field"><label>锁定时长（分钟，1~1440）</label><input name="lockMinutes" type="number" min="1" max="1440" required value="${sec.lockMinutes ?? 30}"></div>
+          <div class="form-foot full"><button class="btn primary">保存安全设置</button></div>
+        </form>
+      </div>
+      <div class="panel">
+        <h3 style="font-size:14px;margin-bottom:12px">配置备份</h3>
+        <div class="tip" style="margin-bottom:12px">导出当前数据库（所有任务与配置）的一致性快照文件，用于离线备份与迁移；本期仅提供下载导出，不提供导入恢复。</div>
+        <button class="btn primary" onclick="downloadBackup()">⬇ 下载配置备份</button>
       </div>`;
     $('#pwdForm').addEventListener('submit', async e => {
         e.preventDefault();
@@ -117,6 +135,18 @@ async function renderSettings() {
             TOKEN = '';
             localStorage.removeItem('nx_token');
             showLogin();
+        } catch (err) { toast(err.message, 'err'); }
+    });
+
+    // 登录安全设置保存
+    $('#secForm').addEventListener('submit', async e => {
+        e.preventDefault();
+        const f = new FormData(e.target);
+        try {
+            const msg = await api('PUT', '/api/auth/security', {
+                maxFails: Number(f.get('maxFails')), lockMinutes: Number(f.get('lockMinutes'))
+            });
+            toast(msg);
         } catch (err) { toast(err.message, 'err'); }
     });
 
@@ -227,5 +257,25 @@ window.provDelete = async id => {
     try {
         const msg = await api('DELETE', '/api/provider/configs/' + id);
         toast(msg); renderSettings();
+    } catch (e) { toast(e.message, 'err'); }
+};
+
+/** 配置备份下载：文件流接口需携带 X-Token 手动 fetch，从 Content-Disposition 取文件名后触发浏览器下载 */
+window.downloadBackup = async () => {
+    toast('正在生成备份…');
+    try {
+        const resp = await fetch(API_BASE + '/api/system/backup', { headers: { 'X-Token': TOKEN } });
+        if (resp.status === 401) { showLogin(); toast('登录已过期，请重新登录', 'err'); return; }
+        if (!resp.ok) { toast('备份失败 ' + resp.status, 'err'); return; }
+        const cd = resp.headers.get('Content-Disposition') || '';
+        const m = /filename="?([^";]+)"?/.exec(cd);
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = m ? decodeURIComponent(m[1]) : 'nexhome-backup.db';
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        toast('配置备份已下载');
     } catch (e) { toast(e.message, 'err'); }
 };

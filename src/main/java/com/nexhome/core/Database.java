@@ -53,6 +53,19 @@ public final class Database {
         }
     }
 
+    /**
+     * 用 SQLite {@code VACUUM INTO} 生成数据库一致性快照到指定文件，用于配置备份。
+     * <p>相比直接复制 {@code nexhome.db}：VACUUM INTO 会一并落盘 WAL 中未合并的提交数据且
+     * 无需暂停连接，产出的单文件备份完整、无碎片。</p>
+     *
+     * @param filePath 目标文件绝对路径（须不存在，SQLite 拒绝覆盖）；使用正斜杠分隔
+     */
+    public static synchronized void backupTo(String filePath) throws SQLException {
+        try (Statement st = conn.createStatement()) {
+            st.execute("VACUUM INTO '" + filePath.replace("'", "''") + "'");
+        }
+    }
+
     /** 执行建表脚本：按分号拆分逐条执行（忽略注释行与空语句） */
     public static synchronized void execScript(String script) throws SQLException {
         try (Statement st = conn.createStatement()) {

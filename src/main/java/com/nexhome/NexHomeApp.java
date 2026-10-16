@@ -8,7 +8,9 @@ import com.nexhome.core.Tasks;
 import com.nexhome.module.cert.CertService;
 import com.nexhome.module.ddns.DdnsService;
 import com.nexhome.module.docker.DockerService;
+import com.nexhome.module.monitor.MonitorService;
 import com.nexhome.module.nav.NavService;
+import com.nexhome.module.notify.NotifyService;
 import com.nexhome.module.provider.ProviderConfigService;
 import com.nexhome.module.stun.StunServerService;
 import com.nexhome.module.stun.StunService;
@@ -53,6 +55,8 @@ public final class NexHomeApp {
             CertService.registerRoutes();
             NavService.registerRoutes();
             DockerService.registerRoutes();
+            NotifyService.registerRoutes();
+            MonitorService.registerRoutes();
 
             // 5. 启动业务调度与后台任务
             ProviderConfigService.init(); // 服务商凭证配置旧库迁移
@@ -62,6 +66,8 @@ public final class NexHomeApp {
             StunService.init();      // 恢复运行中的穿透任务
             TrafficStats.init();     // 启动穿透流量统计周期落库
             NavService.init();       // 清理孤儿导航图标文件
+            NotifyService.init();    // 通知日志定期清理
+            MonitorService.init();   // 恢复可用性监控定时探测
 
             // 6. 启动内置 Web 服务器（前端静态资源 + API 同端口，HTTPS/安全入口见系统设置）
             WebServer.start();

@@ -13,7 +13,7 @@ const API_BASE = (() => {
     const p = location.pathname.replace(/\/+$/, '');
     return p.length > 1 ? p : '';
 })();
-let currentPage = 'home';
+let currentPage = 'dashboard';
 let refreshTimer = null;          // 状态实时刷新定时器
 
 /* ---------------- 基础工具 ---------------- */
@@ -172,7 +172,7 @@ function showLogin() {
 async function enterApp() {
     $('#loginView').classList.add('hidden');
     $('#mainView').classList.remove('hidden');
-    setPage('home');
+    setPage('dashboard');
     loadSysInfo();
     startSysMetrics();
 }
@@ -265,12 +265,14 @@ function stopSysMetrics() {
 /* ---------------- 页面路由 ---------------- */
 
 const PAGE_TITLES = {
-    home: '网站导航', ddns: 'DDNS 域名同步', stun: 'STUN 端口穿透',
+    dashboard: '总览', home: '网站导航', ddns: 'DDNS 域名同步', stun: 'STUN 端口穿透',
+    monitor: '可用性监控', notify: '通知中心',
     wol: 'WOL 网络唤醒', cert: 'SSL 证书管理', docker: 'Docker 容器', logs: '操作日志', settings: '系统设置'
 };
 
 const RENDER = {
-    home: renderHome, ddns: renderDdns, stun: renderStun,
+    dashboard: renderDashboard, home: renderHome, ddns: renderDdns, stun: renderStun,
+    monitor: renderMonitor, notify: renderNotify,
     wol: renderWol, cert: renderCert, docker: renderDocker, logs: renderLogs, settings: renderSettings
 };
 

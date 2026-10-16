@@ -6,7 +6,7 @@
 
     <groupId>com.nexhome</groupId>
     <artifactId>nexhome</artifactId>
-    <version>1.1.2</version>
+    <version>1.2.0</version>
     <packaging>jar</packaging>
 
     <name>NexHome</name>
@@ -64,6 +64,18 @@
             <artifactId>slf4j-jdk14</artifactId>
             <version>2.0.18</version>
         </dependency>
+        <!-- 告警通知中心 email 渠道：Jakarta Mail API + Eclipse Angus 实现（SMTP/STARTTLS/SMTPS）。
+             angus-mail 传递引入 jakarta.mail-api 与 angus-activation，此处显式声明锁定版本。 -->
+        <dependency>
+            <groupId>jakarta.mail</groupId>
+            <artifactId>jakarta.mail-api</artifactId>
+            <version>2.1.5</version>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.angus</groupId>
+            <artifactId>angus-mail</artifactId>
+            <version>2.0.5</version>
+        </dependency>
     </dependencies>
 
     <build>
@@ -114,6 +126,14 @@
                                 </transformer>
                                 <!-- 合并 acme4j / slf4j 的 ServiceLoader 描述文件 -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <!-- Jakarta Mail 的协议能力按 META-INF/mailcap 发现（SMTP/STARTTLS 等），
+                                     多 jar 各带一份 mailcap，必须追加合并而非相互覆盖，否则运行时找不到 provider。 -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                                    <resource>META-INF/mailcap</resource>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                                    <resource>META-INF/defaultjsse_providers</resource>
+                                </transformer>
                             </transformers>
                             <filters>
                                 <filter>

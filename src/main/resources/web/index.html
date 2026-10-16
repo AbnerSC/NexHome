@@ -27,9 +27,12 @@
     <aside class="sidebar">
         <div class="brand"><span class="brand-logo">🏠</span> NexHome 联枢</div>
         <nav>
-            <a class="nav-item active" data-page="home">🧭 网站导航</a>
+            <a class="nav-item active" data-page="dashboard">📊 总览</a>
+            <a class="nav-item" data-page="home">🧭 网站导航</a>
             <a class="nav-item" data-page="ddns">🌐 DDNS 同步</a>
             <a class="nav-item" data-page="stun">🔓 STUN 穿透</a>
+            <a class="nav-item" data-page="monitor">📡 可用性监控</a>
+            <a class="nav-item" data-page="notify">🔔 通知中心</a>
             <a class="nav-item" data-page="wol">⚡ WOL 唤醒</a>
             <a class="nav-item" data-page="cert">🔐 SSL 证书</a>
             <a class="nav-item" data-page="docker">🐳 Docker 容器</a>
@@ -42,7 +45,7 @@
     </aside>
     <main class="content">
         <header class="topbar">
-            <h2 id="pageTitle">网站导航</h2>
+            <h2 id="pageTitle">总览</h2>
             <!-- 顶栏系统资源监控（CPU / 内存 / 虚拟内存），由 app.js 每 5 秒刷新 -->
             <div id="sysMetrics" class="sys-metrics"></div>
             <div class="topbar-actions">
@@ -78,9 +81,12 @@
 <div id="toast" class="toast hidden"></div>
 
 <!-- 各菜单模块脚本，须先于 app.js 加载 -->
+<script src="js/dashboard.js"></script>
 <script src="js/home.js"></script>
 <script src="js/ddns.js"></script>
 <script src="js/stun.js"></script>
+<script src="js/monitor.js"></script>
+<script src="js/notify.js"></script>
 <script src="js/wol.js"></script>
 <script src="js/cert.js"></script>
 <script src="js/docker.js"></script>

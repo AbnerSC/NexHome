@@ -55,9 +55,74 @@ public final class DockerService {
         WebServer.route("GET", "/api/docker/compose", ctx -> ctx.ok(compose()));
         WebServer.route("GET", "/api/docker/compose/file", ctx ->
                 ctx.ok(composeFile(ctx.query("project"))));
+        // ---------- 写操作（容器起停/重启、日志、清理）：宿主特权操作，谨慎使用 ----------
+        WebServer.route("POST", "/api/docker/containers/{id}/start", ctx -> {
+            String id = checkId(ctx.param("id"));
+            CLIENT.post("/containers/" + id + "/start");
+            Logs.info(Logs.DOCKER, "启动容器: " + id);
+            ctx.ok("容器已启动");
+        });
+        WebServer.route("POST", "/api/docker/containers/{id}/stop", ctx -> {
+            String id = checkId(ctx.param("id"));
+            CLIENT.post("/containers/" + id + "/stop?t=10");
+            Logs.info(Logs.DOCKER, "停止容器: " + id);
+            ctx.ok("容器已停止");
+        });
+        WebServer.route("POST", "/api/docker/containers/{id}/restart", ctx -> {
+            String id = checkId(ctx.param("id"));
+            CLIENT.post("/containers/" + id + "/restart?t=10");
+            Logs.info(Logs.DOCKER, "重启容器: " + id);
+            ctx.ok("容器已重启");
+        });
+        WebServer.route("GET", "/api/docker/containers/{id}/logs", ctx -> {
+            String id = checkId(ctx.param("id"));
+            int tail = 200;
+            try {
+                String q = ctx.query("tail");
+                if (q != null && !q.isBlank()) tail = Math.min(Math.max(Integer.parseInt(q), 1), 5000);
+            } catch (NumberFormatException ignored) {
+            }
+            ctx.ok(Map.of("tail", tail, "logs", CLIENT.logs(
+                    "/containers/" + id + "/logs?stdout=1&stderr=1&tail=" + tail)));
+        });
+        WebServer.route("POST", "/api/docker/prune", ctx -> ctx.ok(prune(ctx.body())));
     }
 
     // ---------- 数据组装 ----------
+
+    /** 仪表盘专用轻量概览：仅取连接状态与容器计数（不含逐容器 stats/df，避免拖慢聚合接口） */
+    public static Map<String, Object> dashboardSummary() {
+        Map<String, Object> r = new LinkedHashMap<>();
+        try {
+            JsonObject i = JsonUtils.parse(CLIENT.get("/info"));
+            r.put("connected", true);
+            r.put("containers", optLong(i, "Containers"));
+            r.put("running", optLong(i, "ContainersRunning"));
+            r.put("stopped", optLong(i, "ContainersStopped"));
+            r.put("images", optLong(i, "Images"));
+        } catch (Exception e) {
+            r.put("connected", false);
+        }
+        return r;
+    }
+
+    /** 资源清理：kind=images（悬空/未用镜像）或 containers（已停止容器），返回 Daemon 回收结果 */
+    private static Map<String, Object> prune(JsonObject b) throws IOException {
+        String kind = JsonUtils.str(b, "kind").trim().toLowerCase();
+        if (!"images".equals(kind) && !"containers".equals(kind)) {
+            throw new IllegalArgumentException("不支持的清理类型: " + kind + "（仅 images / containers）");
+        }
+        String resp = CLIENT.post("/" + kind + "/prune");
+        JsonObject r = JsonUtils.parse(resp);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("kind", kind);
+        out.put("spaceReclaimed", optLong(r, "SpaceReclaimed"));
+        JsonArray deleted = optArray(r, kind.equals("images") ? "ImagesDeleted" : "ContainersDeleted");
+        out.put("deletedCount", deleted.size());
+        Logs.info(Logs.DOCKER, "Docker 清理(" + kind + ")：删除 " + deleted.size()
+                + " 项，回收 " + (optLong(r, "SpaceReclaimed") / 1024 / 1024) + " MB");
+        return out;
+    }
 
     /** Docker 整体概况：连接状态 + 版本 + 容器/镜像统计 + 磁盘占用 */
     private static Map<String, Object> overview() {

@@ -23,6 +23,8 @@ public final class Logs {
     public static final String NAV  = "NAV";
     public static final String DOCKER = "DOCKER";
     public static final String PROVIDER = "PROVIDER";
+    public static final String NOTIFY = "NOTIFY";
+    public static final String MONITOR = "MONITOR";
 
     private Logs() {
     }

@@ -168,3 +168,53 @@ CREATE TABLE IF NOT EXISTS nav_item (
     enabled     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+-- 告警通知渠道表（统一通知中心：Webhook / Email / 钉钉，各模块事件按启用渠道扇出）
+-- type   : WEBHOOK（通用 HTTP 回调） / EMAIL（SMTP 邮件） / DINGTALK（钉钉自定义机器人）
+-- config : 按渠道类型的 JSON 配置（详见 NotifyService 类注释），含敏感信息如邮箱密码、加签密钥
+CREATE TABLE IF NOT EXISTS notify_channel (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    config     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+-- 通知发送记录表（每个渠道每次投递一条，供审计与前端展示，随 Logs 策略清理）
+-- result : OK(HTTP xxx) / OK / FAIL(...)
+CREATE TABLE IF NOT EXISTS notify_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    time       TEXT NOT NULL,
+    channel_id INTEGER,
+    channel    TEXT,
+    event      TEXT,
+    title      TEXT,
+    result     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notify_log_id ON notify_log (id DESC);
+
+-- 服务/端口可用性监控任务表
+-- type   : HTTP / HTTPS（URL 探测，按状态码/关键字判定） / TCP（连接探测） / UDP（尽力探测）
+-- target : HTTP(S) 为完整 URL；TCP/UDP 为 host:port
+-- last_status : UP / DOWN / UNKNOWN（UNKNOWN 表示尚未探测）
+-- fail_count  : 连续失败次数（用于阈值告警与去抖），恢复成功后清零
+CREATE TABLE IF NOT EXISTS monitor_task (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    name               TEXT NOT NULL,
+    type               TEXT NOT NULL DEFAULT 'HTTP',
+    target             TEXT NOT NULL,
+    method             TEXT NOT NULL DEFAULT 'GET',
+    keyword            TEXT,
+    expect_status      INTEGER NOT NULL DEFAULT 200,
+    interval_sec       INTEGER NOT NULL DEFAULT 60,
+    timeout_sec        INTEGER NOT NULL DEFAULT 10,
+    fail_threshold     INTEGER NOT NULL DEFAULT 1,
+    enabled            INTEGER NOT NULL DEFAULT 1,
+    notify_on_recovery INTEGER NOT NULL DEFAULT 1,
+    last_status        TEXT NOT NULL DEFAULT 'UNKNOWN',
+    last_check         TEXT,
+    last_latency_ms    INTEGER,
+    fail_count         INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);

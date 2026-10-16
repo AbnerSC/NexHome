@@ -2,6 +2,7 @@ package com.nexhome.web;
 
 import com.google.gson.JsonObject;
 import com.nexhome.auth.AuthService;
+import com.nexhome.core.Database;
 import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
 
@@ -10,6 +11,10 @@ import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import com.sun.management.OperatingSystemMXBean;
 import java.net.InetAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -31,7 +36,14 @@ public final class SystemRoutes {
             JsonObject b = ctx.body();
             String password = JsonUtils.str(b, "password");
             if (password.isBlank()) throw new IllegalArgumentException("密码不能为空");
-            String token = AuthService.login(password);
+            String ip = ctx.clientIp();
+            long remain = AuthService.lockRemainingMs(ip);
+            if (remain > 0) {
+                long minutes = (remain + 59_999) / 60_000;
+                ctx.fail(429, "尝试过于频繁，已临时锁定，请约 " + minutes + " 分钟后再试");
+                return;
+            }
+            String token = AuthService.login(password, ip);
             if (token == null) {
                 ctx.fail(401, "密码错误");
                 return;
@@ -51,12 +63,24 @@ public final class SystemRoutes {
             JsonObject b = ctx.body();
             String oldPwd = JsonUtils.str(b, "old_password");
             String newPwd = JsonUtils.str(b, "new_password");
-            if (newPwd.length() < 4) throw new IllegalArgumentException("新密码长度至少 4 位");
+            if (newPwd.length() < 12) throw new IllegalArgumentException("新密码长度至少 12 位");
             if (!AuthService.changePassword(oldPwd, newPwd)) {
                 ctx.fail(400, "原密码不正确");
                 return;
             }
             ctx.ok("密码已修改，请重新登录");
+        });
+
+        // ---------- 登录安全配置（失败锁定阈值与时长） ----------
+        WebServer.route("GET", "/api/auth/security", ctx -> ctx.ok(Map.of(
+                "maxFails", AuthService.getMaxFails(),
+                "lockMinutes", AuthService.getLockMinutes())));
+        WebServer.route("PUT", "/api/auth/security", ctx -> {
+            JsonObject b = ctx.body();
+            AuthService.setSecurity(JsonUtils.num(b, "maxFails", 3), JsonUtils.num(b, "lockMinutes", 30));
+            Logs.info(Logs.AUTH, "登录安全参数已更新：最大失败 " + AuthService.getMaxFails()
+                    + " 次，锁定 " + AuthService.getLockMinutes() + " 分钟");
+            ctx.ok("已保存登录安全设置");
         });
 
         // ---------- 全局日志（分页 + 模块过滤） ----------
@@ -109,6 +133,28 @@ public final class SystemRoutes {
             WebServer.scheduleRestart(1);
             ctx.ok("已保存，服务正在以新配置重启");
         });
+
+        // ---------- 配置备份：VACUUM INTO 生成一致性快照后下载（仅提供导出，不提供导入恢复） ----------
+        WebServer.route("GET", "/api/system/backup", ctx -> {
+            String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+            Path tmp = Files.createTempFile("nexhome-backup-", ".db");
+            try {
+                // SQLite VACUUM INTO 要求目标文件不存在，临时文件已创建，先删除再交给 SQLite 生成
+                Files.deleteIfExists(tmp);
+                String target = tmp.toAbsolutePath().toString().replace('\\', '/');
+                Database.backupTo(target);
+                ctx.file(tmp, "nexhome-" + stamp + ".db");
+                Logs.info(Logs.SYS, "配置备份已导出: nexhome-" + stamp + ".db");
+            } finally {
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException ignored) {
+                }
+            }
+        });
+
+        // ---------- 统一状态仪表盘（聚合各模块关键状态） ----------
+        WebServer.route("GET", "/api/dashboard", ctx -> ctx.ok(DashboardService.summary()));
 
         // ---------- 访问来源识别（首页导航内外网智能切换依据） ----------
         // 内外网用两套域名时前端 hostname 无法区分，但 TCP 连接的源 IP 不会骗人：

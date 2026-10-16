@@ -1088,6 +1088,45 @@ th.docker-sort:hover { color: var(--cyan); text-shadow: var(--glow-cyan); }
 /* 模态框表格内按钮不换行（避免「详情」被窄列挤成两行） */
 .modal td .btn { white-space: nowrap; }
 
+/* ---------- 统一状态仪表盘（总览） ---------- */
+.dash-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+}
+.dash-stat {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--panel);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    transition: all .2s;
+}
+.dash-stat::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 3px;
+    background: var(--grad-neon);
+    box-shadow: var(--glow-purple);
+}
+.dash-stat:hover { border-color: var(--border-strong); transform: translateY(-2px); box-shadow: 0 12px 30px rgba(0, 0, 0, .4), var(--glow-soft); }
+.dash-stat-icon { font-size: 26px; line-height: 1; filter: drop-shadow(0 0 8px rgba(109, 139, 255, .5)); }
+.dash-stat .v { font-size: 20px; font-weight: 700; color: #eef2ff; font-variant-numeric: tabular-nums; }
+.dash-stat .l { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.dash-stat.ok::before { background: var(--grad-primary); box-shadow: 0 0 12px rgba(52, 211, 153, .6); }
+.dash-stat.warn::before { background: linear-gradient(180deg, #fbbf24, #f97316); box-shadow: 0 0 12px rgba(251, 191, 36, .6); }
+.dash-stat.err::before { background: linear-gradient(180deg, #fb7185, #ef4444); box-shadow: 0 0 12px rgba(251, 113, 133, .6); }
+.dash-panel-title { font-size: 14px; margin-bottom: 12px; }
+
 /* ---------- STUN 流量折线图 ---------- */
 /* 纵向三行堆叠：每张图独占整行，折线横向展开更舒展 */
 .tf-grid { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }

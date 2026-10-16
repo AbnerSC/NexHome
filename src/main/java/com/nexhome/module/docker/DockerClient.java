@@ -74,15 +74,51 @@ final class DockerClient {
 
     /** GET 请求并返回响应体字符串；非 200 抛出携带状态码与 Daemon 错误信息的异常 */
     String get(String pathAndQuery) throws IOException {
+        return exchange("GET", pathAndQuery, null, false);
+    }
+
+    /**
+     * POST 请求（容器起停/重启、镜像/容器清理等写操作），无请求体。
+     * 接受 2xx 及 304（Not Modified：容器已处于目标状态），其余状态码抛错。
+     */
+    String post(String pathAndQuery) throws IOException {
+        return exchange("POST", pathAndQuery, null, true);
+    }
+
+    /**
+     * 读取容器日志（{@code /containers/{id}/logs?stdout=1&stderr=1&tail=N}）。
+     * 非 TTY 容器的响应为 Docker 多路复用帧（8 字节头：[流类型][3 零][大端 4 字节长度]），
+     * 此处解帧后按序拼接 stdout/stderr 文本返回。
+     */
+    String logs(String pathAndQuery) throws IOException {
+        return exchange("GET", pathAndQuery, null, false, true);
+    }
+
+    /** 通用请求：手写 HTTP/1.1，Connection: close，读至 EOF 即完整响应 */
+    private String exchange(String method, String pathAndQuery, String reqBody,
+                            boolean lenientOk) throws IOException {
+        return exchange(method, pathAndQuery, reqBody, lenientOk, false);
+    }
+
+    private String exchange(String method, String pathAndQuery, String reqBody,
+                            boolean lenientOk, boolean demux) throws IOException {
         if (broken != null) throw new IOException(broken);
         SocketChannel ch = openChannel();
         try {
             connect(ch);
             // 直接用 SocketChannel 收发字节：避开 Socket 适配器对 UDS 的诸多限制
             // （如 setSoTimeout 会抛 UnsupportedOperationException("Not supported")）
-            writeFully(ch, ("GET " + pathAndQuery + " HTTP/1.1\r\n"
-                    + "Host: docker\r\n"
-                    + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            byte[] bodyBytes = reqBody == null ? null : reqBody.getBytes(StandardCharsets.UTF_8);
+            StringBuilder head = new StringBuilder();
+            head.append(method).append(' ').append(pathAndQuery).append(" HTTP/1.1\r\n")
+                    .append("Host: docker\r\n");
+            if (bodyBytes != null) {
+                head.append("Content-Type: application/json\r\n")
+                        .append("Content-Length: ").append(bodyBytes.length).append("\r\n");
+            }
+            head.append("Connection: close\r\n\r\n");
+            writeFully(ch, head.toString().getBytes(StandardCharsets.US_ASCII));
+            if (bodyBytes != null) writeFully(ch, bodyBytes);
             // Connection: close：Daemon 发送完响应即断开连接，读到 EOF 即为完整响应
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             ByteBuffer bb = ByteBuffer.allocate(8192);
@@ -93,7 +129,7 @@ final class DockerClient {
                 buf.write(chunk);
                 bb.clear();
             }
-            return new String(body(buf.toByteArray()), StandardCharsets.UTF_8);
+            return payload(buf.toByteArray(), lenientOk, demux);
         } finally {
             try {
                 ch.close();
@@ -143,8 +179,11 @@ final class DockerClient {
         while (bb.hasRemaining()) ch.write(bb);
     }
 
-    /** 解析原始响应：校验状态码，按 Content-Length / chunked 提取响应体 */
-    private static byte[] body(byte[] raw) throws IOException {
+    /**
+     * 解析原始响应：校验状态码，按 Content-Length / chunked 提取响应体。
+     * lenientOk=true 时接受 2xx 与 304（写操作幂等）；demux=true 时解 Docker 多路复用帧。
+     */
+    private static String payload(byte[] raw, boolean lenientOk, boolean demux) throws IOException {
         int headEnd = indexOf(raw, 0, "\r\n\r\n");
         if (headEnd < 0) throw new IOException("Docker 响应格式异常（缺少 HTTP 头）");
         String head = new String(raw, 0, headEnd, StandardCharsets.UTF_8);
@@ -180,14 +219,38 @@ final class DockerClient {
         if (!chunked && payload.length > 0) {
             System.arraycopy(raw, bodyStart, payload, 0, payload.length);
         }
-        if (code != 200) {
+        boolean ok = (code >= 200 && code < 300) || (lenientOk && code == 304) || code == 200;
+        if (!ok) {
             String text = new String(payload, StandardCharsets.UTF_8).trim();
             // Daemon 错误体形如 {"message":"..."}，提取后更友好
             String message = JsonUtils.str(JsonUtils.parse(text), "message");
             throw new IOException("Docker API " + code + ": "
                     + (message.isBlank() ? text : message));
         }
-        return payload;
+        return new String(demux ? demultiplex(payload) : payload, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Docker 多路复用流解帧：每帧 8 字节头 = [流类型 1][零 3][大端长度 4]，随后为负载。
+     * 非帧格式（TTY 容器日志为原始字节流，首字节不会是 1/2）时原样返回。
+     */
+    private static byte[] demultiplex(byte[] data) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int pos = 0;
+        boolean framed = false;
+        while (pos + 8 <= data.length) {
+            int type = data[pos] & 0xFF;
+            if (type != 1 && type != 2) break; // 非 stdout/stderr 帧头，判定为原始流
+            int len = ((data[pos + 4] & 0xFF) << 24) | ((data[pos + 5] & 0xFF) << 16)
+                    | ((data[pos + 6] & 0xFF) << 8) | (data[pos + 7] & 0xFF);
+            int from = pos + 8;
+            int to = Math.min(from + len, data.length);
+            out.write(data, from, to - from);
+            pos = to;
+            framed = true;
+        }
+        if (!framed) return data; // 未解出任何帧：TTY 原始日志，直接返回
+        return out.toByteArray();
     }
 
     /** chunked 编码解码（字节级处理，避免多字节 UTF-8 字符被切断） */
