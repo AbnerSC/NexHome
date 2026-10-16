@@ -49,7 +49,16 @@ async function renderCert() {
       </div>
       <div class="toolbar"><div class="spacer"></div><button class="btn primary" onclick="certForm()">＋ 新增证书任务</button></div>
       <div class="panel"><table>
-        <thead><tr><th>任务</th><th>域名</th><th>状态</th><th>到期时间</th><th>自动续期</th><th>操作</th></tr></thead>
+        <thead>
+          <tr>
+            <th style="width:16%">任务</th>
+            <th>域名</th>
+            <th style="width:20%">状态</th>
+            <th style="width:12%">到期时间</th>
+            <th style="width:10%">自动续期</th>
+            <th style="width:210px">操作</th>
+          </tr>
+        </thead>
         <tbody>${rows || '<tr><td colspan="6" class="muted">暂无证书任务</td></tr>'}</tbody>
       </table></div>`;
     $('#certSettingForm').addEventListener('submit', async e => {

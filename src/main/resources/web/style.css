@@ -471,6 +471,14 @@ table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 /* 固定布局下列宽不随内容扩展，单元格内超长徽标（如可用性自测结果）需允许换行 */
 td .badge { white-space: normal; word-break: break-all; }
 
+/* 宽表格横向滚动：列内容总宽超过容器时不挤压列宽，改为出现横向滑动条（配合表格的 min-width） */
+.table-scroll { overflow-x: auto; }
+.table-scroll > table { margin-bottom: 0; }
+
+/* 操作列：图标按钮成组，紧凑且悬停有语义提示（title） */
+.ops { display: flex; gap: 6px; align-items: center; }
+.btn.icon { width: 30px; padding: 4px 0; justify-content: center; font-size: 14px; line-height: 1; }
+
 th, td {
     text-align: left;
     padding: 10px;
@@ -606,6 +614,33 @@ code {
 }
 
 .form-foot { margin-top: 18px; text-align: right; display: flex; gap: 10px; justify-content: flex-end; }
+
+/* STUN 穿透任务表单：集成配置分区（ESA / Webhook / 通知）卡片化，与顶部基础字段区分，长表单更易扫读 */
+.field.form-section {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px 16px;
+    background: rgba(9, 14, 32, .22);
+}
+.field.form-section > label {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 700; color: #eef2ff; margin-bottom: 0;
+}
+.field.form-section .sec-opt {
+    font-size: 11px; font-weight: 500; color: var(--cyan);
+    background: rgba(34, 211, 238, .12); border: 1px solid rgba(34, 211, 238, .28);
+    padding: 1px 7px; border-radius: 999px;
+}
+.field.form-section .sec-desc { font-size: 12px; color: var(--muted); line-height: 1.6; margin: 6px 0 12px; }
+
+/* Webhook 占位符参考：默认折叠，避免 17 行文档表格撑长表单 */
+.ph-ref { margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--code-bg); }
+.ph-ref > summary { cursor: pointer; padding: 9px 12px; font-size: 12px; color: var(--text); list-style: none; display: flex; align-items: center; gap: 7px; user-select: none; }
+.ph-ref > summary::-webkit-details-marker { display: none; }
+.ph-ref > summary::before { content: "▸"; color: var(--muted); font-size: 11px; }
+.ph-ref[open] > summary::before { content: "▾"; }
+.ph-ref > summary b { color: var(--cyan); font-weight: 600; }
+.ph-ref-body { padding: 2px 12px 12px; }
 
 /* ---------- 模态框 ---------- */
 .modal-mask {

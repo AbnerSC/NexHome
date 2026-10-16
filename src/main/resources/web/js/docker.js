@@ -226,12 +226,12 @@ function paintDockerContainers() {
         <thead><tr>
           ${dockerSortTh('name', '容器名称', 'width:180px')}
           ${dockerSortTh('image', '镜像')}
-          ${dockerSortTh('state', '状态', 'width:80px')}
-          ${dockerSortTh('mem', '内存', 'width:130px')}
-          ${dockerSortTh('sizeRw', '磁盘(可写)', 'width:90px')}
+          ${dockerSortTh('state', '状态', 'width:100px')}
+          ${dockerSortTh('mem', '内存', 'width:140px')}
+          ${dockerSortTh('sizeRw', '磁盘', 'width:90px')}
           ${dockerSortTh('ip', '容器 IP', 'width:120px')}
           <th>暴露端口</th><th style="width:150px">Compose</th>
-          <th style="width:220px">操作</th>
+          <th style="width:235px">操作</th>
         </tr></thead>
         <tbody>${rows || '<tr><td colspan="9" class="muted">暂无容器</td></tr>'}</tbody>
       </table></div>`;
@@ -331,8 +331,12 @@ async function renderDockerCompose(head, ov) {
       <div class="tip">按容器标签 <b>com.docker.compose.project</b> 分组聚合（docker compose up 部署的项目自动携带）。</div>
       <div class="panel" style="padding:6px 10px"><table>
         <thead><tr>
-          <th style="width:150px">项目</th><th>工作目录</th><th>配置文件</th>
-          <th style="width:80px">运行/总数</th><th>服务</th><th style="width:60px">镜像数</th>
+          <th style="width:200px">项目</th>
+          <th>工作目录</th>
+          <th>配置文件</th>
+          <th style="width:80px">运行/总数</th>
+          <th>服务</th>
+          <th style="width:60px">镜像数</th>
           <th style="width:170px">操作</th>
         </tr></thead>
         <tbody>${rows || '<tr><td colspan="7" class="muted">未发现 Compose 项目（仅统计携带 compose 标签的容器）</td></tr>'}</tbody>
@@ -358,7 +362,7 @@ window.dockerProjectDetail = async name => {
       </tr>`).join('');
     modal(`Compose 项目 · ${name}`, `
       <table>
-        <thead><tr><th style="width:170px">容器</th><th style="width:110px">服务</th><th style="width:86px">状态</th>
+        <thead><tr><th style="width:170px">容器</th><th style="width:110px">服务</th><th style="width:100px">状态</th>
           <th style="width:140px">运行时长</th><th>镜像</th><th style="width:110px">容器 IP</th><th style="width:70px">操作</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="7" class="muted">该项目当前无容器</td></tr>'}</tbody>
       </table>`, 'wide');

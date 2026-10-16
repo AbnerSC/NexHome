@@ -20,17 +20,17 @@ async function renderStun() {
                 : t.check_result.startsWith('FAIL') ? 'err' : 'warn')}</div>
                ${t.check_time ? `<div class="small muted">${esc(t.check_time)}</div>` : ''}`
             : '<span class="muted small">未自测</span>'}</td>
-        <td>
+        <td class="ops">
           ${t.status === 'RUNNING'
-            ? `<button class="btn small danger" onclick="stunCmd(${t.id},'stop')">停止</button>`
-            : `<button class="btn small success" onclick="stunCmd(${t.id},'start')">启动</button>`}
-          <button class="btn small" onclick="stunCmd(${t.id},'test')">探测</button>
-          ${t.status === 'RUNNING' ? `<button class="btn small" onclick="stunCmd(${t.id},'verify')">自测</button>` : ''}
-          ${t.esa_sync_enabled === 1 ? `<button class="btn small" onclick="stunEsaSync(${t.id})">ESA</button>` : ''}
-          ${t.notify_enabled === 1 ? `<button class="btn small" onclick="stunNotifyTest(${t.id})">通知</button>` : ''}
-          <button class="btn small" onclick="stunTraffic(${t.id})">流量</button>
-          <button class="btn small" onclick="stunForm(${t.id})">编辑</button>
-          <button class="btn small danger" onclick="stunDelete(${t.id})">删除</button>
+            ? `<button class="btn small icon danger" title="停止" onclick="stunCmd(${t.id},'stop')">⏸</button>`
+            : `<button class="btn small icon success" title="启动" onclick="stunCmd(${t.id},'start')">▶</button>`}
+          <button class="btn small icon" title="探测 NAT 类型" onclick="stunCmd(${t.id},'test')">📡</button>
+          ${t.status === 'RUNNING' ? `<button class="btn small icon" title="可达性自测" onclick="stunCmd(${t.id},'verify')">🔎</button>` : ''}
+          ${t.esa_sync_enabled === 1 ? `<button class="btn small icon" title="ESA 同步" onclick="stunEsaSync(${t.id})">🌐</button>` : ''}
+          ${t.notify_enabled === 1 ? `<button class="btn small icon" title="通知测试" onclick="stunNotifyTest(${t.id})">🔔</button>` : ''}
+          <button class="btn small icon" title="流量统计" onclick="stunTraffic(${t.id})">📊</button>
+          <button class="btn small icon" title="编辑" onclick="stunForm(${t.id})">✏️</button>
+          <button class="btn small icon danger" title="删除" onclick="stunDelete(${t.id})">🗑️</button>
         </td>
       </tr>`).join('');
     $('#pageBody').innerHTML = `
@@ -48,25 +48,25 @@ async function renderStun() {
       <div class="toolbar"><div class="spacer"></div>
         <button class="btn" onclick="renderStunServers()">🛠 管理STUN服务器</button>
         <button class="btn primary" onclick="stunForm()">＋ 新增穿透任务</button></div>
-      <div class="panel"><table>
+      <div class="panel"><div class="table-scroll"><table style="min-width:1690px">
         <thead>
             <tr>
-                <th style="width: 110px">任务</th>
-                <th style="width: 160px">内网目标</th>
-                <th style="width: 180px">STUN服务器</th>
-                <th style="width: 110px">状态</th>
-                <th style="width: 130px">NAT类型</th>
+                <th style="width: 100px">任务</th>
+                <th style="width: 150px">内网目标</th>
+                <th style="width: 150px">STUN服务器</th>
+                <th style="width: 80px">状态</th>
+                <th style="width: 120px">NAT类型</th>
                 <th style="width: 160px">外网映射地址</th>
-                <th style="width: 150px">穿透成功时间</th>
-                <th style="width: 100px">流量</th>
-                <th style="width: 130px">ESA 同步</th>
-                <th style="width: 110px">通知推送</th>
-                <th>可用性自测</th>
-                <th style="width: 360px">操作</th>
+                <th style="width: 140px">穿透成功时间</th>
+                <th style="width: 80px">流量</th>
+                <th style="width: 120px">ESA 同步</th>
+                <th style="width: 90px">通知推送</th>
+                <th style="width: 190px">可用性自测</th>
+                <th style="width: 310px">操作</th>
             </tr>
         </thead>
         <tbody>${rows || '<tr><td colspan="12" class="muted">暂无任务</td></tr>'}</tbody>
-      </table></div>`;
+      </table></div></div>`;
     setRefresh(renderStun, 5000);
 }
 
@@ -231,15 +231,16 @@ window.stunForm = async (id) => {
             <option value="true" ${t.upnp_enabled !== 0 ? 'selected' : ''}>启用（需路由器支持UPnP）</option>
             <option value="false" ${t.upnp_enabled === 0 ? 'selected' : ''}>停用（路由器不支持UPnP）</option>
           </select></div>
-        <div class="field"><label>STUN 服务器 <b>*</b></label>
+        <div class="field full"><label>STUN 服务器 <b>*</b></label>
           <select name="stun_server" onchange="stunServerChanged(this.value)">
             ${serverOpts}
             <option value="custom" ${custom ? 'selected' : ''}>自定义...</option>
           </select></div>
         <div class="field ${custom ? '' : 'hidden'}" id="fStunHost"><label>STUN 地址 <b>*</b></label><input name="stun_host" value="${esc(t.stun_host || '')}" placeholder="stun.miwifi.com"></div>
         <div class="field ${custom ? '' : 'hidden'}" id="fStunPort"><label>STUN 端口</label><input name="stun_port" type="number" min="1" max="65535" value="${t.stun_port ?? 3478}"></div>
-        <div class="field full">
-          <label>ESA 边缘安全加速同步（可选，穿透成功 / 映射地址变化后把映射 IP 写入解析记录、映射端口写入回源 HTTPS 端口）</label>
+        <div class="field full form-section">
+          <label>ESA 边缘安全加速同步 <span class="sec-opt">可选</span></label>
+          <div class="sec-desc">穿透成功 / 映射地址变化后，把映射 IP 写入解析记录、映射端口写入回源 HTTPS 端口。</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
             <select name="esa_sync_enabled" style="width:150px" onchange="stunEsaToggle(this.value)">
               <option value="false" ${t.esa_sync_enabled === 1 ? '' : 'selected'}>停用</option>
@@ -282,12 +283,14 @@ window.stunForm = async (id) => {
               可在任务列表点「ESA」手动补一次。</div>
           </div>
         </div>
-        <div class="field full">
-          <label>Webhook 同步（可选，穿透成功 / 映射地址变化时将结果推送到以下地址，支持多个）</label>
+        <div class="field full form-section">
+          <label>Webhook 同步 <span class="sec-opt">可选</span></label>
+          <div class="sec-desc">穿透成功 / 映射地址变化时，将结果推送到以下地址，支持多个。</div>
           <div id="stunWhList"></div>
           <div style="margin-top:6px"><button type="button" class="btn small" onclick="stunWhAdd()">＋ 添加 Webhook</button></div>
-          <div class="small muted" style="margin-top:10px;padding:10px;background:var(--code-bg);border-radius:8px;border:1px solid var(--border)">
-            <b>可用占位符（在 URL、请求头、参数值、JSON 请求体中引用）：</b>
+          <details class="ph-ref">
+            <summary><b>可用占位符</b>（在 URL、请求头、参数值、JSON 请求体中引用，共 17 个，点击展开）</summary>
+            <div class="ph-ref-body">
             <div style="display:flex;gap:16px;align-items:flex-start;margin-top:6px">
               <table style="flex:1">
                 <thead><tr><th style="width:38%">占位符</th><th>说明</th></tr></thead>
@@ -317,13 +320,15 @@ window.stunForm = async (id) => {
                 </tbody>
               </table>
             </div>
-          </div>
+            </div>
+          </details>
           <div class="small muted" style="margin-top:6px;line-height:1.7">
             每条可选 <b>GET / POST</b>：<b>POST</b> 支持填写自定义 JSON 请求体（占位符会被替换为实际值）；<b>GET</b> 将结果字段+自定义参数拼为查询串。
             <b>请求头</b>每行一个 <code>key: value</code>（如 <code>Authorization: Bearer xxx</code>）。触发时机：首次穿透成功、外网映射地址变化。
             推送失败仅记日志，不影响穿透。</div></div>
-        <div class="field full">
-          <label>通知中心推送（可选，穿透成功 / 映射地址变化时按勾选渠道发送通知，支持多个）</label>
+        <div class="field full form-section">
+          <label>通知中心推送 <span class="sec-opt">可选</span></label>
+          <div class="sec-desc">穿透成功 / 映射地址变化时，按勾选渠道发送通知，支持多个。</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
             <select name="notify_enabled" style="width:150px" onchange="stunNotifyToggle(this.value)">
               <option value="false" ${t.notify_enabled === 1 ? '' : 'selected'}>停用</option>
