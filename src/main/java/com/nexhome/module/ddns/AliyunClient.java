@@ -216,6 +216,81 @@ public final class AliyunClient {
         checkEsaError(resp);
     }
 
+    /**
+     * 查询站点下全部解析记录（自动分页）。
+     * <p>
+     * 不按 RecordName 过滤：通配记录（如 *.edge.example.com）的精确名查询并不可靠，
+     * 统一拉全量后由调用方本地匹配，顺带拿到线上 Type/Ttl/Proxied 以便原样回传。
+     */
+    public static JsonArray esaListAllRecords(String ak, String sk, String siteId) throws Exception {
+        JsonArray all = new JsonArray();
+        int page = 1;
+        while (page <= 50) { // 安全上限，避免异常分页导致死循环
+            JsonObject resp = esaCall(ak, sk, "GET", "ListRecords", Map.of(
+                    "SiteId", siteId,
+                    "PageNumber", String.valueOf(page),
+                    "PageSize", "500"));
+            checkEsaError(resp);
+            JsonArray records = resp.has("Records") ? resp.getAsJsonArray("Records") : new JsonArray();
+            for (var el : records) all.add(el);
+            int total = resp.has("TotalCount") ? resp.get("TotalCount").getAsInt() : all.size();
+            if (records.isEmpty() || all.size() >= total) break;
+            page++;
+        }
+        return all;
+    }
+
+    /**
+     * 查询站点下全部回源规则（自动分页）。
+     * 元素含 ConfigId / RuleName / ConfigType(global|rule) / OriginScheme / OriginHttpsPort 等。
+     */
+    public static JsonArray esaListOriginRules(String ak, String sk, String siteId) throws Exception {
+        JsonArray all = new JsonArray();
+        int page = 1;
+        while (page <= 50) {
+            JsonObject resp = esaCall(ak, sk, "GET", "ListOriginRules", Map.of(
+                    "SiteId", siteId,
+                    "PageNumber", String.valueOf(page),
+                    "PageSize", "500"));
+            checkEsaError(resp);
+            JsonArray configs = resp.has("Configs") ? resp.getAsJsonArray("Configs") : new JsonArray();
+            for (var el : configs) all.add(el);
+            int total = resp.has("TotalCount") ? resp.get("TotalCount").getAsInt() : all.size();
+            if (configs.isEmpty() || all.size() >= total) break;
+            page++;
+        }
+        return all;
+    }
+
+    /**
+     * 更新 ESA 解析记录的记录值：Type / Ttl / Proxied 一律按线上现值原样回传，
+     * 避免只改记录值却把 TTL 或代理加速状态重置为默认值。
+     */
+    public static void esaUpdateRecordValue(String ak, String sk, String recordId, String type,
+                                            String value, int ttl, boolean proxied) throws Exception {
+        JsonObject resp = esaCall(ak, sk, "POST", "UpdateRecord", Map.of(
+                "RecordId", recordId,
+                "Type", esaRecordType(type),
+                "Data", esaDataJson(value),
+                "Ttl", String.valueOf(ttl),
+                "Proxied", String.valueOf(proxied)));
+        checkEsaError(resp);
+    }
+
+    /**
+     * 更新 ESA 回源规则的回源 HTTPS 端口：OriginScheme 沿用线上规则现值
+     * （该接口为整体提交，漏传协议会被改回默认值），其余可选参数不传保持原配置。
+     */
+    public static void esaUpdateOriginRulePort(String ak, String sk, String siteId, String configId,
+                                               String originScheme, String httpsPort) throws Exception {
+        JsonObject resp = esaCall(ak, sk, "POST", "UpdateOriginRule", Map.of(
+                "SiteId", siteId,
+                "ConfigId", configId,
+                "OriginScheme", originScheme,
+                "OriginHttpsPort", httpsPort));
+        checkEsaError(resp);
+    }
+
     private static void checkEsaError(JsonObject resp) {
         if (resp.has("Code") && !resp.get("Code").getAsString().isBlank()) {
             throw new IllegalStateException("阿里云ESA错误[" + resp.get("Code").getAsString() + "]: "

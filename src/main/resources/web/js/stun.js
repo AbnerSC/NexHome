@@ -13,6 +13,8 @@ async function renderStun() {
         <td>${t.mapped_addr ? badge(t.mapped_addr, 'info') : '-'}</td>
         <td>${t.punched_at ? `<span class="small">${esc(t.punched_at)}</span>` : '-'}</td>
         <td>${fmtTrafficBytes(t.total_bytes)}</td>
+        <td>${esaCell(t)}</td>
+        <td>${notifyCell(t)}</td>
         <td>${t.check_result
             ? `<div>${badge(t.check_result, t.check_result.startsWith('OK') ? 'ok'
                 : t.check_result.startsWith('FAIL') ? 'err' : 'warn')}</div>
@@ -24,6 +26,8 @@ async function renderStun() {
             : `<button class="btn small success" onclick="stunCmd(${t.id},'start')">启动</button>`}
           <button class="btn small" onclick="stunCmd(${t.id},'test')">探测</button>
           ${t.status === 'RUNNING' ? `<button class="btn small" onclick="stunCmd(${t.id},'verify')">自测</button>` : ''}
+          ${t.esa_sync_enabled === 1 ? `<button class="btn small" onclick="stunEsaSync(${t.id})">ESA</button>` : ''}
+          ${t.notify_enabled === 1 ? `<button class="btn small" onclick="stunNotifyTest(${t.id})">通知</button>` : ''}
           <button class="btn small" onclick="stunTraffic(${t.id})">流量</button>
           <button class="btn small" onclick="stunForm(${t.id})">编辑</button>
           <button class="btn small danger" onclick="stunDelete(${t.id})">删除</button>
@@ -36,6 +40,10 @@ async function renderStun() {
         穿透启动时自动尝试 <b>UPnP 端口映射</b>（WAN 口为公网时即权威入站通道）；CGNAT 或未启用 UPnP 时，TCP 任务按优先级自动选择出站通道：STUN 长连接精确映射 →
         <b>双链路模式</b>（参考 natmap：公共端点出站保活 + 同端口 STUN 短连接探测精确映射，单事务型 STUN 服务器亦可复用）→ 端口保留兜底。
         穿透成功后系统自动自测一次（映射保活 + 公网入站可达），可在操作列点「自测」手动复测。
+        启用 <b>ESA 同步</b>后，穿透成功与映射地址变化时会自动把映射 IP 写入 ESA 解析记录、映射端口写入回源 HTTPS 端口，
+        可在操作列点「ESA」手动补一次。
+        启用 <b>通知推送</b>后，同样的时机按任务勾选的渠道（在「告警通知」页集中维护，可多选）发送通知，
+        发送记录见「告警通知」页。
       </div>
       <div class="toolbar"><div class="spacer"></div>
         <button class="btn" onclick="renderStunServers()">🛠 管理STUN服务器</button>
@@ -51,14 +59,92 @@ async function renderStun() {
                 <th style="width: 160px">外网映射地址</th>
                 <th style="width: 150px">穿透成功时间</th>
                 <th style="width: 100px">流量</th>
+                <th style="width: 130px">ESA 同步</th>
+                <th style="width: 110px">通知推送</th>
                 <th>可用性自测</th>
-                <th style="width: 320px">操作</th>
+                <th style="width: 360px">操作</th>
             </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="10" class="muted">暂无任务</td></tr>'}</tbody>
+        <tbody>${rows || '<tr><td colspan="12" class="muted">暂无任务</td></tr>'}</tbody>
       </table></div>`;
     setRefresh(renderStun, 5000);
 }
+
+/** ESA 同步状态单元格：未启用置灰，否则按最近一次结果着色（OK / PARTIAL / FAIL） */
+function esaCell(t) {
+    if (t.esa_sync_enabled !== 1) return '<span class="muted small">未启用</span>';
+    let st = {};
+    try { st = t.esa_sync_status ? JSON.parse(t.esa_sync_status) : {}; } catch (e) { st = {}; }
+    const result = st.result || '';
+    if (!result) return '<span class="muted small">待同步</span>';
+    const kind = result.startsWith('OK') ? 'ok' : result.startsWith('PARTIAL') ? 'warn' : 'err';
+    return `<div>${badge(result, kind)}</div>${st.time ? `<div class="small muted">${esc(st.time)}</div>` : ''}`;
+}
+
+/** 通知推送单元格：投递结果不落在任务行（写入 notify_log，在「告警通知」页查看），此处只展示启用与渠道数 */
+function notifyCell(t) {
+    if (t.notify_enabled !== 1) return '<span class="muted small">未启用</span>';
+    const n = notifySnapshot(t.notify_channels).length;
+    return n ? badge(n + ' 个渠道', 'info') : '<span class="small" style="color:var(--red)">未选渠道</span>';
+}
+
+/** 通知渠道勾选列解析（非法/缺失时为空数组），元素为渠道 id 字符串 */
+function notifySnapshot(text) {
+    try {
+        const a = text ? JSON.parse(text) : [];
+        return Array.isArray(a) ? a.map(x => String(x)).filter(x => x && x !== 'null') : [];
+    } catch (e) { return []; }
+}
+
+/** ESA 勾选快照列解析（非法/缺失时为空数组），元素为 {id,name} */
+function esaSnapshot(text) {
+    try {
+        const a = text ? JSON.parse(text) : [];
+        return Array.isArray(a) ? a.filter(x => x && x.id) : [];
+    } catch (e) { return []; }
+}
+
+/** 收集已勾选的 ESA 项（id 保持字符串，避免大整数在 JS Number 下丢精度） */
+function esaCollect(sel) {
+    return [...document.querySelectorAll(sel + ' input[data-id]:checked')]
+        .map(i => ({ id: i.dataset.id, name: i.dataset.name }));
+}
+
+/** 表单内 ESA 勾选行的基础样式 */
+const ESA_ROW = 'display:flex;gap:8px;align-items:center;padding:6px 8px;margin-bottom:4px;'
+    + 'border:1px solid var(--border);border-radius:6px;background:var(--code-bg);font-size:12px;cursor:pointer';
+
+/** 手动立即同步一次 ESA，弹窗展示逐条明细（记录值 / 回源端口的 from→to 与结果） */
+window.stunEsaSync = async id => {
+    toast('正在同步 ESA 解析记录与回源端口...');
+    try {
+        const r = await api('POST', `/api/stun/tasks/${id}/esa-sync`);
+        const items = (r.items || []).map(i => `
+          <tr>
+            <td>${i.kind === 'rule' ? '回源规则' : '解析记录'}</td>
+            <td class="small">${esc(i.name)}</td>
+            <td class="small">${esc(i.from || '-')} → <b>${esc(i.to || '-')}</b></td>
+            <td>${badge(i.state === 'OK' ? '已更新' : i.state === 'SKIP' ? '跳过' : '失败',
+                i.state === 'OK' ? 'ok' : i.state === 'SKIP' ? 'gray' : 'err')}</td>
+            <td class="small">${esc(i.msg || '')}</td>
+          </tr>`).join('');
+        modal('ESA 同步结果', `<p>结果：<b>${esc(r.result || '')}</b>
+          ${r.mapped_addr ? `（映射地址 ${esc(r.mapped_addr)}）` : ''}</p>
+          <div class="panel" style="margin-top:10px"><table>
+            <thead><tr><th style="width:80px">类型</th><th>名称</th><th style="width:180px">变更</th>
+              <th style="width:70px">状态</th><th>说明</th></tr></thead>
+            <tbody>${items || '<tr><td colspan="5" class="muted">无可同步项</td></tr>'}</tbody>
+          </table></div>
+          <p class="muted small" style="margin-top:10px">本功能只更新已勾选的解析记录与回源规则，不会新增或删除云端配置。</p>`, 'wide');
+        renderStun();
+    } catch (e) { toast(e.message, 'err'); }
+};
+
+/** 手动试发一次穿透通知（按任务勾选的渠道；投递异步，结果到「告警通知」页看） */
+window.stunNotifyTest = async id => {
+    try { toast(await api('POST', `/api/stun/tasks/${id}/notify-test`), 'ok'); }
+    catch (e) { toast(e.message, 'err'); }
+};
 
 window.stunCmd = async (id, cmd) => {
     try {
@@ -100,6 +186,36 @@ window.stunForm = async (id) => {
     const serverOpts = servers.map(s =>
         `<option value="${s.id}" ${matched && matched.id === s.id ? 'selected' : ''}>${esc(s.name)}（${esc(s.host)}:${s.port}${s.tcp_support === 1 ? '，支持TCP' : ''}）</option>`).join('');
     const custom = !matched && (!!t.stun_host || !servers.length);
+    // ESA 同步凭证：只列阿里云类型的服务商配置（与 ddns 一致），已引用的保留以免编辑时回显丢失
+    let configs = [];
+    try { configs = await api('GET', '/api/provider/configs'); } catch (e) { /* ignore */ }
+    const credOpts = configs
+        .filter(c => (c.provider_type || 'ALIYUN') === 'ALIYUN' || c.id === t.provider_config_id)
+        .map(c => `<option value="${c.id}" ${t.provider_config_id === c.id ? 'selected' : ''}>${esc(c.name)}（${esc(maskAk(c.access_key_id))}）</option>`).join('');
+    // 勾选快照（[{id,name}]）：先按快照回显勾选项，拉取线上列表后再与线上核对
+    const esaSiteOpt = t.esa_site_id
+        ? `<option value="${esc(t.esa_site_id)}" selected>${esc(t.esa_site_id)}（原站点，点「拉取站点」核对）</option>` : '';
+    const recChecked = new Map(esaSnapshot(t.esa_records).map(p => [String(p.id), p.name]));
+    const ruleChecked = new Map(esaSnapshot(t.esa_rules).map(p => [String(p.id), p.name]));
+    let esaRecOnline = null, esaRuleOnline = null; // 线上列表，null=尚未拉取
+    // 通知中心渠道（统一在「告警通知」页维护，任务只勾选用哪些，可多选）
+    let notifyChannels = [];
+    try { notifyChannels = await api('GET', '/api/notify/channels'); } catch (e) { /* ignore */ }
+    const notifyChecked = new Set(notifySnapshot(t.notify_channels));
+    const notifyList = notifyChannels.map(c => `
+      <label style="${ESA_ROW}">
+        <input type="checkbox" data-id="${c.id}" ${notifyChecked.has(String(c.id)) ? 'checked' : ''}>
+        <span><b>${esc(c.name)}</b> · ${notifyTypeBadge(c.type)}${c.enabled === 1 ? ''
+            : '<b style="color:var(--red)">　渠道已停用（不会发送）</b>'}</span>
+      </label>`).join('')
+        // 快照中已被删除的渠道：保留可取消（与 ESA 勾选快照同样处理），投递时后端自动跳过
+        + [...notifyChecked]
+            .filter(id => !notifyChannels.some(c => String(c.id) === id))
+            .map(id => `
+      <label style="${ESA_ROW}">
+        <input type="checkbox" data-id="${esc(id)}" checked>
+        <span><b>渠道 #${esc(id)}</b><b style="color:var(--red)">　已删除（不会发送，请取消勾选或改选其他渠道）</b></span>
+      </label>`).join('');
     modal(id ? '编辑穿透任务' : '新增穿透任务', `
       <form id="stunFormEl" class="form-grid">
         <div class="field"><label>任务名称 <b>*</b></label><input name="name" required value="${esc(t.name || '')}"></div>
@@ -122,6 +238,50 @@ window.stunForm = async (id) => {
           </select></div>
         <div class="field ${custom ? '' : 'hidden'}" id="fStunHost"><label>STUN 地址 <b>*</b></label><input name="stun_host" value="${esc(t.stun_host || '')}" placeholder="stun.miwifi.com"></div>
         <div class="field ${custom ? '' : 'hidden'}" id="fStunPort"><label>STUN 端口</label><input name="stun_port" type="number" min="1" max="65535" value="${t.stun_port ?? 3478}"></div>
+        <div class="field full">
+          <label>ESA 边缘安全加速同步（可选，穿透成功 / 映射地址变化后把映射 IP 写入解析记录、映射端口写入回源 HTTPS 端口）</label>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <select name="esa_sync_enabled" style="width:150px" onchange="stunEsaToggle(this.value)">
+              <option value="false" ${t.esa_sync_enabled === 1 ? '' : 'selected'}>停用</option>
+              <option value="true" ${t.esa_sync_enabled === 1 ? 'selected' : ''}>启用</option>
+            </select>
+            <select name="provider_config_id" id="fEsaCred" style="flex:1;min-width:240px" onchange="stunEsaCredChanged()">
+              <option value="">${credOpts ? '请选择服务商凭证配置...' : '无阿里云凭证，请先到「服务商配置」添加'}</option>${credOpts}
+            </select>
+          </div>
+          <div id="esaSyncCfg" class="${t.esa_sync_enabled === 1 ? '' : 'hidden'}"
+               style="margin-top:10px;display:flex;flex-direction:column;gap:12px">
+            <div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <select name="esa_site_id" id="fEsaSite" style="flex:1;min-width:240px" onchange="stunEsaSiteChanged()">
+                  <option value="">请先点击「拉取站点」</option>${esaSiteOpt}
+                </select>
+                <button type="button" class="btn small" onclick="stunEsaLoadSites()">拉取站点</button>
+              </div>
+              <div id="esaTip" class="small muted" style="margin-top:5px"></div>
+            </div>
+            <div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <button type="button" class="btn small" onclick="stunEsaLoadRecords()">拉取 DNS 解析记录</button>
+                <span class="small muted">勾选需要写入映射 IP 的记录（仅 A / AAAA 生效）</span>
+              </div>
+              <div id="esaRecList" style="margin-top:6px"></div>
+            </div>
+            <div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <button type="button" class="btn small" onclick="stunEsaLoadRules()">拉取回源规则</button>
+                <span class="small muted">勾选需要写入映射端口的回源规则（仅 TCP 任务生效）</span>
+              </div>
+              <div id="esaRuleList" style="margin-top:6px"></div>
+            </div>
+            <div class="small muted" style="line-height:1.8;padding:10px;background:var(--code-bg);border:1px solid var(--border);border-radius:8px">
+              只更新<b>已勾选</b>的解析记录（记录值）与回源规则（回源 HTTPS 端口），<b>不会新增或删除</b>云端配置；
+              现值与目标一致时跳过写入，多值记录、IPv4↔IPv6 地址族不一致的记录不会被覆盖。
+              <b>UDP 任务</b>的映射端口对 HTTPS 回源无意义，仅同步解析记录。
+              回源协议沿用规则线上现值，本功能只改端口。同步失败仅记日志与任务列表「ESA 同步」列，<b>不影响穿透</b>，
+              可在任务列表点「ESA」手动补一次。</div>
+          </div>
+        </div>
         <div class="field full">
           <label>Webhook 同步（可选，穿透成功 / 映射地址变化时将结果推送到以下地址，支持多个）</label>
           <div id="stunWhList"></div>
@@ -162,6 +322,22 @@ window.stunForm = async (id) => {
             每条可选 <b>GET / POST</b>：<b>POST</b> 支持填写自定义 JSON 请求体（占位符会被替换为实际值）；<b>GET</b> 将结果字段+自定义参数拼为查询串。
             <b>请求头</b>每行一个 <code>key: value</code>（如 <code>Authorization: Bearer xxx</code>）。触发时机：首次穿透成功、外网映射地址变化。
             推送失败仅记日志，不影响穿透。</div></div>
+        <div class="field full">
+          <label>通知中心推送（可选，穿透成功 / 映射地址变化时按勾选渠道发送通知，支持多个）</label>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <select name="notify_enabled" style="width:150px" onchange="stunNotifyToggle(this.value)">
+              <option value="false" ${t.notify_enabled === 1 ? '' : 'selected'}>停用</option>
+              <option value="true" ${t.notify_enabled === 1 ? 'selected' : ''}>启用</option>
+            </select>
+            <span class="small muted">渠道（Webhook / 邮件 / 钉钉机器人）在「告警通知」页集中维护</span>
+          </div>
+          <div id="notifyCfg" class="${t.notify_enabled === 1 ? '' : 'hidden'}" style="margin-top:10px">
+            ${notifyList || '<div class="small muted">暂无通知渠道，请先到「告警通知」页新增渠道。</div>'}
+          </div>
+          <div class="small muted" style="margin-top:6px;line-height:1.7">
+            通知正文包含任务名、协议、内网目标、外网映射地址与 NAT 类型；投递结果写入「告警通知」页的
+            <b>最近发送记录</b>，渠道被删除或停用时自动跳过，<b>不影响穿透</b>。
+            保存后可在任务列表点<b>「通知」</b>试发一次，验证渠道勾选与投递链路是否正常。</div></div>
         <div class="form-foot full">
           <button type="button" class="btn" onclick="closeModal()">取消</button>
           <button class="btn primary">保存</button>
@@ -171,6 +347,135 @@ window.stunForm = async (id) => {
         $('#fStunHost').classList.toggle('hidden', v !== 'custom');
         $('#fStunPort').classList.toggle('hidden', v !== 'custom');
     };
+    // ---------- ESA 同步：站点/记录/规则均由 ESA API 实时拉取供勾选，不手填 ID ----------
+    const esaVal = sel => { const el = $(sel); return el ? el.value : ''; };
+    const esaTip = html => { const el = $('#esaTip'); if (el) el.innerHTML = html; };
+
+    /** 单行勾选项：tag 为需要直出样式的尾标提示（线上未找到 / 未核对） */
+    const esaPickRow = (id, name, desc, tag, on) => `
+      <label style="${ESA_ROW}">
+        <input type="checkbox" data-id="${esc(String(id))}" data-name="${esc(name)}" ${on ? 'checked' : ''}>
+        <span><b>${esc(name)}</b>${desc ? `<span class="muted"> · ${esc(desc)}</span>` : ''}${tag || ''}</span>
+      </label>`;
+
+    /** 渲染记录勾选列表：线上记录 + 快照中线上已不存在的项（保留可取消，避免默认丢掉用户的勾选） */
+    const renderEsaRecs = () => {
+        const box = $('#esaRecList');
+        if (!box) return;
+        const seen = new Set();
+        const rows = (esaRecOnline || []).map(r => {
+            seen.add(String(r.record_id));
+            const desc = [r.record_type, r.value || '无记录值', r.proxied ? '代理加速' : '直连',
+                r.comment ? '备注 ' + r.comment : ''].filter(Boolean).join(' · ');
+            return esaPickRow(r.record_id, r.record_name, desc, '', recChecked.has(String(r.record_id)));
+        });
+        const orphans = [...recChecked].filter(([id]) => !seen.has(id)).map(([id, name]) => esaPickRow(id, name,
+            '快照 ID ' + id,
+            esaRecOnline ? '<b style="color:var(--red)">　线上未找到（只更新不新增）</b>' : '<span class="muted">　未与线上核对</span>',
+            true));
+        box.innerHTML = rows.concat(orphans).join('')
+            || '<div class="small muted">尚未拉取。可点击“拉取 DNS 解析记录”后勾选。</div>';
+    };
+
+    /** 渲染回源规则勾选列表（全局回源配置不适用规则端口同步，不列出） */
+    const renderEsaRules = () => {
+        const box = $('#esaRuleList');
+        if (!box) return;
+        const seen = new Set();
+        const rows = (esaRuleOnline || []).filter(r => (r.config_type || '').toLowerCase() !== 'global').map(r => {
+            seen.add(String(r.config_id));
+            const desc = [r.origin_scheme ? '回源 ' + r.origin_scheme : '',
+                r.origin_https_port ? 'HTTPS 端口 ' + r.origin_https_port : '未设 HTTPS 端口',
+                r.rule_enable ? r.rule_enable : ''].filter(Boolean).join(' · ');
+            return esaPickRow(r.config_id, r.rule_name, desc, '', ruleChecked.has(String(r.config_id)));
+        });
+        const orphans = [...ruleChecked].filter(([id]) => !seen.has(id)).map(([id, name]) => esaPickRow(id, name,
+            '快照 ID ' + id,
+            esaRuleOnline ? '<b style="color:var(--red)">　线上未找到（只更新不新增）</b>' : '<span class="muted">　未与线上核对</span>',
+            true));
+        box.innerHTML = rows.concat(orphans).join('')
+            || '<div class="small muted">尚未拉取。可点击“拉取回源规则”后勾选（UDP 任务不会改动回源端口）。</div>';
+    };
+
+    window.stunEsaToggle = v => $('#esaSyncCfg').classList.toggle('hidden', v !== 'true');
+
+    window.stunNotifyToggle = v => $('#notifyCfg').classList.toggle('hidden', v !== 'true');
+
+    window.stunEsaCredChanged = () => { // 凭证变了，站点/记录/规则归属都可能变：清空重新选
+        const sel = $('#fEsaSite');
+        if (sel) sel.innerHTML = '<option value="">请先点击「拉取站点」</option>';
+        recChecked.clear(); ruleChecked.clear();
+        esaRecOnline = null; esaRuleOnline = null;
+        renderEsaRecs(); renderEsaRules();
+        esaTip('');
+    };
+
+    window.stunEsaSiteChanged = () => { // 换站点后旧列表失效，但保留已勾选项（拉到新列表后核对）
+        esaRecOnline = null; esaRuleOnline = null;
+        renderEsaRecs(); renderEsaRules();
+        esaTip('');
+    };
+
+    window.stunEsaLoadSites = async () => {
+        const cfg = esaVal('#fEsaCred');
+        if (!cfg) { esaTip('<span style="color:var(--red)">请先选择服务商凭证配置</span>'); return; }
+        const sel = $('#fEsaSite');
+        const cur = sel.value || String(t.esa_site_id || '');
+        sel.innerHTML = '<option value="">站点加载中…</option>';
+        esaTip('正在拉取 ESA 站点...');
+        try {
+            const r = await api('POST', '/api/stun/esa/sites', { provider_config_id: cfg });
+            const sites = r.sites || [];
+            if (!sites.length) {
+                sel.innerHTML = '<option value="">无可用站点</option>';
+                esaTip('<span style="color:var(--red)">该账号下未找到 ESA 站点，请先到阿里云 ESA 控制台添加站点。</span>');
+                return;
+            }
+            sel.innerHTML = '<option value="">请选择站点</option>' + sites.map(s =>
+                `<option value="${esc(s.site_id)}" ${cur === String(s.site_id) ? 'selected' : ''}>${esc(s.site_name)}（SiteId: ${esc(s.site_id)}${s.status ? '，' + esc(s.status) : ''}）</option>`).join('');
+            // 编辑时原站点不在列表：保留该项并提示，避免回显丢失
+            if (cur && !sites.some(s => String(s.site_id) === cur)) {
+                sel.insertAdjacentHTML('afterbegin', `<option value="${esc(cur)}" selected>${esc(cur)}（原站点，未在阿里云列表中找到）</option>`);
+            }
+            esaTip('');
+        } catch (e) {
+            sel.innerHTML = '<option value="">站点加载失败</option>';
+            esaTip(`<span style="color:var(--red)">${esc(e.message)}</span>`);
+        }
+    };
+
+    window.stunEsaLoadRecords = async () => {
+        const site = esaVal('#fEsaSite');
+        if (!site) { toast('请先选择 ESA 站点（可点“拉取站点”）', 'err'); return; }
+        const box = $('#esaRecList');
+        box.innerHTML = '<div class="small muted">解析记录加载中…</div>';
+        try {
+            esaRecOnline = (await api('POST', '/api/stun/esa/records',
+                { provider_config_id: esaVal('#fEsaCred'), site_id: site })).records || [];
+            // 拉取后的勾选中只剩仍在线上存在的项（多出的失效项由 render 标灰保留）
+            renderEsaRecs();
+        } catch (e) {
+            esaRecOnline = null; renderEsaRecs(); toast(e.message, 'err');
+        }
+    };
+
+    window.stunEsaLoadRules = async () => {
+        const site = esaVal('#fEsaSite');
+        if (!site) { toast('请先选择 ESA 站点（可点“拉取站点”）', 'err'); return; }
+        const box = $('#esaRuleList');
+        box.innerHTML = '<div class="small muted">回源规则加载中…</div>';
+        try {
+            esaRuleOnline = (await api('POST', '/api/stun/esa/origin-rules',
+                { provider_config_id: esaVal('#fEsaCred'), site_id: site })).rules || [];
+            renderEsaRules();
+        } catch (e) {
+            esaRuleOnline = null; renderEsaRules(); toast(e.message, 'err');
+        }
+    };
+
+    renderEsaRecs();
+    renderEsaRules();
+    if (t.esa_sync_enabled === 1 && t.provider_config_id) stunEsaLoadSites();
     let whs = [], whst = {};
     try { whs = t.webhook_config ? JSON.parse(t.webhook_config) : []; } catch (e) { whs = []; }
     try { whst = t.webhook_status ? JSON.parse(t.webhook_status) : {}; } catch (e) { whst = {}; }
@@ -190,6 +495,16 @@ window.stunForm = async (id) => {
         body.target_port = Number(body.target_port); body.bind_port = Number(body.bind_port || 0);
         body.keepalive_sec = Number(body.keepalive_sec || 25);
         body.upnp_enabled = body.upnp_enabled === 'true';
+        body.esa_sync_enabled = body.esa_sync_enabled === 'true';
+        body.provider_config_id = body.provider_config_id ? Number(body.provider_config_id) : null;
+        body.esa_site_id = (body.esa_site_id || '').trim();
+        // 勾选项从 DOM 收集为 [{id,name}]：id 为线上 RecordId/ConfigId，name 为名称快照（id 失效时回退匹配）
+        body.esa_records = esaCollect('#esaRecList');
+        body.esa_rules = esaCollect('#esaRuleList');
+        body.notify_enabled = body.notify_enabled === 'true';
+        // 勾选的通知渠道 id：与 ESA 勾选同样从列表 DOM 收集（停用时保留勾选，重新启用即恢复）
+        body.notify_channels = [...document.querySelectorAll('#notifyCfg input[data-id]:checked')]
+            .map(i => Number(i.dataset.id));
         body.webhooks = [...document.querySelectorAll('#stunWhList .wh-row')].map(r => {
             const method = r.querySelector('.wh-method').value;
             const headers = {};

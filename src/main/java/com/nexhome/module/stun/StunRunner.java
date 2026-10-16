@@ -973,19 +973,26 @@ final class StunRunner {
                 Database.update("UPDATE stun_task SET mapped_addr=? WHERE id=?", mapped, id);
             }
             // 映射地址落库后推送穿透结果（writeMapped 仅在首次穿透或接受真实变更时为 true）
-            if (writeMapped) notifyWebhook(wasPunched ? "stun.mapped_changed" : "stun.punched");
+            if (writeMapped) onMappedChanged(wasPunched ? "stun.mapped_changed" : "stun.punched");
         } catch (Exception e) {
             Logs.error(Logs.STUN, "更新映射状态失败: " + e.getMessage());
         }
     }
 
-    /** 穿透结果变化（首次穿透成功 / 外网映射地址变更）时按任务配置推送 webhook（读取最新行，异步推送，失败仅日志） */
-    private void notifyWebhook(String event) {
+    /**
+     * 映射地址落库后的联动动作（同一份最新任务行只查一次库）：按任务配置推送 webhook 与
+     * 通知中心（勾选的渠道），并把映射 IP/端口同步到阿里云 ESA 的解析记录与回源 HTTPS 端口。
+     * 三者均在各自独立线程异步执行、失败仅记日志，不占用调度池也不影响穿透与保活。
+     */
+    private void onMappedChanged(String event) {
         try {
             Map<String, Object> row = Database.queryOne("SELECT * FROM stun_task WHERE id=?", id);
-            if (row != null) StunWebhook.push(row, event);
+            if (row == null) return;
+            StunWebhook.push(row, event);
+            StunNotify.trigger(row, event);
+            StunEsaSync.triggerAsync(row);
         } catch (Exception e) {
-            Logs.warn(Logs.STUN, "任务[" + name + "] 触发穿透结果 webhook 失败: " + e.getMessage());
+            Logs.warn(Logs.STUN, "任务[" + name + "] 触发穿透结果联动失败: " + e.getMessage());
         }
     }
 

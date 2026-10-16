@@ -27,8 +27,11 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -39,7 +42,8 @@ import java.util.regex.Pattern;
 
 /**
  * 统一告警通知中心：集中维护通知渠道（Webhook / Email / 钉钉），
- * 各业务模块通过 {@link #broadcast(String, String, String)} 将事件按启用渠道扇出。
+ * 各业务模块通过 {@link #broadcast(String, String, String)} 将事件按启用渠道扇出，
+ * 或通过 {@link #broadcastTo(Collection, String, String, String)} 只投递到任务自选的若干渠道。
  * <p>
  * 渠道配置存于 {@code notify_channel.config}（JSON，按类型字段不同）：
  * <ul>
@@ -150,6 +154,42 @@ public final class NotifyService {
                 record(id, name, event, title, result);
             });
         }
+    }
+
+    /**
+     * 将事件按<b>指定渠道</b>异步扇出（供各模块做「按任务自选渠道」的通知投递，
+     * 与 {@link #broadcast} 的区别只在于渠道由调用方给定而非「全部启用渠道」）。
+     * <p>
+     * 渠道 id 的存在性与启用状态在投递线程内逐条核对：已被删除的渠道记告警跳过，
+     * 已停用的渠道同样跳过（停用即全局静默，不因任务勾选而绕过）；
+     * 调用方无需等待、不会因异常中断，每次投递仍写 {@code notify_log}。
+     */
+    public static void broadcastTo(Collection<Long> channelIds, String event, String title, String message) {
+        List<Long> ids = new ArrayList<>(new LinkedHashSet<>(channelIds == null ? List.of() : channelIds));
+        ids.removeIf(id -> id == null || id <= 0);
+        if (ids.isEmpty()) return;
+        // 查询也放到投递线程：调用方多为穿透保活/接收线程，不该为通知承担数据库锁等待
+        EXEC.submit(() -> {
+            for (Long cid : ids) {
+                Map<String, Object> ch;
+                try {
+                    ch = Database.queryOne("SELECT * FROM notify_channel WHERE id=?", cid);
+                } catch (SQLException e) {
+                    Logs.error(Logs.NOTIFY, "查询通知渠道 #" + cid + " 失败: " + e.getMessage());
+                    continue;
+                }
+                if (ch == null) {
+                    Logs.warn(Logs.NOTIFY, "通知渠道已删除，跳过事件 " + event + ": #" + cid);
+                    continue;
+                }
+                if (num(ch, "enabled") != 1) {
+                    Logs.info(Logs.NOTIFY, "通知渠道[" + str(ch, "name") + "] 已停用，跳过事件 " + event);
+                    continue;
+                }
+                String result = dispatch(str(ch, "type"), JsonUtils.parse(str(ch, "config")), title, message, event);
+                record(num(ch, "id"), str(ch, "name"), event, title, result);
+            }
+        });
     }
 
     // ---------- 渠道增删改 ----------

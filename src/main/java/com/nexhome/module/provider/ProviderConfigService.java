@@ -12,17 +12,18 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * 服务商凭证配置：集中维护阿里云 AccessKey，供 DDNS 同步（云解析 / ESA）与
- * SSL 证书（DNS01 自动验证）按名称选择引用，避免在每个任务中重复填写。
+ * 服务商凭证配置：集中维护阿里云 AccessKey，供 DDNS 同步（云解析 / ESA）、
+ * SSL 证书（DNS01 自动验证）与 STUN 穿透的 ESA 同步按名称选择引用，避免在每个任务中重复填写。
  * <p>
- * 任务通过 ddns_task / cert_task.provider_config_id 引用本表：
+ * 任务通过 ddns_task / cert_task / stun_task.provider_config_id 引用本表：
  * <ul>
- *   <li>DDNS 同步时实时读取引用配置的凭证，修改配置后所有引用任务自动生效；</li>
+ *   <li>同步时实时读取引用配置的凭证，修改配置后所有引用任务自动生效；</li>
  *   <li>删除配置时将当前凭证回填到引用的 DDNS 任务（转为任务内手动凭证，保证继续可用），
- *       证书任务解除引用回到手动添加 TXT 模式。</li>
+ *       证书任务解除引用回到手动添加 TXT 模式，穿透任务停用 ESA 同步并解除引用。</li>
  * </ul>
  * esa_site_id 为可选项：仅阿里云 ESA 使用，DDNS 任务表单选择配置后自动带出，仍可按任务覆盖；
- * SSL 证书 DNS01 在云解析定位不到域名（解析托管在 ESA）时自动用该站点写入验证 TXT 记录。
+ * SSL 证书 DNS01 在云解析定位不到域名（解析托管在 ESA）时自动用该站点写入验证 TXT 记录；
+ * STUN 穿透的 ESA 同步（映射 IP 写解析记录、映射端口写回源 HTTPS 端口）也以本表为唯一凭证入口。
  */
 public final class ProviderConfigService {
 
@@ -120,7 +121,8 @@ public final class ProviderConfigService {
 
     /**
      * 删除配置：引用该配置的 DDNS 任务回填当前凭证转为任务内手动凭证（保证继续可用），
-     * 证书任务解除引用回到手动添加 TXT 模式。
+     * 证书任务解除引用回到手动添加 TXT 模式；STUN 穿透任务的 ESA 同步只支持引用配置（无任务内
+     * AK/SK 可回填），改为停用同步并解除引用，避免同步时读到不存在的配置反复报错。
      */
     private static void delete(Ctx ctx) throws Exception {
         long id = ctx.paramLong("id");
@@ -130,8 +132,12 @@ public final class ProviderConfigService {
                 WHERE provider_config_id=?""",
                 cfg.get("access_key_id"), cfg.get("access_key_secret"), id);
         Database.update("UPDATE cert_task SET provider_config_id=NULL WHERE provider_config_id=?", id);
+        int stunOff = Database.update("""
+                UPDATE stun_task SET esa_sync_enabled=0, provider_config_id=NULL
+                WHERE provider_config_id=?""", id);
         Database.update("DELETE FROM provider_config WHERE id=?", id);
-        Logs.info(Logs.PROVIDER, "删除服务商凭证配置 #" + id + ": " + cfg.get("name") + "（引用任务已回填凭证）");
+        Logs.info(Logs.PROVIDER, "删除服务商凭证配置 #" + id + ": " + cfg.get("name") + "（引用任务已回填凭证"
+                + (stunOff > 0 ? "；" + stunOff + " 个穿透任务已停用 ESA 同步，需重新选择凭证配置" : "") + "）");
         ctx.ok("已删除，引用该配置的任务已回填当前凭证");
     }
 

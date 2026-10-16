@@ -3,6 +3,8 @@ package com.nexhome.module.stun;
 import com.nexhome.core.Database;
 import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
+import com.nexhome.module.ddns.AliyunClient;
+import com.nexhome.module.provider.ProviderConfigService;
 import com.nexhome.web.Ctx;
 import com.nexhome.web.WebServer;
 
@@ -19,7 +21,12 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * STUN 穿透任务管理服务：增删改查 + 启停控制 + 状态持久化（重启自动加载）。
+ * STUN 穿透任务管理服务：增删改查 + 启停控制 + 状态持久化（重启自动加载），
+ * 并提供 ESA（边缘安全加速）站点/解析记录/回源规则的线上列表拉取与手动同步入口。
+ * <p>
+ * 穿透结果有三个可独立启用的联动出口（触发点同一：首次穿透成功、外网映射地址变化）：
+ * {@link StunWebhook}（任务内自定义 HTTP 回调）、{@link StunEsaSync}（写阿里云 ESA 解析/回源）、
+ * {@link StunNotify}（投递到统一告警通知中心，渠道由任务多选勾选）。
  */
 public final class StunService {
 
@@ -54,6 +61,18 @@ public final class StunService {
             if (runner == null) throw new IllegalArgumentException("任务未运行，无法自测");
             ctx.ok(runner.verifyNow());
         });
+        // 手动立即同步一次 ESA（按当前外网映射地址更新解析记录与回源端口，返回逐条明细）
+        WebServer.route("POST", "/api/stun/tasks/{id}/esa-sync", ctx ->
+                ctx.ok(StunEsaSync.syncNow(mustGet(ctx.paramLong("id")))));
+        // 手动试发一次通知：按任务勾选的渠道投递测试通知（异步投递，结果见「告警通知」页发送记录）
+        WebServer.route("POST", "/api/stun/tasks/{id}/notify-test", ctx -> {
+            int n = StunNotify.testSend(mustGet(ctx.paramLong("id")));
+            ctx.ok("已按 " + n + " 个勾选渠道投递测试通知，发送结果见「告警通知」页的最近发送记录");
+        });
+        // ESA 站点/解析记录/回源规则列表：供任务表单勾选（只读拉取，不改动云端）
+        WebServer.route("POST", "/api/stun/esa/sites", StunService::esaSites);
+        WebServer.route("POST", "/api/stun/esa/records", StunService::esaRecords);
+        WebServer.route("POST", "/api/stun/esa/origin-rules", StunService::esaOriginRules);
         // 单独探测一次：不启动任务，仅检测 NAT 类型与映射地址（TCP 任务另探测 TCP 映射）
         WebServer.route("POST", "/api/stun/tasks/{id}/test", ctx -> {
             long taskId = ctx.paramLong("id");
@@ -128,6 +147,14 @@ public final class StunService {
         ensureColumn("upnp_enabled", "INTEGER NOT NULL DEFAULT 1");
         ensureColumn("webhook_config", "TEXT");
         ensureColumn("webhook_status", "TEXT");
+        ensureColumn("esa_sync_enabled", "INTEGER NOT NULL DEFAULT 0");
+        ensureColumn("provider_config_id", "INTEGER");
+        ensureColumn("esa_site_id", "TEXT");
+        ensureColumn("esa_records", "TEXT");
+        ensureColumn("esa_rules", "TEXT");
+        ensureColumn("esa_sync_status", "TEXT");
+        ensureColumn("notify_enabled", "INTEGER NOT NULL DEFAULT 0");
+        ensureColumn("notify_channels", "TEXT");
     }
 
     private static void ensureColumn(String name, String type) throws SQLException {
@@ -154,14 +181,21 @@ public final class StunService {
         validate(b);
         long id = Database.insert("""
                 INSERT INTO stun_task(name, protocol, target_ip, target_port, bind_port,
-                    stun_host, stun_port, keepalive_sec, peer_addr, upnp_enabled, webhook_config, enabled)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    stun_host, stun_port, keepalive_sec, peer_addr, upnp_enabled, webhook_config,
+                    esa_sync_enabled, provider_config_id, esa_site_id, esa_records, esa_rules,
+                    notify_enabled, notify_channels, enabled)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "protocol"), JsonUtils.str(b, "target_ip"),
                 JsonUtils.num(b, "target_port", 0), JsonUtils.num(b, "bind_port", 0),
                 JsonUtils.str(b, "stun_host"), JsonUtils.num(b, "stun_port", 19302),
                 JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"),
                 JsonUtils.bool(b, "upnp_enabled", true) ? 1 : 0,
                 serializeWebhooks(b),
+                JsonUtils.bool(b, "esa_sync_enabled", false) ? 1 : 0,
+                ProviderConfigService.parseId(b, "provider_config_id"),
+                JsonUtils.str(b, "esa_site_id").trim(),
+                serializePicked(b, "esa_records"), serializePicked(b, "esa_rules"),
+                JsonUtils.bool(b, "notify_enabled", false) ? 1 : 0, serializeNotifyChannels(b),
                 JsonUtils.bool(b, "enabled", false) ? 1 : 0);
         Logs.info(Logs.STUN, "新增穿透任务: " + JsonUtils.str(b, "name"));
         // 创建即要求启动的场景：前端传 enabled=1 时自动启动
@@ -178,12 +212,19 @@ public final class StunService {
         validate(b);
         Database.update("""
                 UPDATE stun_task SET name=?, protocol=?, target_ip=?, target_port=?, bind_port=?,
-                    stun_host=?, stun_port=?, keepalive_sec=?, peer_addr=?, upnp_enabled=?, webhook_config=? WHERE id=?""",
+                    stun_host=?, stun_port=?, keepalive_sec=?, peer_addr=?, upnp_enabled=?, webhook_config=?,
+                    esa_sync_enabled=?, provider_config_id=?, esa_site_id=?, esa_records=?, esa_rules=?,
+                    notify_enabled=?, notify_channels=? WHERE id=?""",
                 JsonUtils.str(b, "name"), JsonUtils.str(b, "protocol"), JsonUtils.str(b, "target_ip"),
                 JsonUtils.num(b, "target_port", 0), JsonUtils.num(b, "bind_port", 0),
                 JsonUtils.str(b, "stun_host"), JsonUtils.num(b, "stun_port", 19302),
                 JsonUtils.num(b, "keepalive_sec", 25), JsonUtils.str(b, "peer_addr"),
-                JsonUtils.bool(b, "upnp_enabled", true) ? 1 : 0, serializeWebhooks(b), id);
+                JsonUtils.bool(b, "upnp_enabled", true) ? 1 : 0, serializeWebhooks(b),
+                JsonUtils.bool(b, "esa_sync_enabled", false) ? 1 : 0,
+                ProviderConfigService.parseId(b, "provider_config_id"),
+                JsonUtils.str(b, "esa_site_id").trim(),
+                serializePicked(b, "esa_records"), serializePicked(b, "esa_rules"),
+                JsonUtils.bool(b, "notify_enabled", false) ? 1 : 0, serializeNotifyChannels(b), id);
         Logs.info(Logs.STUN, "更新穿透任务 #" + id + ": " + JsonUtils.str(b, "name"));
         // 运行中修改配置 -> 重启任务使配置生效
         if (wasRunning) {
@@ -246,7 +287,7 @@ public final class StunService {
     }
 
     /** 表单校验 */
-    private static void validate(JsonObject b) {
+    private static void validate(JsonObject b) throws SQLException {
         if (JsonUtils.str(b, "name").isBlank()) throw new IllegalArgumentException("任务名称不能为空");
         String protocol = JsonUtils.str(b, "protocol");
         if (!"TCP".equals(protocol) && !"UDP".equals(protocol)) {
@@ -274,6 +315,8 @@ public final class StunService {
             }
         }
         validateWebhooks(b);
+        validateEsaSync(b);
+        validateNotify(b);
     }
 
     /** Webhook 配置校验：地址须为 http/https，请求方式仅 GET/POST（空地址忽略） */
@@ -319,6 +362,142 @@ public final class StunService {
             out.add(o);
         }
         return out.size() == 0 ? "" : out.toString();
+    }
+
+    // ---------- 通知中心（渠道勾选校验/序列化） ----------
+
+    /** 通知配置校验：启用时必须至少勾选一个渠道，且渠道必须存在（已被删除的渠道给出可读数错） */
+    private static void validateNotify(JsonObject b) throws SQLException {
+        if (!JsonUtils.bool(b, "notify_enabled", false)) return;
+        String channels = serializeNotifyChannels(b);
+        List<Long> ids = StunNotify.parseChannelIds(channels);
+        if (ids.isEmpty()) throw new IllegalArgumentException("启用穿透通知需至少选择一个通知渠道");
+        for (Long id : ids) {
+            if (Database.queryOne("SELECT id FROM notify_channel WHERE id=?", id) == null) {
+                throw new IllegalArgumentException("通知渠道不存在: #" + id + "，请重新选择通知渠道");
+            }
+        }
+    }
+
+    /** 将前端勾选的 notify_channels 数组规范化为存储用 JSON 数字串（过滤非法项与重复 id） */
+    private static String serializeNotifyChannels(JsonObject b) {
+        if (!b.has("notify_channels") || !b.get("notify_channels").isJsonArray()) return "";
+        List<Long> ids = StunNotify.parseChannelIds(b.getAsJsonArray("notify_channels").toString());
+        JsonArray out = new JsonArray();
+        ids.forEach(out::add);
+        return out.size() == 0 ? "" : out.toString();
+    }
+
+    // ---------- ESA 同步（配置校验/序列化 + 线上列表拉取） ----------
+
+    /** ESA 同步校验：启用时必须有凭证配置与站点，且至少勾选一条解析记录或回源规则 */
+    private static void validateEsaSync(JsonObject b) {
+        if (!JsonUtils.bool(b, "esa_sync_enabled", false)) return;
+        if (ProviderConfigService.parseId(b, "provider_config_id") == null) {
+            throw new IllegalArgumentException("启用 ESA 同步需选择服务商凭证配置");
+        }
+        if (JsonUtils.str(b, "esa_site_id").trim().isEmpty()) {
+            throw new IllegalArgumentException("启用 ESA 同步需选择 ESA 站点");
+        }
+        if (serializePicked(b, "esa_records").isEmpty() && serializePicked(b, "esa_rules").isEmpty()) {
+            throw new IllegalArgumentException("启用 ESA 同步需至少勾选一条解析记录或回源规则");
+        }
+    }
+
+    /**
+     * 将前端勾选的 ESA 记录/规则数组规范化为存储用 JSON 串（元素 {id,name}，无 id 项丢弃）：
+     * id 为线上 RecordId/ConfigId（定位为主键），name 为名称快照（id 失效时按名称回退）。
+     */
+    private static String serializePicked(JsonObject b, String key) {
+        if (!b.has(key) || !b.get(key).isJsonArray()) return "";
+        JsonArray out = new JsonArray();
+        for (JsonElement el : b.getAsJsonArray(key)) {
+            if (!el.isJsonObject()) continue;
+            JsonObject o = el.getAsJsonObject();
+            long id;
+            try {
+                id = Long.parseLong(JsonUtils.str(o, "id").trim());
+            } catch (NumberFormatException e) {
+                continue; // 非线上真实 id（如占位项）直接丢弃
+            }
+            if (id <= 0) continue;
+            JsonObject item = new JsonObject();
+            item.addProperty("id", id);
+            item.addProperty("name", JsonUtils.str(o, "name").trim());
+            out.add(item);
+        }
+        return out.size() == 0 ? "" : out.toString();
+    }
+
+    /** 拉取 ESA 站点列表（表单下拉选择，不手填 SiteId） */
+    private static void esaSites(Ctx ctx) throws Exception {
+        String[] cred = esaCredentials(ctx.body());
+        JsonArray out = new JsonArray();
+        for (JsonElement el : AliyunClient.esaListSites(cred[0], cred[1])) {
+            if (!el.isJsonObject()) continue;
+            JsonObject s = el.getAsJsonObject();
+            JsonObject o = new JsonObject();
+            o.addProperty("site_id", s.has("SiteId") ? String.valueOf(s.get("SiteId").getAsLong()) : "");
+            o.addProperty("site_name", JsonUtils.str(s, "SiteName"));
+            o.addProperty("status", JsonUtils.str(s, "Status"));
+            out.add(o);
+        }
+        ctx.ok(Map.of("sites", out));
+    }
+
+    /** 拉取站点下全部解析记录（含当前记录值，供勾选与回显） */
+    private static void esaRecords(Ctx ctx) throws Exception {
+        JsonObject b = ctx.body();
+        String[] cred = esaCredentials(b);
+        String siteId = JsonUtils.str(b, "site_id").trim();
+        if (siteId.isEmpty()) throw new IllegalArgumentException("请先选择 ESA 站点");
+        JsonArray out = new JsonArray();
+        for (JsonElement el : AliyunClient.esaListAllRecords(cred[0], cred[1], siteId)) {
+            if (!el.isJsonObject()) continue;
+            JsonObject r = el.getAsJsonObject();
+            JsonObject o = new JsonObject();
+            o.addProperty("record_id", r.has("RecordId") ? String.valueOf(r.get("RecordId").getAsLong()) : "");
+            o.addProperty("record_name", JsonUtils.str(r, "RecordName"));
+            o.addProperty("record_type", JsonUtils.str(r, "RecordType"));
+            o.addProperty("value", r.has("Data") && r.get("Data").isJsonObject()
+                    ? JsonUtils.str(r.getAsJsonObject("Data"), "Value") : "");
+            o.addProperty("ttl", r.has("Ttl") && !r.get("Ttl").isJsonNull() ? r.get("Ttl").getAsString() : "");
+            o.addProperty("proxied", r.has("Proxied") && !r.get("Proxied").isJsonNull()
+                    && r.get("Proxied").getAsBoolean());
+            o.addProperty("comment", JsonUtils.str(r, "Comment"));
+            out.add(o);
+        }
+        ctx.ok(Map.of("records", out));
+    }
+
+    /** 拉取站点下全部回源规则（含当前回源协议与端口；全局配置由前端过滤不展示） */
+    private static void esaOriginRules(Ctx ctx) throws Exception {
+        JsonObject b = ctx.body();
+        String[] cred = esaCredentials(b);
+        String siteId = JsonUtils.str(b, "site_id").trim();
+        if (siteId.isEmpty()) throw new IllegalArgumentException("请先选择 ESA 站点");
+        JsonArray out = new JsonArray();
+        for (JsonElement el : AliyunClient.esaListOriginRules(cred[0], cred[1], siteId)) {
+            if (!el.isJsonObject()) continue;
+            JsonObject r = el.getAsJsonObject();
+            JsonObject o = new JsonObject();
+            o.addProperty("config_id", r.has("ConfigId") ? String.valueOf(r.get("ConfigId").getAsLong()) : "");
+            o.addProperty("rule_name", JsonUtils.str(r, "RuleName"));
+            o.addProperty("config_type", JsonUtils.str(r, "ConfigType"));
+            o.addProperty("origin_scheme", JsonUtils.str(r, "OriginScheme"));
+            o.addProperty("origin_https_port", JsonUtils.str(r, "OriginHttpsPort"));
+            o.addProperty("origin_http_port", JsonUtils.str(r, "OriginHttpPort"));
+            o.addProperty("rule_enable", JsonUtils.str(r, "RuleEnable"));
+            out.add(o);
+        }
+        ctx.ok(Map.of("rules", out));
+    }
+
+    /** 拉取线上列表用的凭证：ESA 同步只支持引用服务商凭证配置（与 DDNS 的实时读取一致） */
+    private static String[] esaCredentials(JsonObject b) throws SQLException {
+        Long cfgId = ProviderConfigService.parseId(b, "provider_config_id");
+        if (cfgId == null) throw new IllegalArgumentException("请先选择服务商凭证配置");
+        return ProviderConfigService.credentials(cfgId);
     }
 
     /** 将 webhook 项内的对象字段（headers/params）规范化为字符串值对象，缺失时返回空对象 */

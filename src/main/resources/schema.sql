@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS ddns_task (
 -- webhook_config : 可选，穿透结果同步的 webhook 列表（JSON 数组，每项 {url,method(GET/POST),headers,params}），
 --                  穿透成功 / 外网映射地址变化时推送结果，支持多个、自定义请求头与参数（值支持 ${字段} 占位符）
 -- webhook_status : 各 webhook 最近一次调用结果（JSON 对象，url -> {time,result}），result 为成功/失败原因（如 OK(HTTP 200) / FAIL(...)）
+-- esa_sync_enabled : 是否把穿透结果同步到阿里云 ESA（边缘安全加速）：映射 IP 写解析记录、映射端口写回源 HTTPS 端口
+-- provider_config_id : 引用服务商凭证配置（唯一凭证入口，AK/SK 实时读取；删除配置时本列置空并停用同步）
+-- esa_site_id   : 选中的 ESA 站点 SiteId（表单从线上站点列表选择，不手填）
+-- esa_records   : 勾选待更新的解析记录（JSON 数组，元素 {id,name}；id 为线上 RecordId，name 为名称快照供 id 失效时回退）
+-- esa_rules     : 勾选待更新的回源规则（JSON 数组，元素 {id,name}；id 为 ConfigId，仅 TCP 任务改回源端口）
+-- esa_sync_status : 最近一次 ESA 同步结果（JSON 对象 {time,result,mapped_addr,items}），
+--                  items 每项 {kind(record|rule),name,from,to,state(OK|SKIP|FAIL),msg}，供前端展示与手动重试
+-- notify_enabled  : 是否把穿透结果投递到统一告警通知中心（触发点与 webhook 一致：首次穿透成功、映射地址变化）
+-- notify_channels : 勾选的通知渠道 id（JSON 数组，如 [1,3]，引用 notify_channel.id；渠道被删除/停用时投递自动跳过）
 CREATE TABLE IF NOT EXISTS stun_task (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
@@ -92,6 +101,14 @@ CREATE TABLE IF NOT EXISTS stun_task (
     check_result  TEXT,
     webhook_config TEXT,
     webhook_status TEXT,
+    esa_sync_enabled INTEGER NOT NULL DEFAULT 0,
+    provider_config_id INTEGER,
+    esa_site_id   TEXT,
+    esa_records   TEXT,
+    esa_rules     TEXT,
+    esa_sync_status TEXT,
+    notify_enabled INTEGER NOT NULL DEFAULT 0,
+    notify_channels TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
@@ -169,7 +186,8 @@ CREATE TABLE IF NOT EXISTS nav_item (
     created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
--- 告警通知渠道表（统一通知中心：Webhook / Email / 钉钉，各模块事件按启用渠道扇出）
+-- 告警通知渠道表（统一通知中心：Webhook / Email / 钉钉，各模块事件按启用渠道扇出；
+-- 穿透任务等可按任务自选渠道扇出，见 stun_task.notify_channels）
 -- type   : WEBHOOK（通用 HTTP 回调） / EMAIL（SMTP 邮件） / DINGTALK（钉钉自定义机器人）
 -- config : 按渠道类型的 JSON 配置（详见 NotifyService 类注释），含敏感信息如邮箱密码、加签密钥
 CREATE TABLE IF NOT EXISTS notify_channel (
