@@ -326,7 +326,7 @@ window.dockerDetail = async id => {
       ${sec('端口映射')}
       <table><tbody>${mapRows || '<tr><td class="muted">未暴露端口</td></tr>'}</tbody></table>
       ${sec('挂载')}
-      <table>${mntRows ? '<thead><tr><th style="width:60px">类型</th><th>宿主机路径</th><th>容器内路径</th><th style="width:70px">模式</th></tr></thead><tbody>' + mntRows + '</tbody>'
+      <table>${mntRows ? '<thead><tr><th style="width:100px">类型</th><th>宿主机路径</th><th style="width: 300px">容器内路径</th><th style="width:70px">模式</th></tr></thead><tbody>' + mntRows + '</tbody>'
         : '<tbody><tr><td class="muted">无挂载</td></tr></tbody>'}</table>
       ${sec('环境变量')}
       <table><tbody>${envRows || '<tr><td class="muted">无</td></tr>'}</tbody></table>`, 'wide');

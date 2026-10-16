@@ -68,7 +68,7 @@ async function renderStun() {
                 <th style="width: 90px">流量</th>
                 <th style="width: 145px">ESA 同步</th>
                 <th style="width: 110px">通知推送</th>
-                <th style="width: 190px">可用性自测</th>
+                <th style="width: 145px">可用性自测</th>
                 <th style="width: 310px">操作</th>
             </tr>
         </thead>

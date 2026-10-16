@@ -57,12 +57,12 @@ async function renderCert() {
       <div class="panel"><table>
         <thead>
           <tr>
-            <th style="width:16%">任务</th>
+            <th style="width:20%">任务</th>
             <th>域名</th>
-            <th style="width:20%">状态</th>
-            <th style="width:12%">到期时间</th>
+            <th style="width:10%">状态</th>
+            <th style="width:10%">到期时间</th>
             <th style="width:10%">自动续期</th>
-            <th style="width:210px">操作</th>
+            <th style="width:280px">操作</th>
           </tr>
         </thead>
         <tbody id="certTbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody>
