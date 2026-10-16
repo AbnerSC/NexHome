@@ -126,7 +126,7 @@ window.stunForm = async (id) => {
           <label>Webhook 同步（可选，穿透成功 / 映射地址变化时将结果推送到以下地址，支持多个）</label>
           <div id="stunWhList"></div>
           <div style="margin-top:6px"><button type="button" class="btn small" onclick="stunWhAdd()">＋ 添加 Webhook</button></div>
-          <div class="small muted" style="margin-top:10px;padding:10px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0">
+          <div class="small muted" style="margin-top:10px;padding:10px;background:var(--code-bg);border-radius:8px;border:1px solid var(--border)">
             <b>可用占位符（在 URL、请求头、参数值、JSON 请求体中引用）：</b>
             <div style="display:flex;gap:16px;align-items:flex-start;margin-top:6px">
               <table style="flex:1">
@@ -228,13 +228,13 @@ window.stunWhAdd = (w, status) => {
     if (!list) return;
     const row = document.createElement('div');
     row.className = 'wh-row';
-    row.style.cssText = 'display:flex;gap:8px;align-items:flex-start;margin-bottom:12px;flex-wrap:wrap;padding:12px;border:1px solid #e2e8f0;border-radius:8px;background:#fafbfc';
+    row.style.cssText = 'display:flex;gap:8px;align-items:flex-start;margin-bottom:12px;flex-wrap:wrap;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--code-bg)';
     const headersText = Object.entries(w.headers || {}).map(([k, v]) => k + ': ' + v).join('\n');
     const paramsText = Object.entries(w.params || {}).map(([k, v]) => k + '=' + v).join('\n');
     const bodyText = w.body || '';
     const st = status && status.result
         ? `上次调用：<span>${esc(status.time || '')}</span> `
-          + `<b style="color:${String(status.result).startsWith('OK') ? '#16a34a' : '#dc2626'}">${esc(status.result)}</b>`
+          + `<b style="color:${String(status.result).startsWith('OK') ? '#34d399' : '#fb7185'}">${esc(status.result)}</b>`
         : '尚未调用';
     const isPost = w.method !== 'GET';
     row.innerHTML = `
@@ -448,7 +448,7 @@ function tfRenderChart(host, name, points, theme, tickFmt, tipFmt) {
     let grid = '';
     for (let g = 0; g <= 4; g++) {
         const y = (P.t + ih - (ih * g) / 4).toFixed(1);
-        grid += `<line x1="${P.l}" y1="${y}" x2="${W - P.r}" y2="${y}" stroke="${g ? '#eef2f8' : '#e2e8f0'}" stroke-dasharray="${g ? '3 4' : ''}"/>`
+        grid += `<line x1="${P.l}" y1="${y}" x2="${W - P.r}" y2="${y}" stroke="${g ? 'rgba(148,163,200,.10)' : 'rgba(148,163,200,.24)'}" stroke-dasharray="${g ? '3 4' : ''}"/>`
             + `<text x="${P.l - 7}" y="${+y + 3.5}" text-anchor="end" font-size="9.5" fill="#94a3b8">${fmtTrafficBytes((nice * g) / 4)}</text>`;
     }
     // 横轴刻度（最多 ~6 个，末尾必显）

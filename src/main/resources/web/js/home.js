@@ -11,6 +11,71 @@ function iconSrc(u) {
     return u && u.startsWith('/') ? API_BASE + u : u;
 }
 
+/**
+ * 图标形状与主色分析：拉取图标像素（blob 同源，canvas 不被污染），
+ * 依据「四角不透明度 + 不透明覆盖率」判定圆角/方角/圆形/不规则，
+ * 并提取不透明区域主色（过暗时提亮）作为卡片悬停辉光。
+ * 任何失败（外链无 CORS、非图片、超时）返回 null，由调用方回退通用玻璃框。
+ * @returns {Promise<{shape:string, accent:string}|null>} shape=形状类 accent="r,g,b"
+ */
+async function analyzeIcon(url, timeoutMs = 1200) {
+    try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        const resp = await fetch(url, { mode: 'cors', cache: 'force-cache', signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!resp.ok) return null;
+        const blob = await resp.blob();
+        if (!blob.type.startsWith('image/')) return null;
+        const objUrl = URL.createObjectURL(blob);
+        const img = new Image();
+        await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = objUrl; });
+        URL.revokeObjectURL(objUrl);
+        const S = 48;
+        const cv = document.createElement('canvas');
+        cv.width = S; cv.height = S;
+        const cx = cv.getContext('2d', { willReadFrequently: true });
+        const sc = Math.min(S / img.naturalWidth, S / img.naturalHeight);
+        const w = img.naturalWidth * sc, h = img.naturalHeight * sc;
+        cx.drawImage(img, (S - w) / 2, (S - h) / 2, w, h);
+        const { data } = cx.getImageData(0, 0, S, S);
+        const A = (x, y) => data[(y * S + x) * 4 + 3];
+        let opaque = 0, transparent = false, sr = 0, sg = 0, sb = 0;
+        let minX = S, maxX = -1, minY = S, maxY = -1;
+        for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+            const a = A(x, y);
+            if (a < 250) transparent = true;
+            if (a > 128) {
+                const i = (y * S + x) * 4; sr += data[i]; sg += data[i + 1]; sb += data[i + 2]; opaque++;
+                if (x < minX) minX = x; if (x > maxX) maxX = x;
+                if (y < minY) minY = y; if (y > maxY) maxY = y;
+            }
+        }
+        if (!opaque) return null;
+        // 覆盖率基于不透明包围盒（而非整张画布），图标不铺满画布时判定依然准确
+        const bw = maxX - minX + 1, bh = maxY - minY + 1;
+        const coverage = opaque / (bw * bh);
+        // 包围盒四角平均不透明度：区分「实心方角」与「带透明圆角/圆形」
+        const c = Math.max(2, Math.floor(Math.min(bw, bh) * 0.2));
+        let cornerSum = 0;
+        for (const [ox, oy] of [[minX, minY], [maxX - c + 1, minY], [minX, maxY - c + 1], [maxX - c + 1, maxY - c + 1]])
+            for (let y = 0; y < c; y++) for (let x = 0; x < c; x++) cornerSum += A(ox + x, oy + y);
+        const cornerAlpha = cornerSum / (c * c * 4);
+        let shape;
+        // 方角需「四角填实且整体高覆盖」；镂空字标虽四角有笔画但覆盖率低，不归方角
+        if (!transparent || (cornerAlpha > 200 && coverage > 0.8)) shape = 'is-square';
+        else if (coverage > 0.88) shape = 'is-rounded';               // 包围盒内高覆盖+透明角 → 圆角图标
+        else if (coverage > 0.70) shape = 'is-circle';                // ≈π/4 覆盖 → 圆形图标
+        else shape = 'is-irregular';                                  // 低覆盖/镂空 → 不规则，需底板托底
+        // 主色提亮，保证在深色卡片上作为辉光足够醒目
+        let ar = Math.round(sr / opaque), ag = Math.round(sg / opaque), ab = Math.round(sb / opaque);
+        if (0.299 * ar + 0.587 * ag + 0.114 * ab < 90) {
+            ar = Math.min(255, ar + 70); ag = Math.min(255, ag + 70); ab = Math.min(255, ab + 70);
+        }
+        return { shape, accent: `${ar},${ag},${ab}` };
+    } catch (e) { return null; }
+}
+
 function isLanVisit() {
     // 探测结果优先：直接反映浏览器所在网络，不受访问链路（域名/反代/回流）干扰
     if (navProbeLan !== null) return navProbeLan;
@@ -71,7 +136,8 @@ async function renderHome() {
     if (!items.length) {
         html += '<div class="panel"><p class="muted">暂无导航条目，点击右上角「新增导航」添加。</p></div>';
     } else {
-        html += '<div class="nav-grid">';
+        // 先收集有效磁贴，再并发分析图标形状/主色（限时、失败回退通用框），保证一次渲染到位不跳动
+        const tiles = [];
         for (const it of items.filter(i => i.enabled === 1)) {
             const lanFirst = mode === 'lan';
             // 当前模式无对应地址时回退到另一地址（两地址允许只填其一）
@@ -80,20 +146,29 @@ async function renderHome() {
             if (!url) continue;
             const fallback = !preferred;
             const kind = (preferred ? lanFirst : !lanFirst) ? '内网地址' : '外网地址';
-            const icon = it.icon_url
-                ? `<img src="${esc(iconSrc(it.icon_url))}" onerror="this.replaceWith(document.createTextNode('🌍'))">`
-                : '🌍';
             const tip = [it.description, (fallback ? '回退' : '') + kind + '：' + url].filter(Boolean).join('\n');
-            html += `
-            <div class="nav-tile" title="${esc(tip)}" onclick="window.open('${esc(url)}','_blank')">
-              <div class="tile-actions">
-                <button class="btn small" onclick="event.stopPropagation();navForm(${it.id})">编辑</button>
-                <button class="btn small danger" onclick="event.stopPropagation();navDelete(${it.id})">删除</button>
-              </div>
-              <div class="tile-icon">${icon}</div>
-              <div class="tile-name">${esc(it.name)}</div>
-            </div>`;
+            tiles.push({ it, url, tip });
         }
+        const metas = await Promise.all(tiles.map(t => t.it.icon_url ? analyzeIcon(iconSrc(t.it.icon_url)) : null));
+        html += '<div class="nav-grid">';
+        tiles.forEach((t, i) => {
+            const meta = metas[i];
+            // 形状类：分析成功用判定结果；有图标但分析失败用通用玻璃框；无图标用 emoji 框
+            const shapeCls = t.it.icon_url ? (meta ? meta.shape : 'is-auto') : 'is-emoji';
+            const accent = meta ? meta.accent : '109,139,255';
+            const icon = t.it.icon_url
+                ? `<img src="${esc(iconSrc(t.it.icon_url))}" onerror="this.replaceWith(document.createTextNode('🌍'))">`
+                : '🌍';
+            html += `
+            <div class="nav-tile" style="--tile-accent:${accent};--i:${i}" title="${esc(t.tip)}" onclick="window.open('${esc(t.url)}','_blank')">
+              <div class="tile-actions">
+                <button class="btn small" onclick="event.stopPropagation();navForm(${t.it.id})">编辑</button>
+                <button class="btn small danger" onclick="event.stopPropagation();navDelete(${t.it.id})">删除</button>
+              </div>
+              <div class="tile-icon ${shapeCls}">${icon}</div>
+              <div class="tile-name">${esc(t.it.name)}</div>
+            </div>`;
+        });
         html += '</div>';
     }
     html += '</div>';
