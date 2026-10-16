@@ -29,7 +29,7 @@ async function renderDocker() {
         ov = await api('GET', '/api/docker/overview');
     } catch (e) {
         $('#pageBody').innerHTML = `<div class="tip" style="background:var(--err-soft-bg);border-color:var(--err-soft-border);color:#fda4af">Docker 状态获取失败：${esc(e.message)}</div>`;
-        setRefresh(renderDocker, 10000);
+        setRefresh(refreshDocker, 10000);
         return;
     }
     if (!ov.connected) {
@@ -44,11 +44,28 @@ async function renderDocker() {
               <code>unix:///var/run/docker.sock</code> 或 <code>tcp://127.0.0.1:2375</code>
             </p>
           </div>`;
-        setRefresh(renderDocker, 10000);
+        setRefresh(refreshDocker, 10000);
         return;
     }
-    if (dockerTab === 'compose') await renderDockerCompose(dockerHeader(ov), ov);
-    else await renderDockerContainers(dockerHeader(ov), ov);
+    if (dockerTab === 'compose') await buildDockerCompose(ov);
+    else await buildDockerContainers(ov);
+    setRefresh(refreshDocker, dockerTab === 'compose' ? 15000 : 10000);
+}
+
+/** 定时/操作后的轻量刷新：只更新顶部统计卡与表格数据行，保留工具栏/表头；状态或骨架变化时回退整页重绘 */
+async function refreshDocker() {
+    if (!$('#dockerTbody')) { await renderDocker(); return; } // 骨架不存在或处于错误/未连接态：整页重建
+    let ov;
+    try { ov = await api('GET', '/api/docker/overview'); } catch (e) { return; }
+    if (!ov.connected) { await renderDocker(); return; } // 变为未连接：重建为提示页
+    const stats = $('#dockerStats'); if (stats) stats.innerHTML = dockerHeader(ov);
+    if (dockerTab === 'compose') {
+        const tb = $('#dockerTbody');
+        if (tb) tb.innerHTML = dockerComposeRowsHtml(await api('GET', '/api/docker/compose'));
+    } else {
+        dockerListCache = await api('GET', '/api/docker/containers?stats=1');
+        const tb = $('#dockerTbody'); if (tb) tb.innerHTML = dockerContainersRowsHtml();
+    }
 }
 
 /** 顶部统计卡（Docker 版本 / 宿主 / 容器 / 镜像 / 卷） */
@@ -101,7 +118,7 @@ window.dockerAction = async (id, action) => {
     try {
         const msg = await api('POST', `/api/docker/containers/${id}/${action}`);
         toast(msg);
-        setTimeout(renderDocker, 1200);
+        setTimeout(refreshDocker, 1200);
     } catch (e) { toast(e.message, 'err'); }
 };
 
@@ -132,22 +149,26 @@ window.dockerPrunePrompt = async () => {
         const img = await api('POST', '/api/docker/prune', { kind: 'images' });
         const cnt = await api('POST', '/api/docker/prune', { kind: 'containers' });
         toast(`清理完成：删除镜像 ${img.deletedCount} 个、容器 ${cnt.deletedCount} 个，回收 ${fmtBytes((img.spaceReclaimed || 0) + (cnt.spaceReclaimed || 0))}`);
-        renderDocker();
+        refreshDocker();
     } catch (e) { toast(e.message, 'err'); }
 };
 
 /* ---------------- 容器列表 ---------------- */
 
 let dockerListCache = [];       // 容器列表缓存：点击排序时本地重排，不重拉 stats
-let dockerViewCache = null;     // { head, ov }：排序后用缓存直接重绘表格
 let dockerSortKey = '';         // 排序列（空 = 服务端默认创建时间倒序）：name/image/state/mem/sizeRw/ip
 let dockerSortDir = 1;          // 排序方向：1 升序，-1 降序
 
-async function renderDockerContainers(head, ov) {
+/** 构建容器视图骨架（统计卡 + 工具栏 + 表头/tbody），并填充数据行 */
+async function buildDockerContainers(ov) {
     dockerListCache = await api('GET', '/api/docker/containers?stats=1');
-    dockerViewCache = { head, ov };
-    paintDockerContainers();
-    setRefresh(renderDocker, 10000);
+    $('#pageBody').innerHTML = `
+      <div id="dockerStats">${dockerHeader(ov)}</div>
+      ${dockerToolbar(ov)}
+      <div class="panel" style="padding:6px 10px"><table>
+        <thead id="dockerThead">${dockerContainersTheadHtml()}</thead>
+        <tbody id="dockerTbody">${dockerContainersRowsHtml()}</tbody>
+      </table></div>`;
 }
 
 /** 可排序表头：点击切换该列升/降序 */
@@ -189,10 +210,23 @@ window.dockerSortBy = key => {
     paintDockerContainers();
 };
 
-/** 用缓存重绘容器表格（排序操作不重新请求 stats） */
-function paintDockerContainers() {
-    const { head, ov } = dockerViewCache;
-    const rows = dockerSorted().map(c => {
+/** 容器表格 thead（含排序箭头） */
+function dockerContainersTheadHtml() {
+    return `<tr>
+          ${dockerSortTh('name', '容器名称', 'width:180px')}
+          ${dockerSortTh('image', '镜像')}
+          ${dockerSortTh('state', '状态', 'width:100px')}
+          ${dockerSortTh('mem', '内存', 'width:140px')}
+          ${dockerSortTh('sizeRw', '磁盘', 'width:90px')}
+          ${dockerSortTh('ip', '容器 IP', 'width:120px')}
+          <th>暴露端口</th><th style="width:150px">Compose</th>
+          <th style="width:235px">操作</th>
+        </tr>`;
+}
+
+/** 容器表格 tbody 行（基于缓存 + 当前排序） */
+function dockerContainersRowsHtml() {
+    return dockerSorted().map(c => {
         const mem = c.memLimit != null && c.memLimit > 0
             ? `${fmtBytes(c.memUsed)} / ${fmtBytes(c.memLimit)}<div class="docker-mem-bar"><i style="width:${Math.min(100, (c.memUsed * 100 / c.memLimit)).toFixed(1)}%"></i></div>`
             : '<span class="muted">-</span>';
@@ -218,23 +252,13 @@ function paintDockerContainers() {
           <button class="btn small" onclick="dockerDetail('${esc(c.id)}')">详情</button>
         </div></td>
       </tr>`;
-    }).join('');
-    $('#pageBody').innerHTML = `
-      ${head}
-      ${dockerToolbar(ov)}
-      <div class="panel" style="padding:6px 10px"><table>
-        <thead><tr>
-          ${dockerSortTh('name', '容器名称', 'width:180px')}
-          ${dockerSortTh('image', '镜像')}
-          ${dockerSortTh('state', '状态', 'width:100px')}
-          ${dockerSortTh('mem', '内存', 'width:140px')}
-          ${dockerSortTh('sizeRw', '磁盘', 'width:90px')}
-          ${dockerSortTh('ip', '容器 IP', 'width:120px')}
-          <th>暴露端口</th><th style="width:150px">Compose</th>
-          <th style="width:235px">操作</th>
-        </tr></thead>
-        <tbody>${rows || '<tr><td colspan="9" class="muted">暂无容器</td></tr>'}</tbody>
-      </table></div>`;
+    }).join('') || '<tr><td colspan="9" class="muted">暂无容器</td></tr>';
+}
+
+/** 排序/切换后用缓存只重绘表头箭头与数据行，不动统计卡/工具栏，也不重新请求 stats */
+function paintDockerContainers() {
+    const thead = $('#dockerThead'); if (thead) thead.innerHTML = dockerContainersTheadHtml();
+    const tb = $('#dockerTbody'); if (tb) tb.innerHTML = dockerContainersRowsHtml();
 }
 
 /* ---------------- 容器详情 ---------------- */
@@ -310,9 +334,9 @@ window.dockerDetail = async id => {
 
 /* ---------------- Compose 项目 ---------------- */
 
-async function renderDockerCompose(head, ov) {
-    const projects = await api('GET', '/api/docker/compose');
-    const rows = projects.map(p => `
+/** Compose 项目表格 tbody 行 */
+function dockerComposeRowsHtml(projects) {
+    return projects.map(p => `
       <tr>
         <td style="width:150px;font-weight:600">🧩 ${esc(p.name)}</td>
         <td class="docker-mono small" style="word-break:break-all">${esc(p.workdir || '-')}</td>
@@ -324,9 +348,14 @@ async function renderDockerCompose(head, ov) {
           <button class="btn small" onclick="dockerProjectDetail('${esc(p.name)}')">查看容器</button>
           <button class="btn small" onclick="dockerComposeFile('${esc(p.name)}')">查看编排</button>
         </div></td>
-      </tr>`).join('');
+      </tr>`).join('') || '<tr><td colspan="7" class="muted">未发现 Compose 项目（仅统计携带 compose 标签的容器）</td></tr>';
+}
+
+/** 构建 Compose 视图骨架（统计卡 + 工具栏 + 表头/tbody）并填充数据行 */
+async function buildDockerCompose(ov) {
+    const projects = await api('GET', '/api/docker/compose');
     $('#pageBody').innerHTML = `
-      ${head}
+      <div id="dockerStats">${dockerHeader(ov)}</div>
       ${dockerToolbar(ov)}
       <div class="tip">按容器标签 <b>com.docker.compose.project</b> 分组聚合（docker compose up 部署的项目自动携带）。</div>
       <div class="panel" style="padding:6px 10px"><table>
@@ -339,9 +368,8 @@ async function renderDockerCompose(head, ov) {
           <th style="width:60px">镜像数</th>
           <th style="width:170px">操作</th>
         </tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="muted">未发现 Compose 项目（仅统计携带 compose 标签的容器）</td></tr>'}</tbody>
+        <tbody id="dockerTbody">${dockerComposeRowsHtml(projects)}</tbody>
       </table></div>`;
-    setRefresh(renderDocker, 15000);
 }
 
 /** 项目详情弹窗：宽模态框列出该 Compose 项目下全部容器；下钻容器详情关闭后自动回到本列表 */

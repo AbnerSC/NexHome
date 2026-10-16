@@ -8,11 +8,14 @@ function monStatusBadge(s) {
     return badge('未探测', 'gray');
 }
 
-async function renderMonitor() {
+/** 只刷新监控任务表格数据行（<tbody>），不重绘 tip/工具栏/表头 */
+async function refreshMonitorRows() {
+    const tbody = $('#monitorTbody');
+    if (!tbody) return; // 已离开本页，静默退出
     const tasks = await api('GET', '/api/monitor/tasks');
     const monSub = t => (t.type === 'HTTP' || t.type === 'HTTPS')
         ? `${esc(t.type)} · ${esc(t.method || 'GET')}` : esc(t.type);
-    const rows = tasks.map(t => `
+    tbody.innerHTML = tasks.map(t => `
       <tr>
         <td>${esc(t.name)}<div class="small muted">${monSub(t)}</div></td>
         <td class="docker-mono small" style="word-break:break-all">${esc(t.target)}</td>
@@ -27,7 +30,11 @@ async function renderMonitor() {
           <button class="btn small" onclick="monForm(${t.id})">编辑</button>
           <button class="btn small danger" onclick="monDelete(${t.id})">删除</button>
         </td>
-      </tr>`).join('');
+      </tr>`).join('') || '<tr><td colspan="7" class="muted">暂无监控任务，点击右上角「新增监控任务」添加。</td></tr>';
+}
+
+/** 首次进入监控页：绘制页面骨架（tip/工具栏/表头 + 空 tbody），随后只填充数据行 */
+async function renderMonitor() {
     $('#pageBody').innerHTML = `
       <div class="tip">支持 <b>HTTP</b>（URL 可为 http/https，按期望状态码 + 可选关键字判定）、<b>TCP</b>（端口连接可达）、
         <b>UDP</b>（尽力探测：收到回包判可达；无回包但未收到 ICMP 端口不可达差错也按可达处理，因为多数 UDP 服务不会回应未知报文；
@@ -45,9 +52,10 @@ async function renderMonitor() {
           <th style="width:130px">定时</th>
           <th style="width:230px">操作</th>
         </tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="muted">暂无监控任务，点击右上角「新增监控任务」添加。</td></tr>'}</tbody>
+        <tbody id="monitorTbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody>
       </table></div>`;
-    setRefresh(renderMonitor, 15000);
+    await refreshMonitorRows();
+    setRefresh(refreshMonitorRows, 15000);
 }
 
 window.monToggle = async (id, enabled) => {
@@ -56,21 +64,21 @@ window.monToggle = async (id, enabled) => {
         await api('PUT', '/api/monitor/tasks/' + id, monBody(t, { enabled }));
         toast(enabled ? '已启用监控' : '已停用');
     } catch (e) { toast(e.message, 'err'); }
-    renderMonitor();
+    refreshMonitorRows();
 };
 
 window.monRun = async id => {
     try {
         const msg = await api('POST', `/api/monitor/tasks/${id}/run`);
         toast(msg);
-        setTimeout(renderMonitor, 2500);
-        setTimeout(renderMonitor, 6000);
+        setTimeout(refreshMonitorRows, 2500);
+        setTimeout(refreshMonitorRows, 6000);
     } catch (e) { toast(e.message, 'err'); }
 };
 
 window.monDelete = async id => {
     if (!(await confirmBox({ title: '删除监控任务', message: '确定删除该监控任务？', confirmText: '删除', danger: true }))) return;
-    try { const msg = await api('DELETE', '/api/monitor/tasks/' + id); toast(msg); renderMonitor(); }
+    try { const msg = await api('DELETE', '/api/monitor/tasks/' + id); toast(msg); refreshMonitorRows(); }
     catch (e) { toast(e.message, 'err'); }
 };
 
@@ -145,7 +153,7 @@ window.monForm = async (id) => {
         try {
             if (id) await api('PUT', '/api/monitor/tasks/' + id, body);
             else await api('POST', '/api/monitor/tasks', body);
-            closeModal(); toast('保存成功'); renderMonitor();
+            closeModal(); toast('保存成功'); refreshMonitorRows();
         } catch (err) { toast(err.message, 'err'); }
     });
 };

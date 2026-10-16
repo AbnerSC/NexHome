@@ -7,11 +7,12 @@ function certPrimaryDomain(domains) {
     return first.replace(/^\*\./, '').replace(/[^a-zA-Z0-9.\-]/g, '_');
 }
 
-async function renderCert() {
+/** 只刷新证书任务表格数据行（<tbody>）：服务商设置表单在页面骨架中，不参与刷新，避免定时刷新清掉正在输入的内容 */
+async function refreshCertRows() {
+    const tbody = $('#certTbody');
+    if (!tbody) return; // 已离开本页（tbody 被替换），静默退出
     const tasks = await api('GET', '/api/cert/tasks');
-    let s = {};
-    try { s = await api('GET', '/api/cert/settings'); } catch (e) { /* ignore */ }
-    const rows = tasks.map(t => {
+    tbody.innerHTML = tasks.map(t => {
         let actions = `<button class="btn small success" onclick="certIssue(${t.id})">${t.status === 'ISSUED' ? '续期' : '申请'}</button>`;
         if (t.status === 'PENDING_VALIDATION') {
             actions += ` <button class="btn small" onclick="certShowHint(${t.id})">查看TXT</button>
@@ -30,7 +31,12 @@ async function renderCert() {
           <td>${actions} <button class="btn small" onclick="certForm(${t.id})">编辑</button>
             <button class="btn small danger" onclick="certDelete(${t.id})">删除</button></td>
         </tr>`;
-    }).join('');
+    }).join('') || '<tr><td colspan="6" class="muted">暂无证书任务</td></tr>';
+}
+
+async function renderCert() {
+    let s = {};
+    try { s = await api('GET', '/api/cert/settings'); } catch (e) { /* ignore */ }
     $('#pageBody').innerHTML = `
       <div class="tip">
         Let's Encrypt 免费无需凭证；<b>ZeroSSL 需要在下方填写 EAB 凭证</b>（ZeroSSL 控制台 → Developer → EAB Credentials 生成）。
@@ -59,7 +65,7 @@ async function renderCert() {
             <th style="width:210px">操作</th>
           </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="6" class="muted">暂无证书任务</td></tr>'}</tbody>
+        <tbody id="certTbody"><tr><td colspan="6" class="muted">加载中...</td></tr></tbody>
       </table></div>`;
     $('#certSettingForm').addEventListener('submit', async e => {
         e.preventDefault();
@@ -67,16 +73,17 @@ async function renderCert() {
         try { await api('PUT', '/api/cert/settings', body); toast('设置已保存'); }
         catch (err) { toast(err.message, 'err'); }
     });
-    setRefresh(renderCert, 8000);
+    await refreshCertRows();
+    setRefresh(refreshCertRows, 8000);
 }
 
 window.certIssue = async id => {
-    try { await api('POST', `/api/cert/tasks/${id}/issue`); toast('申请已发起，请稍候刷新查看进度'); renderCert(); }
+    try { await api('POST', `/api/cert/tasks/${id}/issue`); toast('申请已发起，请稍候刷新查看进度'); refreshCertRows(); }
     catch (e) { toast(e.message, 'err'); }
 };
 
 window.certValidate = async id => {
-    try { await api('POST', `/api/cert/tasks/${id}/validate`); toast('已提交验证，等待 CA 校验'); renderCert(); }
+    try { await api('POST', `/api/cert/tasks/${id}/validate`); toast('已提交验证，等待 CA 校验'); refreshCertRows(); }
     catch (e) { toast(e.message, 'err'); }
 };
 
@@ -129,7 +136,7 @@ window.certDownload = id => {
 
 window.certDelete = async id => {
     if (!(await confirmBox({ title: '删除证书任务', message: '确定删除该证书任务？磁盘上的证书文件也会被清理。', confirmText: '删除', danger: true }))) return;
-    try { await api('DELETE', '/api/cert/tasks/' + id); toast('已删除'); renderCert(); }
+    try { await api('DELETE', '/api/cert/tasks/' + id); toast('已删除'); refreshCertRows(); }
     catch (e) { toast(e.message, 'err'); }
 };
 
@@ -216,7 +223,7 @@ window.certForm = async (id) => {
         try {
             if (id) await api('PUT', '/api/cert/tasks/' + id, body);
             else await api('POST', '/api/cert/tasks', body);
-            closeModal(); toast('保存成功'); renderCert();
+            closeModal(); toast('保存成功'); refreshCertRows();
         } catch (err) { toast(err.message, 'err'); }
     });
 };

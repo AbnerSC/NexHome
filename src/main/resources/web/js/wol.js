@@ -1,9 +1,12 @@
 /* ============ WOL 网络唤醒模块 ============ */
 'use strict';
 
-async function renderWol() {
+/** 只刷新 WOL 设备表格数据行（<tbody>），不重绘工具栏/表头 */
+async function refreshWolRows() {
+    const tbody = $('#wolTbody');
+    if (!tbody) return; // 已离开本页，静默退出
     const devs = await api('GET', '/api/wol/devices');
-    const rows = devs.map(d => `
+    tbody.innerHTML = devs.map(d => `
       <tr>
         <td><input type="checkbox" class="wol-chk" value="${d.id}"></td>
         <td>${esc(d.name)}</td>
@@ -14,7 +17,12 @@ async function renderWol() {
           <button class="btn small" onclick="wolForm(${d.id})">编辑</button>
           <button class="btn small danger" onclick="wolDelete(${d.id})">删除</button>
         </td>
-      </tr>`).join('');
+      </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无设备</td></tr>';
+    const all = $('#wolAll'); if (all) all.checked = false; // 行重建后清空全选态
+}
+
+/** 首次进入 WOL 页：绘制页面骨架（tip/工具栏/表头 + 空 tbody），绑定全选事件，随后只填充数据行 */
+async function renderWol() {
     $('#pageBody').innerHTML = `
       <div class="tip">通过局域网广播 UDP 魔术包唤醒设备，被唤醒主机需在网卡与 BIOS 中开启 WOL（Wake on LAN）支持。多网口设备可配置多个 MAC，唤醒时逐个发送魔术包。</div>
       <div class="toolbar">
@@ -25,11 +33,12 @@ async function renderWol() {
       </div>
       <div class="panel"><table>
         <thead><tr><th style="width:30px"></th><th>设备名称</th><th>MAC 地址</th><th>广播地址</th><th>操作</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="5" class="muted">暂无设备</td></tr>'}</tbody>
+        <tbody id="wolTbody"><tr><td colspan="5" class="muted">加载中...</td></tr></tbody>
       </table></div>`;
     $('#wolAll').addEventListener('change', e =>
         $$('.wol-chk').forEach(c => c.checked = e.target.checked));
     setRefresh(null);
+    await refreshWolRows();
 }
 
 window.wolWake = async id => {
@@ -48,7 +57,7 @@ window.wolWakeBatch = async () => {
 
 window.wolDelete = async id => {
     if (!(await confirmBox({ title: '删除设备', message: '确定删除该设备？', confirmText: '删除', danger: true }))) return;
-    try { await api('DELETE', '/api/wol/devices/' + id); toast('已删除'); renderWol(); }
+    try { await api('DELETE', '/api/wol/devices/' + id); toast('已删除'); refreshWolRows(); }
     catch (e) { toast(e.message, 'err'); }
 };
 
@@ -73,7 +82,7 @@ window.wolForm = async (id) => {
         try {
             if (id) await api('PUT', '/api/wol/devices/' + id, body);
             else await api('POST', '/api/wol/devices', body);
-            closeModal(); toast('保存成功'); renderWol();
+            closeModal(); toast('保存成功'); refreshWolRows();
         } catch (err) { toast(err.message, 'err'); }
     });
 };

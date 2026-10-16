@@ -1,9 +1,12 @@
 /* ============ DDNS 域名同步模块 ============ */
 'use strict';
 
-async function renderDdns() {
+/** 只刷新 DDNS 任务表格数据行（<tbody>），不重绘 tip/工具栏/表头 */
+async function refreshDdnsRows() {
+    const tbody = $('#ddnsTbody');
+    if (!tbody) return; // 已离开本页，静默退出
     const tasks = await api('GET', '/api/ddns/tasks');
-    const rows = tasks.map(t => `
+    tbody.innerHTML = tasks.map(t => `
       <tr>
         <td>${esc(t.name)}<div class="small muted">${esc(t.provider === 'ALIYUN_ESA' ? '阿里云ESA' : '阿里云DNS')}</div></td>
         <td>${esc(t.rr)}.${esc(t.domain)} <span class="muted small">${esc(t.type)}</span></td>
@@ -17,7 +20,11 @@ async function renderDdns() {
           <button class="btn small" onclick="ddnsForm(${t.id})">编辑</button>
           <button class="btn small danger" onclick="ddnsDelete(${t.id})">删除</button>
         </td>
-      </tr>`).join('');
+      </tr>`).join('') || '<tr><td colspan="7" class="muted">暂无任务</td></tr>';
+}
+
+/** 首次进入 DDNS 页：绘制页面骨架（tip/工具栏/表头 + 空 tbody），随后只填充数据行 */
+async function renderDdns() {
     $('#pageBody').innerHTML = `
       <div class="tip">IP 来源支持三种模式：<b>公网接口</b>（自动获取出口 IP）/ <b>本地网卡</b> / <b>手动输入</b>。
         阿里云 AccessKey 可在 <a href="#" onclick="setPage('settings')">系统设置 → 服务商凭证配置</a> 中统一维护，表单中直接下拉选择；
@@ -25,9 +32,10 @@ async function renderDdns() {
       <div class="toolbar"><div class="spacer"></div><button class="btn primary" onclick="ddnsForm()">＋ 新增同步任务</button></div>
       <div class="panel"><table>
         <thead><tr><th>任务</th><th>域名</th><th>IP来源</th><th>定时同步</th><th>当前IP</th><th>最近同步</th><th>操作</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="muted">暂无任务</td></tr>'}</tbody>
+        <tbody id="ddnsTbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody>
       </table></div>`;
-    setRefresh(renderDdns, 10000);
+    await refreshDdnsRows();
+    setRefresh(refreshDdnsRows, 10000);
 }
 
 window.ddnsToggle = async (id, enabled, interval) => {
@@ -42,8 +50,8 @@ window.ddnsToggle = async (id, enabled, interval) => {
             esa_site_id: t.esa_site_id, interval_sec: t.interval_sec, enabled
         });
         toast(enabled ? '已启用定时同步' : '已停用');
-        renderDdns();
-    } catch (e) { toast(e.message, 'err'); renderDdns(); }
+        refreshDdnsRows();
+    } catch (e) { toast(e.message, 'err'); refreshDdnsRows(); }
 };
 
 window.ddnsSync = async id => {
@@ -51,8 +59,8 @@ window.ddnsSync = async id => {
         const msg = await api('POST', `/api/ddns/tasks/${id}/sync`);
         toast(msg);
         // 同步为异步执行，延迟两次刷新以展示最新同步状态（含“记录已存在”等取消写入结果）
-        setTimeout(renderDdns, 2000);
-        setTimeout(renderDdns, 6000);
+        setTimeout(refreshDdnsRows, 2000);
+        setTimeout(refreshDdnsRows, 6000);
     }
     catch (e) { toast(e.message, 'err'); }
 };
@@ -69,7 +77,7 @@ window.ddnsDelete = async id => {
     });
     try {
         const msg = await api('DELETE', '/api/ddns/tasks/' + id + '?remote=' + remote);
-        toast(msg); renderDdns();
+        toast(msg); refreshDdnsRows();
     }
     catch (e) { toast(e.message, 'err'); }
 };
@@ -224,7 +232,7 @@ window.ddnsForm = async (id) => {
         try {
             if (id) await api('PUT', '/api/ddns/tasks/' + id, body);
             else await api('POST', '/api/ddns/tasks', body);
-            closeModal(); toast('保存成功'); renderDdns();
+            closeModal(); toast('保存成功'); refreshDdnsRows();
         } catch (err) { toast(err.message, 'err'); }
     });
 };

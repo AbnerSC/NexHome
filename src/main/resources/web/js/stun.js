@@ -1,9 +1,12 @@
 /* ============ STUN 端口穿透模块 ============ */
 'use strict';
 
-async function renderStun() {
+/** 拉取任务并只重写表格数据行（<tbody>），不动 tip/工具栏/表头，避免定时刷新整页重绘导致闪烁、滚动位置丢失 */
+async function refreshStunRows() {
+    const tbody = $('#stunTbody');
+    if (!tbody) return; // 已离开本页（tbody 被替换），静默退出
     const tasks = await api('GET', '/api/stun/tasks');
-    const rows = tasks.map(t => `
+    tbody.innerHTML = tasks.map(t => `
       <tr>
         <td>${esc(t.name)} <div class="small muted">${esc(t.protocol)}</div></td>
         <td>${esc(t.target_ip)}:${t.target_port}${t.peer_addr ? `<div class="small muted">对端: ${esc(t.peer_addr)}</div>` : ''}</td>
@@ -32,7 +35,11 @@ async function renderStun() {
           <button class="btn small icon" title="编辑" onclick="stunForm(${t.id})">✏️</button>
           <button class="btn small icon danger" title="删除" onclick="stunDelete(${t.id})">🗑️</button>
         </td>
-      </tr>`).join('');
+      </tr>`).join('') || '<tr><td colspan="12" class="muted">暂无任务</td></tr>';
+}
+
+/** 首次进入穿透任务页：绘制页面骨架（tip/工具栏/表头 + 空 tbody），随后只填充数据行 */
+async function renderStun() {
     $('#pageBody').innerHTML = `
       <div class="tip">
         <b>穿透通道支持承载 UDP / TCP / HTTP 数据传输；任务运行中 ≠ 外网可访问。</b>
@@ -65,9 +72,10 @@ async function renderStun() {
                 <th style="width: 310px">操作</th>
             </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="12" class="muted">暂无任务</td></tr>'}</tbody>
+        <tbody id="stunTbody"><tr><td colspan="12" class="muted">加载中...</td></tr></tbody>
       </table></div></div>`;
-    setRefresh(renderStun, 5000);
+    await refreshStunRows();
+    setRefresh(refreshStunRows, 5000);
 }
 
 /** ESA 同步状态单元格：未启用置灰，否则按最近一次结果着色（OK / PARTIAL / FAIL） */
@@ -136,7 +144,7 @@ window.stunEsaSync = async id => {
             <tbody>${items || '<tr><td colspan="5" class="muted">无可同步项</td></tr>'}</tbody>
           </table></div>
           <p class="muted small" style="margin-top:10px">本功能只更新已勾选的解析记录与回源规则，不会新增或删除云端配置。</p>`, 'wide');
-        renderStun();
+        refreshStunRows();
     } catch (e) { toast(e.message, 'err'); }
 };
 
@@ -167,13 +175,13 @@ window.stunCmd = async (id, cmd) => {
             await api('POST', `/api/stun/tasks/${id}/${cmd}`);
             toast(cmd === 'start' ? '已启动' : '已停止');
         }
-        renderStun();
+        refreshStunRows();
     } catch (e) { toast(e.message, 'err'); }
 };
 
 window.stunDelete = async id => {
     if (!(await confirmBox({ title: '删除穿透任务', message: '确定删除该穿透任务？', confirmText: '删除', danger: true }))) return;
-    try { await api('DELETE', '/api/stun/tasks/' + id); toast('已删除'); renderStun(); }
+    try { await api('DELETE', '/api/stun/tasks/' + id); toast('已删除'); refreshStunRows(); }
     catch (e) { toast(e.message, 'err'); }
 };
 
@@ -536,7 +544,7 @@ window.stunForm = async (id) => {
         try {
             if (id) await api('PUT', '/api/stun/tasks/' + id, body);
             else await api('POST', '/api/stun/tasks', body);
-            closeModal(); toast('保存成功'); renderStun();
+            closeModal(); toast('保存成功'); refreshStunRows();
         } catch (err) { toast(err.message, 'err'); }
     });
 };

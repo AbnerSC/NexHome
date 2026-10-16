@@ -7,12 +7,15 @@ function notifyTypeBadge(type) {
     return badge(NOTIFY_TYPES[type] || type, type === 'EMAIL' ? 'info' : type === 'DINGTALK' ? 'warn' : 'gray');
 }
 
-async function renderNotify() {
+/** 只刷新两张表格的数据行（渠道表 + 最近发送记录表），不重绘 tip/工具栏/表头 */
+async function refreshNotifyRows() {
+    const chBody = $('#notifyChTbody');
+    if (!chBody) return; // 已离开本页，静默退出
     const [channels, logs] = await Promise.all([
         api('GET', '/api/notify/channels'),
         api('GET', '/api/notify/logs?limit=50')
     ]);
-    const chRows = channels.map(c => `
+    chBody.innerHTML = channels.map(c => `
       <tr>
         <td>${esc(c.name)}</td>
         <td>${notifyTypeBadge(c.type)}</td>
@@ -23,9 +26,9 @@ async function renderNotify() {
           <button class="btn small" onclick="notifyForm(${c.id})">编辑</button>
           <button class="btn small danger" onclick="notifyDelete(${c.id})">删除</button>
         </td>
-      </tr>`).join('');
-
-    const logRows = logs.map(l => {
+      </tr>`).join('') || '<tr><td colspan="4" class="muted">暂无通知渠道，点击右上角「新增渠道」添加。</td></tr>';
+    const logBody = $('#notifyLogTbody');
+    if (logBody) logBody.innerHTML = logs.map(l => {
         const ok = String(l.result || '').startsWith('OK');
         return `<tr>
           <td class="log-cell-time">${esc(l.time || '')}</td>
@@ -34,21 +37,25 @@ async function renderNotify() {
           <td>${esc(l.title || '')}</td>
           <td>${badge(ok ? '成功' : '失败', ok ? 'ok' : 'err')}<span class="small muted"> ${esc(l.result || '')}</span></td>
         </tr>`;
-    }).join('');
+    }).join('') || '<tr><td colspan="5" class="muted">暂无发送记录</td></tr>';
+}
 
+/** 首次进入通知页：绘制页面骨架（tip/工具栏/两张表的表头 + 空 tbody），随后只填充数据行 */
+async function renderNotify() {
     $('#pageBody').innerHTML = `
       <div class="tip">集中维护通知渠道（<b>Webhook</b> / <b>邮件</b> / <b>钉钉机器人</b>），可用性监控故障恢复、登录锁定等事件将按启用渠道自动扇出推送。
         各模块事件通过统一接口投递，发送失败仅记录不影响主流程。</div>
       <div class="toolbar"><div class="spacer"></div><button class="btn primary" onclick="notifyForm()">＋ 新增渠道</button></div>
       <div class="panel"><table>
         <thead><tr><th>名称</th><th>类型</th><th>状态</th><th style="width:230px">操作</th></tr></thead>
-        <tbody>${chRows || '<tr><td colspan="4" class="muted">暂无通知渠道，点击右上角「新增渠道」添加。</td></tr>'}</tbody>
+        <tbody id="notifyChTbody"><tr><td colspan="4" class="muted">加载中...</td></tr></tbody>
       </table></div>
       <div class="panel">
         <h3 class="dash-panel-title">📬 最近发送记录 <span class="muted small" style="font-weight:400">（最多 50 条）</span></h3>
         <table><thead><tr><th style="width:150px">时间</th><th style="width:130px">渠道</th><th style="width:120px">事件</th><th>标题</th><th>结果</th></tr></thead>
-          <tbody>${logRows || '<tr><td colspan="5" class="muted">暂无发送记录</td></tr>'}</tbody></table>
+          <tbody id="notifyLogTbody"><tr><td colspan="5" class="muted">加载中...</td></tr></tbody></table>
       </div>`;
+    await refreshNotifyRows();
 }
 
 window.notifyToggle = async (id, enabled) => {
@@ -57,18 +64,18 @@ window.notifyToggle = async (id, enabled) => {
         await api('PUT', '/api/notify/channels/' + id, { name: c.name, type: c.type, enabled, config: JSON.parse(c.config || '{}') });
         toast(enabled ? '已启用渠道' : '已停用');
     } catch (e) { toast(e.message, 'err'); }
-    renderNotify();
+    refreshNotifyRows();
 };
 
 window.notifyTest = async id => {
     try { const msg = await api('POST', `/api/notify/channels/${id}/test`); toast(msg, String(msg).startsWith('测试发送成功') ? 'ok' : 'err'); }
     catch (e) { toast(e.message, 'err'); }
-    renderNotify();
+    refreshNotifyRows();
 };
 
 window.notifyDelete = async id => {
     if (!(await confirmBox({ title: '删除通知渠道', message: '确定删除该通知渠道？', confirmText: '删除', danger: true }))) return;
-    try { const msg = await api('DELETE', '/api/notify/channels/' + id); toast(msg); renderNotify(); }
+    try { const msg = await api('DELETE', '/api/notify/channels/' + id); toast(msg); refreshNotifyRows(); }
     catch (e) { toast(e.message, 'err'); }
 };
 
@@ -173,7 +180,7 @@ window.notifyForm = async (id) => {
         try {
             if (id) await api('PUT', '/api/notify/channels/' + id, body);
             else await api('POST', '/api/notify/channels', body);
-            closeModal(); toast('保存成功'); renderNotify();
+            closeModal(); toast('保存成功'); refreshNotifyRows();
         } catch (err) { toast(err.message, 'err'); }
     });
 };
