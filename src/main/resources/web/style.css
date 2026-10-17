@@ -6,13 +6,15 @@
     /* 底色与层次 */
     --bg: #070b18;
     --bg-2: #0b1024;
-    --panel: rgba(20, 27, 51, .55);
+    --panel: rgba(20, 27, 51, .62);
     --panel-solid: #131a33;
     --panel-glass: rgba(255, 255, 255, .045);
     --border: rgba(126, 148, 255, .16);
     --border-strong: rgba(126, 148, 255, .34);
     --text: #e7ecff;
-    --muted: #93a0c9;
+    /* 次要文字：深色玻璃面板 + 流动极光背景下需保证小字可读，
+       过暗的灰蓝(#93a0c9)在表单标签/表格副信息/弹窗正文里临界看不清，提亮以稳过 WCAG AA */
+    --muted: #a7b3d6;
 
     /* 霓虹色板 */
     --cyan: #22d3ee;
@@ -394,7 +396,7 @@ body::after {
 .btn.ghost:hover { color: var(--red); box-shadow: none; }
 .btn.small { padding: 4px 11px; font-size: 12px; border-radius: 8px; }
 .btn.block { width: 100%; justify-content: center; padding: 12px; }
-.btn:disabled { opacity: .45; cursor: not-allowed; transform: none !important; box-shadow: none !important; }
+.btn:disabled { opacity: .6; cursor: not-allowed; transform: none !important; box-shadow: none !important; }
 
 /* ---------- 分段切换控件（如首页内/外网地址模式） ---------- */
 .seg {
@@ -491,7 +493,7 @@ td .badge { white-space: normal; word-break: break-all; }
 
 /* 操作列：图标按钮成组，紧凑且悬停有语义提示（title） */
 .ops { display: flex; gap: 6px; align-items: center; }
-.btn.icon { width: 30px; height: 28px; padding: 0; align-items: center; justify-content: center; font-size: 14px; line-height: 1; }
+.btn.icon { width: 30px; height: 32px; padding: 0; align-items: center; justify-content: center; font-size: 14px; line-height: 1; }
 .btn.icon.invisible { visibility: hidden; pointer-events: none; }
 
 th, td {
@@ -611,7 +613,7 @@ code {
     font-family: inherit;
     transition: all .2s;
 }
-.field input::placeholder, .field textarea::placeholder { color: rgba(147, 160, 201, .6); }
+.field input::placeholder, .field textarea::placeholder { color: rgba(167, 179, 214, .7); }
 .field select option { background: var(--panel-solid); color: var(--text); }
 
 .field input:focus, .field select:focus, .field textarea:focus {

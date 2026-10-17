@@ -23,7 +23,7 @@ async function refreshStunRows() {
                 : t.check_result.startsWith('FAIL') ? 'err' : 'warn')}</div>
                ${t.check_time ? `<div class="small muted">${esc(t.check_time)}</div>` : ''}`
             : '<span class="muted small">未自测</span>'}</td>
-        <td class="ops">
+        <td><div class="ops">
           ${t.status === 'RUNNING'
             ? `<button class="btn small icon danger" title="停止" onclick="stunCmd(${t.id},'stop')">⏸</button>`
             : `<button class="btn small icon success" title="启动" onclick="stunCmd(${t.id},'start')">▶</button>`}
@@ -34,7 +34,7 @@ async function refreshStunRows() {
           <button class="btn small icon" title="流量统计" onclick="stunTraffic(${t.id})">📊</button>
           <button class="btn small icon" title="编辑" onclick="stunForm(${t.id})">✏️</button>
           <button class="btn small icon danger" title="删除" onclick="stunDelete(${t.id})">🗑️</button>
-        </td>
+        </div></td>
       </tr>`).join('') || '<tr><td colspan="12" class="muted">暂无任务</td></tr>';
 }
 
@@ -777,14 +777,14 @@ function tfRenderChart(host, name, points, theme, tickFmt, tipFmt) {
     for (let g = 0; g <= 4; g++) {
         const y = (P.t + ih - (ih * g) / 4).toFixed(1);
         grid += `<line x1="${P.l}" y1="${y}" x2="${W - P.r}" y2="${y}" stroke="${g ? 'rgba(148,163,200,.10)' : 'rgba(148,163,200,.24)'}" stroke-dasharray="${g ? '3 4' : ''}"/>`
-            + `<text x="${P.l - 7}" y="${+y + 3.5}" text-anchor="end" font-size="9.5" fill="#94a3b8">${fmtTrafficBytes((nice * g) / 4)}</text>`;
+            + `<text x="${P.l - 7}" y="${+y + 3.5}" text-anchor="end" font-size="9.5" fill="#aab6d8">${fmtTrafficBytes((nice * g) / 4)}</text>`;
     }
     // 横轴刻度（最多 ~6 个，末尾必显）
     let ticks = '';
     const step = Math.max(1, Math.ceil(pts.length / 5));
     pts.forEach((p, i) => {
         if (i % step && i !== pts.length - 1) return;
-        ticks += `<text x="${p.x}" y="${H - 6}" text-anchor="middle" font-size="9.5" fill="#94a3b8">${esc(tickFmt(p.key))}</text>`;
+        ticks += `<text x="${p.x}" y="${H - 6}" text-anchor="middle" font-size="9.5" fill="#aab6d8">${esc(tickFmt(p.key))}</text>`;
     });
 
     const last = pts[pts.length - 1];
