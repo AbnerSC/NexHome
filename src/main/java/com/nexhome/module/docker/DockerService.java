@@ -122,7 +122,8 @@ public final class DockerService {
         for (JsonElement el : arr) {
             JsonObject img = el.getAsJsonObject();
             String id = JsonUtils.str(img, "Id");
-            // 首个 RepoTag 拆为 name:tag；无标签镜像为 <none>:<none>
+            // 名称/标签：优先 RepoTags（name:tag）；无标签镜像 RepoTags 为空，
+            // 回退 RepoDigests（name@sha256:...）取仓库名，标签仍为 <none>
             String name = "<none>", tag = "<none>";
             JsonArray rt = optArray(img, "RepoTags");
             if (rt.size() > 0) {
@@ -133,6 +134,13 @@ public final class DockerService {
                     tag = t.substring(i + 1);
                 } else {
                     name = t;
+                }
+            } else {
+                JsonArray rd = optArray(img, "RepoDigests");
+                if (rd.size() > 0) {
+                    String d = rd.get(0).getAsString();
+                    int at = d.indexOf('@');
+                    name = at > 0 ? d.substring(0, at) : d;
                 }
             }
             JsonObject o = new JsonObject();

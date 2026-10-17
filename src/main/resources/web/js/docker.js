@@ -145,12 +145,18 @@ window.dockerPrunePrompt = async () => {
     catch (e) { toast(e.message, 'err'); return; }
     if (!list.length) { toast('当前没有无标签（悬空）镜像需要清理', 'ok'); return; }
     const total = list.reduce((s, i) => s + (i.size || 0), 0);
-    const rows = list.map(i => `
+    const rows = list.map(i => {
+        // 悬空镜像无 RepoTag，Docker 返回 <none>；此时以镜像 ID 作为可识别名称展示
+        const untagged = !i.name || i.name === '<none>';
+        const displayName = untagged ? i.shortId : i.name;
+        const sub = untagged ? '' : `<div class="muted small docker-mono">${esc(i.shortId)}</div>`;
+        return `
       <tr>
-        <td style="text-align:left;word-break:break-all">${esc(i.name)}<div class="muted small docker-mono">${esc(i.shortId)}</div></td>
+        <td style="text-align:left;word-break:break-all">${esc(displayName)}${sub}</td>
         <td style="text-align:left">${esc(i.tag)}</td>
         <td style="text-align:right">${fmtBytes(i.size)}</td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
     const html = `
       <div style="text-align:left;white-space:normal">
         <div style="margin-bottom:8px">将清理以下 <b>${list.length}</b> 个无标签（悬空）镜像，共 <b>${fmtBytes(total)}</b>（不可恢复）：</div>

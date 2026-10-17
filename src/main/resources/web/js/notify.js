@@ -13,7 +13,7 @@ async function refreshNotifyRows() {
     if (!chBody) return; // 已离开本页，静默退出
     const [channels, logs] = await Promise.all([
         api('GET', '/api/notify/channels'),
-        api('GET', '/api/notify/logs?limit=50')
+        api('GET', '/api/notify/logs?limit=10')
     ]);
     chBody.innerHTML = channels.map(c => `
       <tr>
@@ -51,7 +51,7 @@ async function renderNotify() {
         <tbody id="notifyChTbody"><tr><td colspan="4" class="muted">加载中...</td></tr></tbody>
       </table></div>
       <div class="panel">
-        <h3 class="dash-panel-title">📬 最近发送记录 <span class="muted small" style="font-weight:400">（最多 50 条）</span></h3>
+        <h3 class="dash-panel-title">📬 最近发送记录 <span class="muted small" style="font-weight:400">（最多 10 条）</span></h3>
         <table><thead><tr><th style="width:150px">时间</th><th style="width:130px">渠道</th><th style="width:120px">事件</th><th>标题</th><th>结果</th></tr></thead>
           <tbody id="notifyLogTbody"><tr><td colspan="5" class="muted">加载中...</td></tr></tbody></table>
       </div>`;
