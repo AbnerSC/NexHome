@@ -85,6 +85,7 @@ public final class DockerService {
             ctx.ok(Map.of("tail", tail, "logs", CLIENT.logs(
                     "/containers/" + id + "/logs?stdout=1&stderr=1&tail=" + tail)));
         });
+        WebServer.route("GET", "/api/docker/prune/preview", ctx -> ctx.ok(danglingImages()));
         WebServer.route("POST", "/api/docker/prune", ctx -> ctx.ok(prune(ctx.body())));
     }
 
@@ -104,6 +105,47 @@ public final class DockerService {
             r.put("connected", false);
         }
         return r;
+    }
+
+    /** 悬空（无标签）镜像列表：清理前预览，字段 id/shortId/name/tag/size/created */
+    private static List<JsonObject> danglingImages() throws IOException {
+        String filters;
+        try {
+            filters = java.net.URLEncoder.encode("{\"dangling\":{\"true\":true}}",
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            filters = "{\"dangling\":{\"true\":true}}";
+        }
+        JsonArray arr = JsonParser.parseString(
+                CLIENT.get("/images/json?all=1&filters=" + filters)).getAsJsonArray();
+        List<JsonObject> list = new ArrayList<>();
+        for (JsonElement el : arr) {
+            JsonObject img = el.getAsJsonObject();
+            String id = JsonUtils.str(img, "Id");
+            // 首个 RepoTag 拆为 name:tag；无标签镜像为 <none>:<none>
+            String name = "<none>", tag = "<none>";
+            JsonArray rt = optArray(img, "RepoTags");
+            if (rt.size() > 0) {
+                String t = rt.get(0).getAsString();
+                int i = t.lastIndexOf(':');
+                if (i > 0 && !t.substring(i + 1).contains("/")) {   // 排除仅含仓库分隔的冒号
+                    name = t.substring(0, i);
+                    tag = t.substring(i + 1);
+                } else {
+                    name = t;
+                }
+            }
+            JsonObject o = new JsonObject();
+            o.addProperty("id", id);
+            o.addProperty("shortId", id.startsWith("sha256:") ? id.substring(7, Math.min(19, id.length())) : id);
+            o.addProperty("name", name);
+            o.addProperty("tag", tag);
+            o.addProperty("size", optLong(img, "Size"));
+            o.addProperty("created", optLong(img, "Created"));
+            list.add(o);
+        }
+        list.sort((a, b) -> Long.compare(optLong(b, "size"), optLong(a, "size")));
+        return list;
     }
 
     /** 资源清理：kind=images（悬空/未用镜像）或 containers（已停止容器），返回 Daemon 回收结果 */

@@ -87,7 +87,9 @@ function closeModal() {
  * 全局确认弹窗，替代原生 confirm，风格与主题一致。
  * 后续所有需要“确定/取消”交互的场景都应使用本方法。
  * @param {string|Object} opts 传字符串时视为提示内容；或配置对象
- *   { title, message, confirmText, cancelText, danger }
+ *   { title, message, html, confirmText, cancelText, danger, boxWidth }
+ *   html：传入时以富文本渲染确认内容（如镜像预览表），优先级高于 message；
+ *   boxWidth：需要展示表格等宽内容时放宽弹窗宽度（如 '560px'）。
  * @returns {Promise<boolean>} 点击确认返回 true；取消、点击遮罩或按 Esc 返回 false
  * 用法：if (!(await confirmBox({ message: '确定删除？', danger: true }))) return;
  */
@@ -96,9 +98,11 @@ function confirmBox(opts) {
     const {
         title = '操作确认',
         message = '',
+        html = '',
         confirmText = '确定',
         cancelText = '取消',
         danger = false,
+        boxWidth = '',
     } = opts;
 
     const mask = $('#confirmMask');
@@ -107,11 +111,13 @@ function confirmBox(opts) {
     const cancelBtn = $('#confirmCancel');
 
     $('#confirmTitle').textContent = title;
-    $('#confirmMsg').textContent = message;
+    if (html) $('#confirmMsg').innerHTML = html;
+    else $('#confirmMsg').textContent = message;
     $('#confirmIcon').textContent = danger ? '⚠️' : '❔';
     okBtn.textContent = confirmText;
     cancelBtn.textContent = cancelText;
     box.classList.toggle('danger', danger);
+    box.style.width = boxWidth || '';
 
     mask.classList.remove('hidden');
     okBtn.focus();

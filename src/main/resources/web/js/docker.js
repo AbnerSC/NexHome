@@ -138,17 +138,40 @@ window.dockerLogs = async (id, tail = 200) => {
       </div>${body}`, 'wide');
 };
 
-/** 资源清理：镜像 / 已停止容器，二次确认（danger）后执行并展示回收空间 */
+/** 资源清理：先预览无标签（悬空）镜像列表，二次确认（danger）后一键清理并展示回收空间 */
 window.dockerPrunePrompt = async () => {
+    let list;
+    try { list = await api('GET', '/api/docker/prune/preview'); }
+    catch (e) { toast(e.message, 'err'); return; }
+    if (!list.length) { toast('当前没有无标签（悬空）镜像需要清理', 'ok'); return; }
+    const total = list.reduce((s, i) => s + (i.size || 0), 0);
+    const rows = list.map(i => `
+      <tr>
+        <td style="text-align:left;word-break:break-all">${esc(i.name)}<div class="muted small docker-mono">${esc(i.shortId)}</div></td>
+        <td style="text-align:left">${esc(i.tag)}</td>
+        <td style="text-align:right">${fmtBytes(i.size)}</td>
+      </tr>`).join('');
+    const html = `
+      <div style="text-align:left;white-space:normal">
+        <div style="margin-bottom:8px">将清理以下 <b>${list.length}</b> 个无标签（悬空）镜像，共 <b>${fmtBytes(total)}</b>（不可恢复）：</div>
+        <div style="max-height:280px;overflow:auto">
+          <table style="width:100%;font-size:12px">
+            <thead><tr>
+              <th style="text-align:left">镜像名称</th>
+              <th style="text-align:left;width:80px">标签</th>
+              <th style="text-align:right;width:76px">体积</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>`;
     if (!(await confirmBox({
-        title: 'Docker 资源清理',
-        message: '将清理宿主机的「悬空镜像」和「已停止容器」（不可恢复）。\n\n确定继续？',
-        confirmText: '清理镜像', cancelText: '取消', danger: true
+        title: 'Docker 资源清理', html, boxWidth: '560px',
+        confirmText: `清理 ${list.length} 个镜像`, cancelText: '取消', danger: true
     }))) return;
     try {
         const img = await api('POST', '/api/docker/prune', { kind: 'images' });
-        const cnt = await api('POST', '/api/docker/prune', { kind: 'containers' });
-        toast(`清理完成：删除镜像 ${img.deletedCount} 个、容器 ${cnt.deletedCount} 个，回收 ${fmtBytes((img.spaceReclaimed || 0) + (cnt.spaceReclaimed || 0))}`);
+        toast(`清理完成：删除镜像 ${img.deletedCount} 个，回收 ${fmtBytes(img.spaceReclaimed || 0)}`);
         refreshDocker();
     } catch (e) { toast(e.message, 'err'); }
 };
