@@ -186,6 +186,28 @@ CREATE TABLE IF NOT EXISTS nav_item (
     created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
+-- 反向代理站点表（代理中心：类 nginx 的内置 HTTP 反代，独立端口监听，开关与端口见 app_config proxy.*）
+-- domains    : Host 匹配列表，逗号分隔，支持 *.example.com 通配
+-- paths      : 路径前缀匹配列表，逗号分隔；空 = 整域名全部路径
+-- target     : 后端地址 http(s)://host:port[/路径前缀]，带路径时作为回源路径改写的前缀
+-- force_https: 1 时 HTTP 请求 301 跳转到 https://同域名
+-- cert_mode  : AUTO=SNI 自动匹配已签发证书 / TASK=指定证书任务 / NONE=仅 HTTP 不接 TLS
+-- advanced   : 高级配置 JSON（请求/响应头改写、路径重写、超时、限流、BasicAuth、
+--               IP 白名单、后端 TLS 校验开关、文件缓存等，字段语义见 ProxyAdvanced 类注释）
+CREATE TABLE IF NOT EXISTS proxy_site (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    domains      TEXT NOT NULL,
+    paths        TEXT,
+    target       TEXT NOT NULL,
+    force_https  INTEGER NOT NULL DEFAULT 0,
+    cert_mode    TEXT NOT NULL DEFAULT 'AUTO',
+    cert_task_id INTEGER,
+    advanced     TEXT,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
 -- 告警通知渠道表（统一通知中心：Webhook / Email / 钉钉，各模块事件按启用渠道扇出；
 -- 穿透任务等可按任务自选渠道扇出，见 stun_task.notify_channels）
 -- type   : WEBHOOK（通用 HTTP 回调） / EMAIL（SMTP 邮件） / DINGTALK（钉钉自定义机器人）

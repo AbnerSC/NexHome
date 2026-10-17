@@ -12,6 +12,7 @@ import com.nexhome.module.monitor.MonitorService;
 import com.nexhome.module.nav.NavService;
 import com.nexhome.module.notify.NotifyService;
 import com.nexhome.module.provider.ProviderConfigService;
+import com.nexhome.module.proxy.ProxyService;
 import com.nexhome.module.stun.StunServerService;
 import com.nexhome.module.stun.StunService;
 import com.nexhome.module.stun.TrafficStats;
@@ -57,6 +58,7 @@ public final class NexHomeApp {
             DockerService.registerRoutes();
             NotifyService.registerRoutes();
             MonitorService.registerRoutes();
+            ProxyService.registerRoutes();
 
             // 5. 启动业务调度与后台任务
             ProviderConfigService.init(); // 服务商凭证配置旧库迁移
@@ -68,6 +70,7 @@ public final class NexHomeApp {
             NavService.init();       // 清理孤儿导航图标文件
             NotifyService.init();    // 通知日志定期清理
             MonitorService.init();   // 恢复可用性监控定时探测
+            ProxyService.init();     // 初始化代理文件缓存并按开关拉起监听（在 CertService 之后，证书清单已就绪）
 
             // 6. 启动内置 Web 服务器（前端静态资源 + API 同端口，HTTPS/安全入口见系统设置）
             WebServer.start();
@@ -78,6 +81,7 @@ public final class NexHomeApp {
             //    且必须先于调度器关停，避免保活/巡检任务与删除竞争重新添加映射
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 Logs.info(Logs.SYS, "正在关闭...");
+                ProxyService.shutdown(); // 停止代理监听并释放 Netty 线程组
                 StunService.stopAll();
                 TrafficStats.flushNow(); // 落库最后不足一个周期的流量增量，避免丢失
                 Tasks.shutdown();

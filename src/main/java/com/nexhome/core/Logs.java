@@ -25,6 +25,7 @@ public final class Logs {
     public static final String PROVIDER = "PROVIDER";
     public static final String NOTIFY = "NOTIFY";
     public static final String MONITOR = "MONITOR";
+    public static final String PROXY = "PROXY";
 
     private Logs() {
     }

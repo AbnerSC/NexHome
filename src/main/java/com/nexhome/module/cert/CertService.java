@@ -437,6 +437,8 @@ public final class CertService {
                 leaf.getNotBefore().toInstant(), leaf.getNotAfter().toInstant());
         // HTTPS 正在使用该证书时自动重启 Web 服务，加载续期后的新证书
         WebServer.onCertRenewed(taskId);
+        // 反向代理中心：热加载证书库，使 SNI 立即用上续期后的新证书
+        com.nexhome.module.proxy.ProxyService.onCertRenewed();
     }
 
     /** 定时自动续期：到期前 RENEW_AHEAD_DAYS 天自动重新申请 */
