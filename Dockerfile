@@ -51,4 +51,3 @@ COPY --from=build /build/target/nexhome.jar app.jar
 ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-Xms64m", "-Xmx256m", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
 
 EXPOSE 8090
-VOLUME ["/app/db"]
