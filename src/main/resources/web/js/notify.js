@@ -95,7 +95,23 @@ function notifyConfigFields(type, cfg) {
           <div class="field"><label>用户名</label><input name="c_username" value="${v('username')}" placeholder="发件邮箱"></div>
           <div class="field"><label>密码 / 授权码</label><input name="c_password" type="password" value="${v('password')}"></div>
           <div class="field"><label>发件人 (From)</label><input name="c_from" value="${v('from')}" placeholder="留空则用用户名"></div>
-          <div class="field full"><label>收件人 (To) <b>*</b></label><input name="c_to" required value="${v('to')}" placeholder="多个收件人以逗号分隔"></div>`;
+          <div class="field full"><label>收件人 (To) <b>*</b></label><input name="c_to" required value="${v('to')}" placeholder="多个收件人以逗号分隔"></div>
+          <div class="field full" style="margin-top:2px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--text)">
+            <input type="checkbox" name="c_saveSent" style="width:auto;margin:0" ${cfg.saveSent ? 'checked' : ''}
+              onchange="document.querySelectorAll('.imap-only').forEach(e=>e.style.display=this.checked?'':'none')">
+            保存到「已发送」文件夹（经 IMAP 存档，mailu 等自建邮箱网页端可见）</label></div>
+          <div class="field imap-only" style="display:${cfg.saveSent ? '' : 'none'}"><label>IMAP 服务器</label>
+            <input name="c_imapHost" value="${v('imapHost')}" placeholder="留空同 SMTP 服务器"></div>
+          <div class="field imap-only" style="display:${cfg.saveSent ? '' : 'none'}"><label>IMAP 端口</label>
+            <input name="c_imapPort" type="number" value="${cfg.imapPort ?? 993}"></div>
+          <div class="field imap-only" style="display:${cfg.saveSent ? '' : 'none'}"><label>IMAP 加密方式</label>
+            <select name="c_imapSecure">
+              <option value="ssl" ${cfg.imapStarttls || cfg.imapSsl === false ? '' : 'selected'}>SSL (993, imaps)</option>
+              <option value="starttls" ${cfg.imapStarttls ? 'selected' : ''}>STARTTLS (143)</option>
+              <option value="none" ${!cfg.imapStarttls && cfg.imapSsl === false ? 'selected' : ''}>不加密</option>
+            </select></div>
+          <div class="field full imap-only" style="display:${cfg.saveSent ? '' : 'none'}"><label>已发送文件夹名</label>
+            <input name="c_sentFolder" value="${v('sentFolder')}" placeholder="留空自动探测（mailu 默认 Sent）"></div>`;
         case 'DINGTALK': return `
           <div class="field full"><label>机器人 Webhook <b>*</b></label>
             <input name="c_webhook" required value="${v('webhook')}" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."></div>
@@ -118,12 +134,22 @@ function notifyCollectConfig(type, f) {
     const n = s => { const x = f.get(s); return x === '' || x == null ? undefined : x; };
     if (type === 'EMAIL') {
         const secure = f.get('c_secure');
-        return {
+        const cfg = {
             host: f.get('c_host'), port: Number(f.get('c_port') || 465),
             ssl: secure === 'ssl', starttls: secure === 'starttls',
             username: n('c_username'), password: n('c_password'),
             from: n('c_from'), to: f.get('c_to')
         };
+        if (f.get('c_saveSent') === 'on') {
+            const is = f.get('c_imapSecure');
+            cfg.saveSent = true;
+            cfg.imapHost = n('c_imapHost');
+            cfg.imapPort = Number(f.get('c_imapPort') || 993);
+            cfg.imapSsl = is !== 'starttls' && is !== 'none';
+            cfg.imapStarttls = is === 'starttls';
+            cfg.sentFolder = n('c_sentFolder');
+        }
+        return cfg;
     }
     if (type === 'DINGTALK') return { webhook: f.get('c_webhook'), secret: n('c_secret') };
     const cfg = { url: f.get('c_url'), method: f.get('c_method') };

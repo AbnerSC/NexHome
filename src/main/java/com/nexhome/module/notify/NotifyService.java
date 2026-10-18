@@ -9,8 +9,12 @@ import com.nexhome.core.Tasks;
 import com.nexhome.web.Ctx;
 import com.nexhome.web.WebServer;
 
+import jakarta.mail.Flags;
+import jakarta.mail.Folder;
 import jakarta.mail.Message;
+import jakarta.mail.MessagingException;
 import jakarta.mail.Session;
+import jakarta.mail.Store;
 import jakarta.mail.Transport;
 import jakarta.mail.internet.InternetAddress;
 import jakarta.mail.internet.MimeBodyPart;
@@ -49,7 +53,11 @@ import java.util.regex.Pattern;
  * <ul>
  *   <li>WEBHOOK：{@code {"url","method":"GET|POST","headers":{...},"bodyTemplate":"..."}}，
  *       URL/请求头/bodyTemplate 支持占位符 {@code ${title} ${message} ${event} ${time}}</li>
- *   <li>EMAIL：{@code {"host","port":"465","ssl":true,"starttls":false,"username","password","from","to"}}</li>
+ *   <li>EMAIL：{@code {"host","port","ssl","starttls","username","password","from","to",
+ *       "saveSent","imapHost","imapPort","imapSsl","imapStarttls","sentFolder"}}；
+ *       {@code saveSent} 开启时 SMTP 发送成功后将副本经 IMAP APPEND 存入「已发送」文件夹
+ *       （mailu 等自建邮箱的网页客户端即可看到已发邮件；IMAP 以 SMTP 同账号登录，
+ *       imapHost/imapPort 留空默认同 SMTP 主机/993 SSL，sentFolder 留空自动探测）</li>
  *   <li>DINGTALK：{@code {"webhook":"https://oapi.dingtalk.com/robot/send?access_token=xxx","secret":"加签密钥(可选)"}}</li>
  * </ul>
  * 投递在独立单线程 executor 串行执行，绝不占用 {@link Tasks} 共享调度池（慢 HTTP/SMTP 会拖垮调度），
@@ -248,6 +256,8 @@ public final class NotifyService {
             case EMAIL -> {
                 if (JsonUtils.str(c, "host").isBlank()) throw new IllegalArgumentException("SMTP 服务器不能为空");
                 if (JsonUtils.str(c, "to").isBlank()) throw new IllegalArgumentException("收件人不能为空");
+                if (JsonUtils.bool(c, "saveSent", false) && JsonUtils.str(c, "username").isBlank())
+                    throw new IllegalArgumentException("开启已发送存档需填写用户名（IMAP 以该账号登录）");
             }
             case DINGTALK -> {
                 if (JsonUtils.str(c, "webhook").isBlank()) throw new IllegalArgumentException("钉钉机器人 Webhook 不能为空");
@@ -339,6 +349,7 @@ public final class NotifyService {
         String password = JsonUtils.str(c, "password");
         String from = JsonUtils.str(c, "from").trim();
         String to = JsonUtils.str(c, "to").trim();
+        boolean saveSent = JsonUtils.bool(c, "saveSent", false);
         String proto = ssl ? "smtps" : "smtp";
 
         Properties props = new Properties();
@@ -367,6 +378,8 @@ public final class NotifyService {
         alt.addBodyPart(textPart);
         alt.addBodyPart(htmlPart);
         msg.setContent(alt);
+        // 实例 sendMessage 不会自动落头，显式保存生成 Message-ID/Date，保证投递与 IMAP 存档副本头完整
+        msg.saveChanges();
 
         Transport t = session.getTransport(proto);
         try {
@@ -378,7 +391,86 @@ public final class NotifyService {
             } catch (Exception ignored) {
             }
         }
-        return "OK(已发送)";
+        // SMTP 协议只负责投递不落箱，mailu 等自建邮箱的网页客户端看不到已发邮件；
+        // 开启存档则将副本经 IMAP APPEND 写入「已发送」文件夹，存档失败不影响投递结果（仅结果附注）
+        if (!saveSent || username.isBlank()) return "OK(已发送)";
+        return "OK(已发送，" + archiveToSent(c, host, username, password, msg) + ")";
+    }
+
+    /** 常见「已发送」文件夹名：mailu/Dovecot 为 Sent，中文客户端环境可能是本地化名称 */
+    private static final String[] SENT_FOLDER_CANDIDATES =
+            {"Sent", "Sent Messages", "Sent Items", "已发送", "已发送邮件", "INBOX.Sent"};
+
+    /**
+     * SMTP 发送成功后将副本经 IMAP APPEND 存入「已发送」文件夹（与桌面/网页客户端发信落箱行为一致），
+     * IMAP 与 SMTP 复用同一账号。返回结果附注文案，不抛出（失败不影响投递成功的事实）。
+     */
+    private static String archiveToSent(JsonObject c, String smtpHost, String username, String password,
+                                        MimeMessage msg) {
+        String imapHost = JsonUtils.str(c, "imapHost").trim();
+        if (imapHost.isEmpty()) imapHost = smtpHost;
+        int imapPort = JsonUtils.num(c, "imapPort", 993);
+        boolean imapSsl = JsonUtils.bool(c, "imapSsl", true);
+        boolean imapStarttls = JsonUtils.bool(c, "imapStarttls", false);
+        String proto = imapSsl ? "imaps" : "imap";
+
+        Properties props = new Properties();
+        props.put("mail." + proto + ".host", imapHost);
+        props.put("mail." + proto + ".port", String.valueOf(imapPort));
+        props.put("mail." + proto + ".connectiontimeout", "15000");
+        props.put("mail." + proto + ".timeout", "15000");
+        if (imapStarttls) props.put("mail.imap.starttls.enable", "true");
+
+        Store store = null;
+        try {
+            store = Session.getInstance(props).getStore(proto);
+            store.connect(imapHost, imapPort, username, password);
+            Folder sent = findSentFolder(store, JsonUtils.str(c, "sentFolder").trim());
+            sent.appendMessages(new Message[]{msg});
+            markAppendedSeen(sent);
+            return "已存档至已发送[" + sent.getFullName() + "]";
+        } catch (Exception e) {
+            Logs.warn(Logs.NOTIFY, "邮件 IMAP 存档失败: " + e.getMessage());
+            return "IMAP 存档失败: " + e.getMessage();
+        } finally {
+            if (store != null) {
+                try {
+                    store.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    /** 定位「已发送」文件夹：优先用户指定名，否则按常见候选探测，都不存在则尝试创建 Sent */
+    private static Folder findSentFolder(Store store, String preferred) throws MessagingException {
+        if (!preferred.isBlank()) {
+            Folder f = store.getFolder(preferred);
+            if (f.exists()) return f;
+            if (f.create(Folder.HOLDS_MESSAGES)) return f;
+            throw new MessagingException("已发送文件夹[" + preferred + "]不存在且无法创建");
+        }
+        for (String name : SENT_FOLDER_CANDIDATES) {
+            Folder f = store.getFolder(name);
+            if (f.exists()) return f;
+        }
+        Folder f = store.getFolder("Sent");
+        if (f.create(Folder.HOLDS_MESSAGES)) return f;
+        throw new MessagingException("未探测到已发送文件夹，请在渠道配置中手动指定文件夹名");
+    }
+
+    /** 给刚 APPEND 的邮件补 \Seen 标记，避免网页客户端「已发送」出现未读角标（尽力而为，失败可忽略） */
+    private static void markAppendedSeen(Folder folder) {
+        try {
+            folder.open(Folder.READ_WRITE);
+            try {
+                int n = folder.getMessageCount();
+                if (n > 0) folder.getMessage(n).setFlag(Flags.Flag.SEEN, true);
+            } finally {
+                folder.close(false);
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     /** 邮件 HTML 正文：卡片式布局 + 内联样式（邮件客户端不支持 <style>/外链 CSS），按事件自动配色 */
