@@ -201,11 +201,11 @@ public final class ProxyCenter {
         return b.bind(port).sync().channel();
     }
 
-    /** SNI 握手选证：站点指定任务优先，其余按域名自动匹配；无证书时终止握手 */
+    /** SNI 握手选证：站点指定任务优先，其余按域名自动匹配；未命中兜底剩余有效期最长的证书，证书库为空才终止握手 */
     private static final Mapping<CharSequence, SslContext> SNI_MAPPING = hostname -> {
         SslContext ctx = SslStore.forSni(hostname == null ? "" : hostname.toString(), sites);
         if (ctx == null) {
-            Logs.warn(Logs.PROXY, "SNI 域名 " + hostname + " 无可用证书（请在 SSL 证书管理中签发，或检查站点证书模式）");
+            Logs.warn(Logs.PROXY, "SNI 域名 " + hostname + " 无可用证书（证书库为空，请在 SSL 证书管理中签发）");
         }
         return ctx;
     };

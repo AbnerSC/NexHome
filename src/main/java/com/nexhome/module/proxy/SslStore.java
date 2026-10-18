@@ -28,6 +28,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * 证书文件布局与面板 HTTPS 一致：{@code data/certs/task-{id}/} 下
  * {@code domain.key.pem}（PKCS8 私钥）+ {@code fullchain.pem}（缺失回退 cert.pem）。
  * 站点 cert_mode=TASK 时优先使用指定任务的证书；AUTO 按 SNI 域名精确 > 通配匹配。
+ * 均未命中时不终止握手，兜底选用剩余有效期最长的证书（域名不符仅表现为浏览器告警）。
  * 证书签发/续期成功后调用 {@link #reload()} 热更新（SslContext 懒构建，重载即失效重建）。
  */
 public final class SslStore {
@@ -97,10 +98,11 @@ public final class SslStore {
 
     /**
      * SNI 握手选证：先按当前站点列表解析（cert_mode=TASK 指定优先），
-     * 再按域名映射自动匹配（精确 > 逐级父域通配）。返回 null 表示无可用证书（握手终止）。
+     * 再按域名映射自动匹配（精确 > 逐级父域通配）；均未命中时兜底选用
+     * 剩余有效期最长的证书。返回 null 仅当证书库为空（握手终止）。
      */
     public static SslContext forSni(String hostname, List<ProxySite> sites) {
-        if (hostname == null || hostname.isEmpty()) return firstContext();
+        if (hostname == null || hostname.isEmpty()) return longestValidContext();
         String host = hostname.toLowerCase(Locale.ROOT);
         // 1. 站点指定证书任务优先
         boolean auto = false;
@@ -115,7 +117,8 @@ public final class SslStore {
             Long taskId = lookupDomain(host);
             if (taskId != null) return context(taskId);
         }
-        return null;
+        // 3. 未匹配到域名证书：兜底剩余有效期最长的证书，避免直接中断握手
+        return longestValidContext();
     }
 
     /** 域名查表：精确 -> *.一级父域 -> *.二级父域 ...（nginx 通配最长匹配语义） */
@@ -146,10 +149,17 @@ public final class SslStore {
         });
     }
 
-    /** 无 SNI 时的兜底：任一有效证书（后续按 HTTP 层再校验域名归属） */
-    private static SslContext firstContext() {
-        for (Long id : entries.keySet()) return context(id);
-        return null;
+    /** 兜底选证：剩余有效期最长的一张（无 SNI 或域名未命中时使用，后续按 HTTP 层再校验域名归属） */
+    private static SslContext longestValidContext() {
+        Long bestId = null;
+        Instant bestNotAfter = null;
+        for (CertEntry e : entries.values()) {
+            if (bestId == null || e.notAfter().isAfter(bestNotAfter)) {
+                bestId = e.taskId();
+                bestNotAfter = e.notAfter();
+            }
+        }
+        return bestId == null ? null : context(bestId);
     }
 
     private static SslContext buildContext(long taskId) throws Exception {

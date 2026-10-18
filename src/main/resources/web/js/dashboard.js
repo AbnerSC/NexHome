@@ -28,6 +28,112 @@ const SPEED_TEST_MS = 10000;
  */
 const SPEED_STREAMS = 6;
 
+/** 取“好看”的纵轴上限（1/2/2.5/5 × 10^n），网格刻度避免零碎小数 */
+function dvNiceMax(v) {
+    const exp = Math.pow(10, Math.floor(Math.log10(Math.max(v, 1))));
+    for (const f of [1, 2, 2.5, 5, 10]) if (v <= f * exp * 1.0001) return f * exp;
+    return 10 * exp;
+}
+
+/**
+ * 每日总访问折线图：Catmull-Rom 平滑曲线 + 主题色渐变描边与面积 + 虚线网格
+ * + 悬浮最近点吸附气泡，最新一天末端常亮高亮点；尺寸按容器实测绘制（纵向填满所在栅格行）。
+ */
+function drawVisitChart(host, days) {
+    if (!host) return;
+    if (!days.length) { host.innerHTML = '<p class="muted small" style="margin:0">暂无访问数据</p>'; return; }
+    const W = Math.max(host.clientWidth || 0, 240), H = Math.max(host.clientHeight || 0, 140);
+    const P = { l: 42, r: 14, t: 14, b: 20 };
+    const iw = W - P.l - P.r, ih = H - P.t - P.b;
+    const peak = Math.max(...days.map(x => x.hits || 0));
+    const nice = dvNiceMax(peak);
+    const X = i => P.l + (days.length < 2 ? iw / 2 : (iw * i) / (days.length - 1));
+    const Y = v => P.t + ih - (Math.max(v, 0) / nice) * ih;
+    const pts = days.map((x, i) => ({ x: +X(i).toFixed(1), y: +Y(x.hits || 0).toFixed(1), day: x.day, hits: x.hits || 0 }));
+
+    // Catmull-Rom 转三次贝塞尔（控制点钳制在绘图区内，防平滑越界穿过基线）
+    const line = (() => {
+        if (pts.length === 1) return `M${pts[0].x},${pts[0].y}`;
+        const cl = y => Math.min(P.t + ih, Math.max(P.t, y));
+        let d = `M${pts[0].x},${pts[0].y}`;
+        for (let i = 0; i < pts.length - 1; i++) {
+            const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+            d += `C${(p1.x + (p2.x - p0.x) / 6).toFixed(1)},${cl(p1.y + (p2.y - p0.y) / 6).toFixed(1)} `
+                + `${(p2.x - (p3.x - p1.x) / 6).toFixed(1)},${cl(p2.y + (p3.y - p1.y) / 6).toFixed(1)} `
+                + `${p2.x},${p2.y}`;
+        }
+        return d;
+    })();
+    const area = pts.length > 1 ? `${line}L${pts[pts.length - 1].x},${P.t + ih}L${pts[0].x},${P.t + ih}Z` : '';
+
+    // 网格 + 纵轴刻度（基线实线，其余虚线）
+    let grid = '';
+    for (let g = 0; g <= 4; g++) {
+        const y = (P.t + ih - (ih * g) / 4).toFixed(1);
+        grid += `<line x1="${P.l}" y1="${y}" x2="${W - P.r}" y2="${y}" stroke="${g ? 'rgba(148,163,200,.10)' : 'rgba(148,163,200,.24)'}" stroke-dasharray="${g ? '3 4' : ''}"/>`
+            + `<text x="${P.l - 7}" y="${+y + 3.5}" text-anchor="end" font-size="9.5" fill="#aab6d8">${fmtCount((nice * g) / 4)}</text>`;
+    }
+    // 横轴日期刻度（点少全显，点多隔取样且末尾必显）
+    let ticks = '';
+    const step = Math.max(1, Math.ceil(pts.length / 5));
+    pts.forEach((p, i) => {
+        if (i % step && i !== pts.length - 1) return;
+        ticks += `<text x="${p.x}" y="${H - 6}" text-anchor="middle" font-size="9.5" fill="#aab6d8">${esc((p.day || '').slice(5))}</text>`;
+    });
+
+    const last = pts[pts.length - 1];
+    host.innerHTML = `
+      <svg width="${W}" height="${H}" style="display:block">
+        <defs>
+          <linearGradient id="dvc-line" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#38bdf8"/><stop offset=".55" stop-color="#6d8bff"/><stop offset="1" stop-color="#a855f7"/>
+          </linearGradient>
+          <linearGradient id="dvc-area" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#6d8bff" stop-opacity=".30"/>
+            <stop offset=".65" stop-color="#6d8bff" stop-opacity=".07"/>
+            <stop offset="1" stop-color="#6d8bff" stop-opacity="0"/>
+          </linearGradient>
+          <filter id="dvc-glow" x="-30%" y="-30%" width="160%" height="160%">
+            <feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#6d8bff" flood-opacity=".35"/>
+          </filter>
+        </defs>
+        ${grid}${ticks}
+        ${area ? `<path d="${area}" fill="url(#dvc-area)"/>` : ''}
+        <path d="${line}" fill="none" stroke="url(#dvc-line)" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" filter="url(#dvc-glow)"/>
+        ${peak > 0 && last ? `<circle cx="${last.x}" cy="${last.y}" r="3.4" fill="#fff" stroke="#6d8bff" stroke-width="2.2"/>` : ''}
+        ${peak === 0 ? `<text x="${P.l + iw / 2}" y="${P.t + ih / 2}" text-anchor="middle" font-size="11" fill="#b7c1cf">该时段暂无访问</text>` : ''}
+        <line id="dvc-guide" y1="${P.t}" y2="${P.t + ih}" stroke="#6d8bff" stroke-width="1.2" stroke-dasharray="4 3" opacity="0"/>
+        <circle id="dvc-cursor" r="4.2" fill="#6d8bff" stroke="#fff" stroke-width="1.6" opacity="0"/>
+        <rect id="dvc-hit" x="${P.l}" y="${P.t}" width="${iw}" height="${ih}" fill="transparent" style="cursor:crosshair"/>
+      </svg>
+      <div class="tf-tip" id="dvc-tip" style="display:none"></div>`;
+
+    // 悬浮交互：最近点吸附 + 十字引导线 + 深色气泡提示
+    const svg = host.querySelector('svg');
+    const guide = host.querySelector('#dvc-guide');
+    const cursor = host.querySelector('#dvc-cursor');
+    const tip = host.querySelector('#dvc-tip');
+    const move = e => {
+        const mx = e.clientX - svg.getBoundingClientRect().left;
+        let best = 0, dist = Infinity;
+        pts.forEach((p, i) => { const dd = Math.abs(p.x - mx); if (dd < dist) { dist = dd; best = i; } });
+        const p = pts[best];
+        guide.setAttribute('x1', p.x); guide.setAttribute('x2', p.x); guide.setAttribute('opacity', '.55');
+        cursor.setAttribute('cx', p.x); cursor.setAttribute('cy', p.y); cursor.setAttribute('opacity', '1');
+        tip.style.display = '';
+        tip.innerHTML = `${esc(p.day)}<br><b>${fmtCount(p.hits)} 次</b>`;
+        const half = tip.offsetWidth / 2 || 40; // 靠近左右边缘时钳制，防气泡溢出
+        tip.style.left = Math.max(half + 2, Math.min(W - half - 2, p.x)) + 'px';
+        tip.style.top = Math.max(p.y - 10, 30) + 'px';
+    };
+    const leave = () => {
+        guide.setAttribute('opacity', '0'); cursor.setAttribute('opacity', '0'); tip.style.display = 'none';
+    };
+    const hit = host.querySelector('#dvc-hit');
+    hit.addEventListener('mousemove', move);
+    hit.addEventListener('mouseleave', leave);
+}
+
 async function renderDashboard() {
     let d;
     try { d = await api('GET', '/api/dashboard'); }
@@ -69,15 +175,8 @@ async function renderDashboard() {
       <tr><td>${esc(c.name)}</td><td class="small muted">${esc((c.not_after || '').slice(0, 10))}</td>
         <td>${badge(c.daysLeft <= 7 ? `仅剩 ${c.daysLeft} 天` : `${c.daysLeft} 天后到期`, c.daysLeft <= 7 ? 'err' : 'warn')}</td></tr>`).join('');
 
-    // 代理访问统计：每日总访问柱状 + 网站/地区 TOP10（横向条形）
+    // 代理访问统计：每日总访问折线 + 网站/地区 TOP10（横向条形）
     const visitDays = visits.days || [];
-    const maxDay = Math.max(1, ...visitDays.map(x => x.hits || 0));
-    const dayBars = visitDays.map(x => `
-      <div class="dash-visit-item" title="${esc(x.day)}：${fmtCount(x.hits)} 次">
-        <span class="dash-visit-num">${fmtCount(x.hits)}</span>
-        <div class="dash-visit-barwrap"><i class="dash-visit-bar" style="height:${Math.max(2, Math.round((x.hits || 0) / maxDay * 100))}%"></i></div>
-        <span class="dash-visit-day">${esc((x.day || '').slice(5))}</span>
-      </div>`).join('');
 
     const topList = items => (items || []).length ? items.map((it, i) => {
         const top = items[0].hits || 1;
@@ -100,9 +199,9 @@ async function renderDashboard() {
         <h3 class="dash-panel-title">📈 代理访问统计
           <span class="muted small" style="font-weight:400">（最近 7 天 · 共 ${fmtCount(visits.total)} 次）</span></h3>
         <div class="dash-visit-grid">
-          <div>
+          <div class="dash-visit-col">
             <div class="dash-visit-sub">每日总访问次数</div>
-            <div class="dash-visit-chart">${dayBars}</div>
+            <div class="dash-visit-chart" id="dashVisitChart"></div>
           </div>
           <div>
             <div class="dash-visit-sub">网站访问 TOP10</div>
@@ -131,6 +230,15 @@ async function renderDashboard() {
         </div>
       </div>
       <div class="tip">数据每 15 秒自动刷新一次；点击顶部指标卡可跳转到对应模块查看详情。</div>`;
+    drawVisitChart($('#dashVisitChart'), visitDays);
+    // TOP10 名称等宽：以两列全部名称中最长为准统一列宽，比例条起点与次数纵向对齐
+    // （scrollWidth 含被 ellipsis 截断的完整文本宽；超出 max-width 时全体一致截断，仍保持对齐）
+    const nameEls = $$('.dash-top-name');
+    if (nameEls.length) {
+        let maxW = 0;
+        nameEls.forEach(el => { maxW = Math.max(maxW, el.scrollWidth); });
+        nameEls.forEach(el => { el.style.width = maxW + 1 + 'px'; });  // +1 防亚像素取整误差深出省略号
+    }
     setRefresh(renderDashboard, 15000);
 }
 
@@ -239,20 +347,26 @@ async function runSpeedTest() {
         if (!got) throw new Error('下载测速未收到数据');
         setV('down', rate(got, tD));
 
-        // 3) 上传速率：优先流式推流（fetch + duplex:'half'）——整条连接 10 秒连续满载。
+        // 3) 上传速率：https 页面优先流式推流（fetch + duplex:'half'）——整条连接 10 秒连续满载。
         //    旧“整片 POST 等响应再发下一片”的模式，每片之间连接空转一个往返周期，
         //    千兆链路实测只能压出约 1/3 带宽；流式模式由浏览器按网络节奏回调 pull 入块
         //    （默认高水位 1 块，天然背压，推流节奏即网络真实吞吐节奏），到时 close() 结束，
-        //    服务端读到 EOF 返回实收字节数作为权威计量。不支持流式请求体的浏览器回退为
-        //    8MB 大分片整片 POST（分片越大，每片往返空转的占比越小）。
+        //    服务端读到 EOF 返回实收字节数作为权威计量。
+        //    注意：浏览器的流式请求体只在 HTTP/2、HTTP/3 上可用，而这两种协议只跑在 TLS
+        //    之上——明文 http:// 页面里发流式 POST，浏览器会对同端口发起 TLS/h2 协商，
+        //    失败即整路 "Failed to fetch"（net::ERR_ALPN_NEGOTIATION_FAILED）。
+        //    因此 http:// 下直接走 8MB 大分片整片 POST（分片越大，每片往返空转的占比越小）；
+        //    https 下若流式实际不可用（如服务端未启用 h2）同样降级到分片模式。
         const UP_URL = API_BASE + '/api/system/speedtest/up';
         const UP_BLOCK = 1024 * 1024;
         const upBlock = new Uint8Array(UP_BLOCK); // getRandomValues 单次上限 65536 字节，需分片填充
         for (let off = 0; off < UP_BLOCK; off += 65536) {
             crypto.getRandomValues(upBlock.subarray(off, Math.min(off + 65536, UP_BLOCK)));
         }
-        // 流式上传能力探测：不支持的浏览器 Request 构造器直接抛 TypeError
-        const canStreamUp = (() => {
+        // 流式上传能力探测：除浏览器需支持 duplex 外，还要求页面本身是 https——
+        // 不满足时直接走定长分片，避免流式请求在明文端口上触发注定失败的 TLS 协商；
+        // 不支持流式请求体的浏览器 Request 构造器会直接抛 TypeError
+        const canStreamUp = location.protocol === 'https:' && (() => {
             try { new Request('', { method: 'POST', body: new ReadableStream(), duplex: 'half' }); return true; }
             catch (e) { return false; }
         })();
@@ -283,39 +397,51 @@ async function runSpeedTest() {
                 return (await r.json()).data.bytes;
             });
         };
+        // 定长分片轮：8MB 大分片整片 POST，是 http:// 下的唯一上传通道，
+        // 也是 https 下流式失败时的降级路径；窗口从各自超时点重新起算
+        const chunkRound = async () => {
+            const CHUNK = 8 * 1024 * 1024;
+            const chunk = new Uint8Array(CHUNK);
+            for (let off = 0; off < CHUNK; off += 65536) {
+                crypto.getRandomValues(chunk.subarray(off, Math.min(off + 65536, CHUNK)));
+            }
+            let total = 0;
+            const tC = performance.now();
+            const push = async () => {
+                while (performance.now() - tC < SPEED_TEST_MS) {
+                    const r = await fetch(UP_URL, {
+                        method: 'POST',
+                        headers: { 'X-Token': TOKEN, 'Content-Type': 'application/octet-stream' },
+                        body: chunk,
+                        signal: upAbort.signal
+                    });
+                    if (!r.ok) throw new Error('上传测速请求失败: HTTP ' + r.status);
+                    const j = await r.json();
+                    total += (j.data && j.data.bytes) || CHUNK;
+                    if (tick()) setV('up', rate(total, tC));
+                }
+            };
+            await Promise.all(Array.from({ length: SPEED_STREAMS }, push));
+            setV('up', rate(total, tC));
+        };
         try {
             if (canStreamUp) {
-                // 预热：下载阶段的连接对发送方向未经考验，先让 6 条连接度过 TCP 慢启动（不计入测量）
-                await Promise.all(Array.from({ length: SPEED_STREAMS }, () => streamUp(600)));
-                sent = 0;
-                tU = performance.now();
-                const ups = await Promise.all(Array.from({ length: SPEED_STREAMS }, () => streamUp(SPEED_TEST_MS)));
-                const upTotal = ups.reduce((a, b) => a + b, 0);
-                if (!upTotal) throw new Error('上传测速未发出数据');
-                setV('up', rate(upTotal, tU));
-            } else {
-                const CHUNK = 8 * 1024 * 1024;
-                const chunk = new Uint8Array(CHUNK);
-                for (let off = 0; off < CHUNK; off += 65536) {
-                    crypto.getRandomValues(chunk.subarray(off, Math.min(off + 65536, CHUNK)));
+                try {
+                    // 预热：下载阶段的连接对发送方向未经考验，先让 6 条连接度过 TCP 慢启动（不计入测量）
+                    await Promise.all(Array.from({ length: SPEED_STREAMS }, () => streamUp(600)));
+                    sent = 0;
+                    tU = performance.now();
+                    const ups = await Promise.all(Array.from({ length: SPEED_STREAMS }, () => streamUp(SPEED_TEST_MS)));
+                    const upTotal = ups.reduce((a, b) => a + b, 0);
+                    if (!upTotal) throw new Error('上传测速未发出数据');
+                    setV('up', rate(upTotal, tU));
+                } catch (se) {
+                    // 流式实际不可用（如 https 站点未启用 HTTP/2）：降级为定长分片重测
+                    setV('up', '--');
+                    await chunkRound();
                 }
-                let total = 0;
-                const push = async () => {
-                    while (performance.now() - tU < SPEED_TEST_MS) {
-                        const r = await fetch(UP_URL, {
-                            method: 'POST',
-                            headers: { 'X-Token': TOKEN, 'Content-Type': 'application/octet-stream' },
-                            body: chunk,
-                            signal: upAbort.signal
-                        });
-                        if (!r.ok) throw new Error('上传测速请求失败: HTTP ' + r.status);
-                        const j = await r.json();
-                        total += (j.data && j.data.bytes) || CHUNK;
-                        if (tick()) setV('up', rate(total, tU));
-                    }
-                };
-                await Promise.all(Array.from({ length: SPEED_STREAMS }, push));
-                setV('up', rate(total, tU));
+            } else {
+                await chunkRound();
             }
         } finally {
             clearTimeout(upGuard);
