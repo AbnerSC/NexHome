@@ -48,6 +48,6 @@ COPY --from=build /build/target/nexhome.jar app.jar
 
 # JVM 参数与 pom.xml 中 MANIFEST JVM-Options 保持一致；
 # 低内存调优：Serial GC + 固定小堆（ip2region 已用 VIndexCache 按需读文件，无需大堆）
-ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-Xms64m", "-Xmx256m", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
+ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-Xms64m", "-Xmx512m", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
 
 EXPOSE 8090
