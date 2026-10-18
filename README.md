@@ -31,7 +31,12 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - DOCKER_HOST=unix:///var/run/docker.sock
-    mem_limit: 512m          # 256m→512m：容纳 -Xmx256m + Metaspace128m + CodeCache64m，否则 OOM Kill
+    deploy:
+      resources:
+        limits:
+          memory: 512m # 推荐512MB以上
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
     healthcheck:
       # 镜像无 curl，改用 bash /dev/tcp 探测端口（仅验证端口可连）
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8090 && echo -n '' >&3"]

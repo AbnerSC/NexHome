@@ -46,8 +46,10 @@ WORKDIR /app
 
 COPY --from=build /build/target/nexhome.jar app.jar
 
-# JVM 参数与 pom.xml 中 MANIFEST JVM-Options 保持一致；
-# 低内存调优：Serial GC + 固定小堆（ip2region 已用 VIndexCache 按需读文件，无需大堆）
-ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-Xms64m", "-Xmx512m", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
+# JVM 内存自适应：堆上限按容器内存限制（cgroup；裸机运行时为物理总内存）的 75% 自动计算
+# （-XX:MaxRAMPercentage），无需固定 -Xmx，低配/高配环境均可自适应；
+# 剩余 ~25% 留给 Metaspace(≤128m)/CodeCache(≤64m)/线程栈等非堆内存；
+# 低内存调优：Serial GC + 小线程栈（ip2region 已用 VIndexCache 按需读文件，无需大堆）
+ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-XX:MaxRAMPercentage=75.0", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
 
 EXPOSE 8090
