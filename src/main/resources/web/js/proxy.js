@@ -37,6 +37,10 @@ async function renderProxy() {
           </span>
           <span class="field-inline">HTTP 端口 <input name="httpPort" id="pxHttp" type="number" min="1" max="65535" placeholder="80"></span>
           <span class="field-inline">HTTPS 端口 <input name="httpsPort" id="pxHttps" type="number" min="1" max="65535" placeholder="443"></span>
+          <span class="inline-switch" title="前置代理/CDN 场景按 X-Forwarded-For / X-Real-IP / CF-Connecting-IP 解析访客真实来源 IP（用于访问统计与 IP 白名单）；直连暴露且需以真实 socket 对端为准时关闭">
+            <label class="switch"><input type="checkbox" id="pxRealIp"><span class="slider"></span></label>
+            <span class="muted small">解析真实来源 IP</span>
+          </span>
           <button class="btn primary" type="submit">保存并应用</button>
           <span id="pxListenStatus" class="small muted"></span>
         </form>
@@ -83,6 +87,7 @@ async function refreshProxy() {
     $('#pxEnabled').checked = !!L.enabled;
     $('#pxHttp').value = L.httpPort || '';
     $('#pxHttps').value = L.httpsPort || '';
+    $('#pxRealIp').checked = L.trustRealIp !== false; // 默认开启
     pxRenderListen(L);
     // 告警条
     const err = st.lastError || '';
@@ -152,7 +157,8 @@ window.pxSaveSettings = async e => {
     const body = {
         enabled: f.get('enabled') === 'on' || $('#pxEnabled').checked,
         httpPort: Number(f.get('httpPort') || 0),
-        httpsPort: Number(f.get('httpsPort') || 0)
+        httpsPort: Number(f.get('httpsPort') || 0),
+        trustRealIp: $('#pxRealIp').checked
     };
     try {
         const r = await api('POST', '/api/proxy/settings', body);
@@ -249,6 +255,14 @@ window.pxForm = async (id) => {
           <div class="field full"><label>IP 白名单</label><input id="aIpAllow" placeholder="192.168.1., 10.0.0.5（精确 IP 或以点结尾的网段前缀，逗号分隔，留空=不限）"></div>
           <div class="field"><label>后端 TLS 免校验（自签 https 后端）</label>
             <select id="aInsecure"><option value="true">是</option><option value="false">否</option></select></div>
+          <div class="field full adv-cache-title"><b>回源协议 / HTTP/2</b></div>
+          <div class="field"><label>回源协议</label>
+            <select id="aBackendProto"><option value="http1">HTTP/1.1</option><option value="h2">HTTP/2（h2c / ALPN h2）</option></select></div>
+          <div class="field"><label>h2 单连接并发流上限</label><input id="aH2Streams" type="number" min="1" max="1000"></div>
+          <div class="field"><label>h2 后端连接上限</label><input id="aH2Conns" type="number" min="1" max="1024"></div>
+          <div class="small muted full">选 <b>HTTP/2</b> 时：明文后端走 h2c prior-knowledge，https 后端经 ALPN 协商 h2（协商不到 h2 直接报 502，不静默降级）；
+            一条后端连接并发承载多事务，只开关流不重建连接，可显著降低后端 fd 消耗。
+            此模式忽略下方「回源连接池」的开关（空闲回收秒数仍用于 h2 连接），且不支持 Upgrade/WebSocket 与 HTTP/1.1 前端的 gRPC。</div>
           <div class="field full adv-cache-title"><b>回源长连接（upstream keepalive）</b></div>
           <div class="field"><label>启用回源连接池</label>
             <select id="aUpstreamKa"><option value="true">启用（复用空闲连接）</option><option value="false">关闭（每请求短连接）</option></select></div>
@@ -334,6 +348,9 @@ function pxFillAdvControls() {
     $('#aAuthPass').value = ba.pass || '';
     $('#aIpAllow').value = (a.ipAllow || []).join(', ');
     $('#aInsecure').value = String(!!a.backendInsecure);
+    $('#aBackendProto').value = a.backendProtocol === 'h2' ? 'h2' : 'http1';
+    $('#aH2Streams').value = a.h2MaxConcurrentStreams ?? 100;
+    $('#aH2Conns').value = a.h2MaxConns ?? 4;
     $('#aUpstreamKa').value = String(!!a.upstreamKeepalive);
     $('#aUpstreamIdle').value = a.upstreamIdleSec ?? 60;
     $('#aUpstreamMax').value = a.upstreamMaxIdleConns ?? 32;
@@ -362,6 +379,10 @@ function pxReadAdvControls() {
     const ip = csv($('#aIpAllow').value);
     if (ip.length) a.ipAllow = ip; else delete a.ipAllow;
     a.backendInsecure = $('#aInsecure').value === 'true';
+    const proto = $('#aBackendProto').value === 'h2' ? 'h2' : 'http1';
+    a.backendProtocol = proto;
+    a.h2MaxConcurrentStreams = Math.min(1000, Math.max(1, num($('#aH2Streams').value) || 100));
+    a.h2MaxConns = Math.min(1024, Math.max(1, num($('#aH2Conns').value) || 4));
     a.upstreamKeepalive = $('#aUpstreamKa').value === 'true';
     a.upstreamIdleSec = num($('#aUpstreamIdle').value) || 60;
     a.upstreamMaxIdleConns = num($('#aUpstreamMax').value) || 32;

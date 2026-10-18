@@ -10,12 +10,11 @@
     <packaging>jar</packaging>
 
     <name>NexHome</name>
-    <description>一站式内网节点守护工具（DDNS / STUN穿透 / WOL唤醒 / SSL证书 / 网站导航）</description>
+    <description>一站式内网节点守护工具，面向家庭 / 小型机房服务器，把内网能力安全对外打通</description>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>25</maven.compiler.release>
-        <!-- 代理模块 Netty 版本（4.2 稳定线，netty-bom 统一各模块版本） -->
         <netty.version>4.2.19.Final</netty.version>
     </properties>
 

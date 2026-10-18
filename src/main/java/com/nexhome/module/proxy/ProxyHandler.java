@@ -11,6 +11,7 @@ import io.netty.handler.codec.http.DefaultHttpContent;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.DefaultHttpResponse;
+import io.netty.handler.codec.http.DefaultLastHttpContent;
 import io.netty.handler.codec.http.HttpContent;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaders;
@@ -50,6 +51,21 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
 
     private Tx tx; // 进行中的转发事务
 
+    /**
+     * h1 流水线积压队列：同一读批次中编解码器会连续下发多个请求，
+     * autoRead=false 只能阻止后续 read 迭代，拦不住已解码消息；
+     * 事务进行中新到达的 HttpRequest 及其体分片复制为脱离原管道的消息暂存
+     * （引用由队列独占，不与框架 channelRead0 后的自动释放相互干扰），
+     * 当前事务结束后按请求边界重放（对齐 nginx 串行处理流水线而非拒绝对行为）。
+     */
+    private final java.util.ArrayDeque<Object> backlog = new java.util.ArrayDeque<>();
+    private long backlogBytes; // 积压体字节数，超限视为客户端异常
+    private boolean accumulating; // 正在向 backlog 累积后续请求单元
+    private ChannelHandlerContext frontCtx; // 连接级上下文（startRequest 时记录，供积压重放用）
+
+    /** 流水线积压上限：客户端不等响应持续灌体则断连保护（对齐 nginx 流水线缓冲限制） */
+    private static final long MAX_BACKLOG_BYTES = 16L * 1024 * 1024;
+
     ProxyHandler(boolean https, boolean isH2) {
         this.https = https;
         this.isH2 = isH2;
@@ -59,20 +75,107 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
     protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
         if (msg instanceof HttpRequest req) {
             if (tx != null && !tx.done.get()) {
-                // 正常不会发生（h1 靠 autoRead 串行、h2 每流一处理器）；防御性拒绝
-                ProxyCenter.sendSimple(ctx, 400, "请求流水线异常", null, null, false);
-                ctx.close();
+                if (isH2) {
+                    // h2 每流一处理器，再收第二个 HttpRequest 必为客户端违规：防御性拒绝
+                    ProxyCenter.sendSimple(ctx, 400, "请求流水线异常", null, null, false);
+                    ctx.close();
+                    return;
+                }
+                accumulating = true;
+                backlog.add(detach(req));
                 return;
             }
             startRequest(ctx, req);
+            if (req instanceof io.netty.handler.codec.http.FullHttpMessage full) {
+                // h2 前端的无体请求（HEADERS 带 END_STREAM）会被流编解码器合成<em>一条</em> FullHttpRequest：
+                // 框架不再另行下发 LastHttpContent，此处就地把它当请求体收尾交回事务。
+                // 否则回源 h2 流永远等不到 END_STREAM（后端挂在读请求体上），h1 回源也缺「无体」信号。
+                handleContent(ctx, new DefaultLastHttpContent(full.content().retain()));
+            }
         } else if (msg instanceof HttpContent c) {
+            if (accumulating) {
+                long size = c.content().readableBytes();
+                if (backlogBytes + size > MAX_BACKLOG_BYTES) {
+                    releaseBacklog();
+                    ctx.close(); // 积压超限：客户端违规，直接断开
+                    return;
+                }
+                backlogBytes += size;
+                backlog.add(detach(c));
+                if (c instanceof LastHttpContent) drainBacklog(); // 事务已收尾时及时排空
+                return;
+            }
             handleContent(ctx, c);
         }
+    }
+
+    /** 复制为脱离原管道的消息：头与内容独立于解码器缓冲，入队后引用由队列独占 */
+    private static Object detach(Object msg) {
+        if (msg instanceof HttpRequest req)
+            return new DefaultHttpRequest(req.protocolVersion(), req.method(), req.uri(),
+                    new DefaultHttpHeaders().add(req.headers()));
+        HttpContent c = (HttpContent) msg;
+        return c instanceof LastHttpContent
+                ? new DefaultLastHttpContent(c.content().copy())
+                : new DefaultHttpContent(c.content().copy());
+    }
+
+    /** 事务间隙尝试排空积压：按 HttpRequest 边界重放，直到新事务建立或队列空 */
+    private void drainBacklog() {
+        ChannelHandlerContext ctx = frontCtx;
+        if (ctx == null || !ctx.channel().isActive()) {
+            releaseBacklog();
+            return;
+        }
+        while ((tx == null || tx.done.get()) && !backlog.isEmpty()) {
+            if (tx != null && tx.done.get()) tx = null; // 允许重新开始下一事务
+            Object head = backlog.peekFirst();
+            if (!(head instanceof HttpRequest)) {
+                Object orphan = backlog.pollFirst(); // 无主内容（前请求已收尾）：丢弃
+                backlogBytes -= ((HttpContent) orphan).content().readableBytes();
+                release(orphan);
+                continue;
+            }
+            HttpRequest req = (HttpRequest) backlog.pollFirst();
+            accumulating = false;
+            startRequest(ctx, req);
+            release(req); // startRequest 同步取用完毕，释放队列独占引用
+            // 重放该请求已缓存的体分片，至下一个请求边界或 LastHttpContent 为止
+            while (!backlog.isEmpty() && !(backlog.peekFirst() instanceof HttpRequest)) {
+                Object c = backlog.pollFirst();
+                backlogBytes -= ((HttpContent) c).content().readableBytes();
+                channelRead0(ctx, c); // 事务已建→ handleContent 自行 retain 接管；未建→ 忽略
+                release(c);           // 释放队列独占引用（等价于框架 channelRead0 后的自动释放）
+                if (c instanceof LastHttpContent) break;
+            }
+            if (tx != null && !tx.done.get()) return; // 新事务进行中，余下等 onFinish 重排
+        }
+    }
+
+    private static void release(Object msg) {
+        if (msg instanceof io.netty.util.ReferenceCounted rc) rc.release();
+    }
+
+    /** 连接收尾：释放全部积压消息引用 */
+    private void releaseBacklog() {
+        Object o;
+        while ((o = backlog.pollFirst()) != null) release(o);
+        backlogBytes = 0;
+        accumulating = false;
     }
 
     // ==================== 请求处理 ====================
 
     private void startRequest(ChannelHandlerContext ctx, HttpRequest req) {
+        frontCtx = ctx;
+        if (req.decoderResult().isFailure()) {
+            // 请求行/请求头非法（典型为超长头）：解码器不抛异常而是下发失败标记的空请求，
+            // 若不拦下会被后面的「缺 Host」误报 400，语义上应为 431 并断开连接
+            String why = String.valueOf(req.decoderResult().cause());
+            ProxyCenter.logFrontError(ctx, req.decoderResult().cause());
+            ProxyCenter.sendSimple(ctx, 431, "请求行或请求头非法/过长：" + why, null, null, false);
+            return;
+        }
         String hostHdr = req.headers().get(HttpHeaderNames.HOST);
         if (hostHdr == null || hostHdr.isBlank()) {
             ProxyCenter.sendSimple(ctx, 400, "缺少 Host 请求头", null, null, false);
@@ -100,7 +203,10 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         st.rate.inc();
 
         ProxyAdvanced adv = site.adv();
-        String clientIp = ProxyCenter.clientAddr(ctx.channel()).getAddress().getHostAddress();
+        // peerIp：直连对端地址，用于回源时向下游追加 XFF 链；
+        // clientIp：解析后的访客真实 IP（前置代理/CDN 场景取转发头），用于访问统计与 IP 白名单
+        String peerIp = ProxyCenter.clientAddr(ctx.channel()).getAddress().getHostAddress();
+        String clientIp = ProxyCenter.resolveClientIp(req, peerIp);
         // 访问统计：路由命中即计一次（含被访问控制拒绝的请求），仅内存累加，不阻塞转发
         VisitStats.record(host, clientIp);
 
@@ -145,7 +251,22 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
                         null, null, true);
                 return;
             }
-            startTunnel(ctx, site, req, upath, clientIp, st);
+            if (adv.backendH2()) {
+                // h2 回源无法承载 Upgrade（RFC 7540 8.4 明确禁止连接级升级）：
+                // 明确拒绝而不给一个语义不明的高速源错误，告知该改站点回源协议
+                ProxyCenter.sendSimple(ctx, 501,
+                        "该站点回源协议为 HTTP/2，不支持 Upgrade/WebSocket，请将回源协议改为 http1", null, null, true);
+                return;
+            }
+            startTunnel(ctx, site, req, upath, peerIp, st);
+            return;
+        }
+        // gRPC 依赖 trailer 里的 grpc-status：HTTP/1.1 前端无法透传 trailer，
+        // 若硬转发会给出一个“成功但无状态码”的坏响应，此处明确拒绝（后端为 h2 时前端也必须走 h2）
+        if (adv.backendH2() && !isH2 && isGrpc(req)) {
+            ProxyCenter.sendSimple(ctx, 501,
+                    "gRPC 需经 HTTP/2 前端访问（本连接为 HTTP/1.1，无法透传 grpc-status trailer）",
+                    null, null, true);
             return;
         }
 
@@ -165,14 +286,15 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         }
 
         beginRelay(ctx, site, req, upath, path + (query.isEmpty() ? "" : "?" + query),
-                clientIp, st, cacheKey, HttpMethod.GET.equals(req.method()));
+                peerIp, st, cacheKey, HttpMethod.GET.equals(req.method()));
     }
 
     /** 消息级中继：改写请求头后连后端，请求体流式转发；h1 期间暂停读取实现串行 */
     private void beginRelay(ChannelHandlerContext ctx, ProxySite site, HttpRequest req,
-                            String upath, String pathQuery, String clientIp, ProxyCenter.SiteStats st,
+                            String upath, String pathQuery, String peerIp, ProxyCenter.SiteStats st,
                             String cacheKey, boolean methodGet) {
         tx = new Tx(ctx, site, st, cacheKey, methodGet, pathQuery);
+        tx.onFinish = this::drainBacklog; // 本事务收尾后继续排空流水线积压
         st.active.incrementAndGet();
         boolean keepAlive = !isH2 && HttpUtil.isKeepAlive(req);
         ProxyAdvanced adv = site.adv();
@@ -184,61 +306,81 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
                 new DefaultHttpHeaders());
         copyHeaders(req.headers(), fwd.headers());
         // 启用回源连接池时不声明 close（HTTP/1.1 默认 keep-alive），供响应读完后归还复用；
-        // 否则维持既有短连接语义（每请求 close）
-        if (adv.upstreamKeepalive) HttpUtil.setKeepAlive(fwd, true);
-        else fwd.headers().set(HttpHeaderNames.CONNECTION, "close");
-        // 上游 chunked 请求体（TE 已被剥离）：向后端重新声明 chunked 分帧，
-        // 否则后端按连接关闭定界等待 body 而挂起不响应
-        if (HttpUtil.isTransferEncodingChunked(req)) {
-            HttpUtil.setTransferEncodingChunked(fwd, true);
+        // 否则维持既有短连接语义（每请求 close）。h2 回源则两者都不写：逐跳头在 h2 中属违规头
+        // （RFC 7540 8.1.2.2），事务结束由流的 END_STREAM/RST 自然定界
+        if (adv.backendH2()) {
+            // 不写 Connection/Keep-Alive；chunked 请求体也不写 Transfer-Encoding，改由 DATA + END_STREAM 定界
+        } else {
+            if (adv.upstreamKeepalive) HttpUtil.setKeepAlive(fwd, true);
+            else fwd.headers().set(HttpHeaderNames.CONNECTION, "close");
+            // 上游 chunked 请求体（TE 已被剥离）：向后端重新声明 chunked 分帧，
+            // 否则后端按连接关闭定界等待 body 而挂起不响应
+            if (HttpUtil.isTransferEncodingChunked(req)) {
+                HttpUtil.setTransferEncodingChunked(fwd, true);
+            }
         }
         fwd.headers().set("X-Forwarded-Proto", https ? "https" : "http");
         fwd.headers().set("X-Forwarded-Host", req.headers().get(HttpHeaderNames.HOST, ""));
         String xff = req.headers().get("X-Forwarded-For");
-        fwd.headers().set("X-Forwarded-For", xff == null || xff.isBlank() ? clientIp : xff + ", " + clientIp);
+        fwd.headers().set("X-Forwarded-For", xff == null || xff.isBlank() ? peerIp : xff + ", " + peerIp);
         fwd.headers().set("X-Forwarded-By", "NexHome");
         applyHeaderOps(adv.reqHeaders, fwd.headers());
 
-        ChannelFuture bf = ProxyCenter.openBackend(site, tx.front);
-        tx.backend = bf.channel();
-        // 关键：连接建立成功后再写回源请求。跨事件循环时，连接未完成时的预写与 flush
+        // 捕获本次事务引用：流水线重放会推进 tx 字段，迟到的连接回调不得误伤后续事务
+        final Tx t = tx;
+        if (!isH2) {
+            // autoRead=false 后 Netty 会撤走 OP_READ 兴趣，客户端在事务进行中提前断开（abort）
+            // 就无人唤醒，事务与两端 fd 悬挂到后端读超时才回收；此处显式保持一次读兴趣，
+            // 以便感知 FIN/RST 与流水线后续请求（后者进积压队列，不在此直接处理）
+            ctx.read();
+        }
+        // 关键：回源可用后再写回源请求。跨事件循环时，连接/流未就绪时的预写与 flush
         // 不会被可靠地下发到 socket（表现为后端收不到完整请求、响应永远不到达），
-        // 故统一放到 connect 监听器内，此时 backend channel 已 active 且可写。
-        // 复用连接返回的是已完成 future，监听器在同一事件循环线程内立即执行。
-        bf.addListener((ChannelFutureListener) f -> {
-            if (!f.isSuccess()) {
-                connectFailed(f, "后端连接失败: " + f.cause().getMessage());
+        // 故统一放到就绪回调内，此时 backend channel 已 active 且可写。
+        // h1 复用连接与 h2 新建流都在同一事件循环线程内回调。
+        ProxyCenter.openBackend(site, ctx, (b, err) -> {
+            if (err != null) {
+                connectFailed(t, "后端连接失败: " + err.getMessage());
                 return;
             }
-            Channel b = f.channel();
+            if (t.done.get()) { // 回调迟到（前端已断开/事务已收尾）：只释放刚取到的连接或流
+                b.close();
+                return;
+            }
+            t.backend = b;
             BackendRelay relay = b.attr(ProxyCenter.RELAY).get();
-            if (relay != null) relay.beginExchange(site, tx, keepAlive);
+            if (relay == null) { // 连接/流未绑定中继（不应发生）：明确失败，不要把事务静默挂到读超时
+                connectFailed(t, "后端连接未就绪（缺少中继处理器）");
+                b.close();
+                return;
+            }
+            relay.beginExchange(site, t, keepAlive);
             b.writeAndFlush(fwd);
-            tx.backendReady = true;
+            t.backendReady = true;
             // 请求体先于连接到达的缓存内容直接续流
-            if (tx.pendingBody != null && !tx.pendingBody.isEmpty()) {
-                for (Object o : tx.pendingBody) {
+            if (t.pendingBody != null && !t.pendingBody.isEmpty()) {
+                for (Object o : t.pendingBody) {
                     b.write(o);
-                    if (o instanceof LastHttpContent) tx.requestBodyDone = true;
+                    if (o instanceof LastHttpContent) t.requestBodyDone = true;
                 }
-                tx.pendingBody = null;
+                t.pendingBody = null;
                 b.flush();
             }
             // 大请求体（如 Docker 层 PUT）在首读批次后不会自动续读：前端 autoRead=false 期间
             // 必须显式驱动续读，否则后端等不到完整 body 而超时（对齐 nginx 请求体流式转发）。
             // 无体请求（GET 或空 POST）已由 LastHttpContent 置 requestBodyDone，不会误读下一个流水线请求。
-            if (!tx.requestBodyDone && b.isWritable()) ctx.read();
+            if (!t.requestBodyDone && b.isWritable()) ctx.read();
         });
     }
 
-    /** 后端连接建立失败：回 502 并收尾事务 */
-    private void connectFailed(ChannelFuture f, String reason) {
-        if (tx == null || tx.done.get()) return;
-        ProxyCenter.noteError(tx.site, reason);
-        ProxyCenter.sendSimple(tx.front, 502, "NexHome 代理：" + reason + "，请检查后端服务与端口",
+    /** 后端连接建立失败：回 502 并收尾事务（只针对发起连接的那个事务） */
+    private void connectFailed(Tx t, String reason) {
+        if (t == null || t.done.get()) return;
+        ProxyCenter.noteError(t.site, reason);
+        ProxyCenter.sendSimple(t.front, 502, "NexHome 代理：" + reason + "，请检查后端服务与端口",
                 null, null, false);
-        tx.front.close();
-        tx.finish(false);
+        t.front.close();
+        t.finish(false);
     }
 
     private void handleContent(ChannelHandlerContext ctx, HttpContent c) {
@@ -278,6 +420,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         volatile Channel backend;
         volatile boolean tunnel, backendReady;
         volatile boolean requestBodyDone; // 回源请求体是否已完整转发到后端（连接复用前置条件）
+        volatile Runnable onFinish;       // 事务正常收尾（恢复读取）后的回调：排空流水线积压
         List<Object> pendingBody = new ArrayList<>();
 
         Tx(ChannelHandlerContext front, ProxySite site, ProxyCenter.SiteStats st,
@@ -303,19 +446,22 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
                 pendingBody = null;
             }
             if (backend != null) backend.close();
-            if (front.channel().isActive() && resumeReads)
+            if (front.channel().isActive() && resumeReads) {
                 front.channel().config().setAutoRead(true);
+                if (onFinish != null) onFinish.run();
+            }
         }
     }
 
     // ==================== WebSocket / Upgrade 隧道 ====================
 
     private void startTunnel(ChannelHandlerContext ctx, ProxySite site, HttpRequest req,
-                             String upath, String clientIp, ProxyCenter.SiteStats st) {
+                             String upath, String peerIp, ProxyCenter.SiteStats st) {
         tx = new Tx(ctx, site, st, null, false, upath);
         tx.tunnel = true;
         st.active.incrementAndGet();
         ctx.channel().config().setAutoRead(false); // 握手期间不读后续帧（101 转入原始泵时恢复）
+        ctx.read(); // 同 beginRelay：保持读兴趣以感知握手期的客户端提前断开
 
         // 原始序列化回源请求头（保留 Upgrade，Connection 归一为 upgrade）
         StringBuilder sb = new StringBuilder(512);
@@ -325,7 +471,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
             if (hopNoTunnel(name)) continue;
             sb.append(name).append(": ").append(h.getValue()).append("\r\n");
         }
-        appendForwardHeaders(sb, req, clientIp);
+        appendForwardHeaders(sb, req, peerIp);
         applyTunnelOps(sb, site.adv().reqHeaders);
         sb.append("Connection: upgrade\r\n\r\n");
         byte[] head = sb.toString().getBytes(StandardCharsets.UTF_8);
@@ -334,7 +480,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         tx.backend = bf.channel();
         bf.addListener((ChannelFutureListener) f -> {
             if (!f.isSuccess()) {
-                connectFailed(f, "后端连接失败: " + f.cause().getMessage());
+                connectFailed(tx, "后端连接失败: " + f.cause().getMessage());
                 return;
             }
             Channel bc = f.channel();
@@ -363,11 +509,11 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         };
     }
 
-    private void appendForwardHeaders(StringBuilder sb, HttpRequest req, String clientIp) {
+    private void appendForwardHeaders(StringBuilder sb, HttpRequest req, String peerIp) {
         sb.append("X-Forwarded-Proto: ").append(https ? "https-tunnel" : "http-tunnel").append("\r\n");
         String xff = req.headers().get("X-Forwarded-For");
         sb.append("X-Forwarded-For: ")
-                .append(xff == null || xff.isBlank() ? clientIp : xff + ", " + clientIp).append("\r\n");
+                .append(xff == null || xff.isBlank() ? peerIp : xff + ", " + peerIp).append("\r\n");
         sb.append("X-Forwarded-By: NexHome\r\n");
     }
 
@@ -510,6 +656,12 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
                 && conn.toLowerCase(Locale.ROOT).contains("upgrade");
     }
 
+    /** gRPC 请求判定（含 websocket-style 的 grpc-web 文本帧，均依赖 h2 trailer） */
+    private static boolean isGrpc(HttpRequest req) {
+        String ct = req.headers().get(HttpHeaderNames.CONTENT_TYPE);
+        return ct != null && ct.toLowerCase(Locale.ROOT).startsWith("application/grpc");
+    }
+
     /** IP 白名单：精确 IP，或显式以点结尾的网段前缀（192.168.1. 匹配 192.168.1.*） */
     private static boolean ipAllowed(String ip, List<String> allow) {
         String v = ip.toLowerCase(Locale.ROOT);
@@ -544,9 +696,19 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
             String name = h.getKey();
             if (ProxyCenter.hopByHop(name)) continue;
             if (name.equalsIgnoreCase("expect")) continue;
+            if (syntheticH2(name)) continue; // 流对象编解码器注入的元数据头，不得透传
             if (dynHop != null && dynHop.contains(name.toLowerCase(Locale.ROOT))) continue;
             dst.add(name, h.getValue());
         }
+    }
+
+    /**
+     * h2 流对象编解码器将伪头翻译成的元数据头：
+     * 向前端（h1）透传会泄漏内部流号与连接参数，向 h2 后端透传则属违规头，两端一律剔除。
+     */
+    private static boolean syntheticH2(String name) {
+        String n = name.toLowerCase(Locale.ROOT);
+        return n.startsWith("x-http2-");
     }
 
     /** Connection 头中声明的额外逐跳头名（RFC 7230 §6.1，小写；无则返回 null） */
@@ -585,6 +747,17 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
     }
 
     @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        // 等待后端响应阶段保持读兴趣（见 beginRelay）：autoRead=false 下若不做一次 read，
+        // 前端提前断开无法感知，事务悬挂至后端读超时才回收（请求体上传阶段仍由可写回调驱动续读）
+        if (!isH2 && tx != null && !tx.done.get() && tx.requestBodyDone
+                && !ctx.channel().config().isAutoRead() && ctx.channel().isActive()) {
+            ctx.read();
+        }
+        super.channelReadComplete(ctx);
+    }
+
+    @Override
     public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
         // 背压恢复：前端出站缓冲回落低水位后恢复后端读取（与 BackendRelay 的暂停配对）
         if (ctx.channel().isWritable() && tx != null && !tx.done.get() && tx.backend != null) {
@@ -595,10 +768,16 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
+        releaseBacklog(); // 流水线积压随连接终止释放
         if (tx != null) {
             tx.finish(false);
             if (tx.backend != null) tx.backend.close();
         }
+    }
+
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) {
+        releaseBacklog(); // Upgrade 手术摘除处理器时同样清理
     }
 
     @Override

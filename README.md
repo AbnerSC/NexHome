@@ -21,7 +21,7 @@ compose 部署示例（host 网络 + docker.sock 挂载）：
 ```yaml
 services:
   nex-home:
-    image: scdm/nex-home:latest
+    image: babyfly/nex-home:latest
     container_name: nex-home
     restart: unless-stopped
     network_mode: host
@@ -102,4 +102,3 @@ docker compose up -d
 2. 登录密码：首次启动随机生成并打印到控制台，无内置固定密码（源码中的数据库文件`data/nexhome.db`用户密码：123456789012）
 
 ## 五、待办
-- [ ] 网络代理未识别header，所有请求都被识别为内网IP访问

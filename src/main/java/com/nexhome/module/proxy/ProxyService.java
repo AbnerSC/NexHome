@@ -28,6 +28,8 @@ public final class ProxyService {
     private static final String KEY_ENABLED = "proxy.enabled";
     private static final String KEY_HTTP_PORT = "proxy.http.port";
     private static final String KEY_HTTPS_PORT = "proxy.https.port";
+    /** 是否通过代理转发头解析访客真实来源 IP（"0"=关闭，其余含缺省=开启） */
+    private static final String KEY_TRUST_REALIP = "proxy.realip.trust_header";
     /** 最近一次绑定/降级提示（页头告警条展示），空=正常 */
     private static final String KEY_LAST_ERROR = "proxy.last_error";
 
@@ -72,6 +74,12 @@ public final class ProxyService {
         ProxyCache.init(ProxyService::siteExists);
         VisitStats.init(); // 访问记录周期落库（独立于监听开关，关停期间不丢已累积增量）
         try {
+            // 真实来源 IP 解析开关（默认开启）：读入内存供转发热路径直接取用，避免逐请求查库
+            ProxyCenter.trustRealIp = !"0".equals(orEmpty(Database.getConfig(KEY_TRUST_REALIP)));
+        } catch (Exception ignored) {
+            // 读取失败保持默认（开启）
+        }
+        try {
             applyListener();
         } catch (Exception e) {
             Logs.error(Logs.PROXY, "启动代理监听失败: " + e.getMessage());
@@ -94,6 +102,7 @@ public final class ProxyService {
         m.put("enabled", c.enabled());
         m.put("httpPort", c.httpPort());
         m.put("httpsPort", c.httpsPort());
+        m.put("trustRealIp", ProxyCenter.trustRealIp);
         m.put("lastError", orEmpty(Database.getConfig(KEY_LAST_ERROR)));
         ctx.ok(m);
     }
@@ -104,6 +113,10 @@ public final class ProxyService {
         int http = JsonUtils.num(b, "httpPort", DEFAULT_HTTP_PORT);
         int https = JsonUtils.num(b, "httpsPort", DEFAULT_HTTPS_PORT);
         validatePorts(enabled, http, https);
+        // 真实来源 IP 解析开关（独立于监听开关，无需重启即生效）
+        boolean trustRealIp = JsonUtils.bool(b, "trustRealIp", ProxyCenter.trustRealIp);
+        Database.setConfig(KEY_TRUST_REALIP, trustRealIp ? "1" : "0");
+        ProxyCenter.trustRealIp = trustRealIp;
         Database.setConfig(KEY_ENABLED, enabled ? "1" : "0");
         Database.setConfig(KEY_HTTP_PORT, String.valueOf(http));
         Database.setConfig(KEY_HTTPS_PORT, String.valueOf(https));
@@ -187,6 +200,7 @@ public final class ProxyService {
         Map<String, Object> row = mustGet(id);
         Database.update("DELETE FROM proxy_site WHERE id=?", id);
         ProxyCache.purgeSite(id); // 站点删除即清空其磁盘缓存
+        ProxyCenter.dropSiteState(id); // 释放限流桶与运行统计，避免长期增删站点残留
         ProxyCenter.reloadSites();
         Logs.info(Logs.PROXY, "删除代理站点 #" + id + ": " + row.get("name"));
         ctx.ok("已删除");
@@ -248,13 +262,13 @@ public final class ProxyService {
         String target = JsonUtils.str(b, "target").trim();
         ProxySite.validateTarget(target);
 
-        String certMode = JsonUtils.str(b, "certMode").trim().toUpperCase();
+        String certMode = fieldStr(b, "certMode", "cert_mode").trim().toUpperCase();
         if (certMode.isEmpty()) certMode = "AUTO";
         Long certTaskId = null;
         if (!CERT_MODES.contains(certMode))
             throw new IllegalArgumentException("证书模式只能是 AUTO / TASK / NONE: " + certMode);
         if (certMode.equals("TASK")) {
-            long tid = JsonUtils.num(b, "certTaskId", 0);
+            long tid = fieldNum(b, "certTaskId", "cert_task_id", 0);
             if (tid <= 0) throw new IllegalArgumentException("证书模式为 TASK 时必须指定证书任务");
             Map<String, Object> task = Database.queryOne(
                     "SELECT status FROM cert_task WHERE id=?", tid);
@@ -267,12 +281,30 @@ public final class ProxyService {
         String advJson = readAdvanced(b);
         String advanced = ProxyAdvanced.parse(advJson).toJson().toString(); // 校验 + 规范化回写
 
-        boolean forceHttps = JsonUtils.bool(b, "forceHttps", false);
+        boolean forceHttps = fieldBool(b, "forceHttps", "force_https", false);
         if (forceHttps && certMode.equals("NONE"))
             throw new IllegalArgumentException("强制 HTTPS 需要可用证书，证书模式不能为 NONE");
         boolean enabled = JsonUtils.bool(b, "enabled", true);
         return new Values(name, domains, paths, target, forceHttps, certMode, certTaskId,
                 advanced, enabled);
+    }
+
+    // ---------- 字段读取：兼容前端把列表行（DB 列名 snake_case）直接回写的编辑往返 ----------
+
+    private static String fieldStr(JsonObject b, String camel, String snake) {
+        if (b.has(camel)) return JsonUtils.str(b, camel);
+        return JsonUtils.str(b, snake);
+    }
+
+    private static boolean fieldBool(JsonObject b, String camel, String snake, boolean def) {
+        if (b.has(camel)) return JsonUtils.bool(b, camel, def);
+        if (b.has(snake)) return JsonUtils.bool(b, snake, def);
+        return def;
+    }
+
+    private static int fieldNum(JsonObject b, String camel, String snake, int def) {
+        if (b.has(camel)) return JsonUtils.num(b, camel, def);
+        return JsonUtils.num(b, snake, def);
     }
 
     /** advanced 允许为 JSON 对象或 JSON 字符串，统一取出文本再解析 */

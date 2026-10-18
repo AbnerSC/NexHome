@@ -27,6 +27,9 @@ import java.util.Set;
  *   "basicAuth":   {"user":"","pass":""},                           // Basic 认证（user 空=关闭）
  *   "ipAllow":     ["192.168.1.", "10.0.0.5"],                      // 来源 IP 白名单：精确 IP 或以点结尾的网段前缀（空=不限）
  *   "backendInsecure": false,                                       // 后端 HTTPS 跳过证书校验
+ *   "backendProtocol": "http1",                                     // 回源协议：http1 | h2（明文 h2c prior-knowledge / https ALPN 协商 h2）
+ *   "h2MaxConcurrentStreams": 100,                                  // h2 单连接并发流上限（与后端 SETTINGS 取小）
+ *   "h2MaxConns": 4,                                                // h2 后端连接（每路由每事件循环）保留上限
  *   "upstreamKeepalive": false,                                     // 回源长连接池（按后端 host:port 复用空闲连接）
  *   "upstreamIdleSec": 60,                                          // 池内空闲连接回收秒数
  *   "upstreamMaxIdleConns": 32,                                     // 每后端路由(每事件循环)保留的最大空闲连接数
@@ -70,6 +73,19 @@ public final class ProxyAdvanced {
     public int upstreamIdleSec = 60;
     /** 每个后端路由在每个事件循环上保留的最大空闲连接数 */
     public int upstreamMaxIdleConns = 32;
+
+    // ---------- 回源 HTTP/2（h2c / ALPN h2） ----------
+    /** 回源协议：http1（默认）或 h2。h2 时明文后端走 prior-knowledge，https 后端走 ALPN 协商 h2 */
+    public String backendProtocol = "http1";
+    /** 单条 h2 后端连接的并发流上限（与后端 SETTINGS 通告值取小） */
+    public int h2MaxConcurrentStreams = 100;
+    /** 每后端路由每事件循环保留的 h2 连接上限（满载时允许临时超出新建，用完即关不入池） */
+    public int h2MaxConns = 4;
+
+    /** 回源是否走 HTTP/2 */
+    public boolean backendH2() {
+        return "h2".equals(backendProtocol);
+    }
 
     // ---------- 文件缓存 ----------
     public boolean cacheEnabled = false;
@@ -151,6 +167,13 @@ public final class ProxyAdvanced {
             a.ipAllow = List.copyOf(list);
         }
         a.backendInsecure = JsonUtils.bool(o, "backendInsecure", a.backendInsecure);
+        if (o.has("backendProtocol") && !o.get("backendProtocol").isJsonNull()) {
+            a.backendProtocol = JsonUtils.str(o, "backendProtocol").trim().toLowerCase(Locale.ROOT);
+            if (!a.backendProtocol.equals("http1") && !a.backendProtocol.equals("h2"))
+                throw new IllegalArgumentException("backendProtocol 只能是 http1 或 h2: " + a.backendProtocol);
+        }
+        a.h2MaxConcurrentStreams = rangeInt(o, "h2MaxConcurrentStreams", a.h2MaxConcurrentStreams, 1, 1000, "h2MaxConcurrentStreams");
+        a.h2MaxConns = rangeInt(o, "h2MaxConns", a.h2MaxConns, 1, 1024, "h2MaxConns");
         a.upstreamKeepalive = JsonUtils.bool(o, "upstreamKeepalive", a.upstreamKeepalive);
         a.upstreamIdleSec = rangeInt(o, "upstreamIdleSec", a.upstreamIdleSec, 1, 3600, "upstreamIdleSec");
         a.upstreamMaxIdleConns = rangeInt(o, "upstreamMaxIdleConns", a.upstreamMaxIdleConns, 1, 4096, "upstreamMaxIdleConns");
@@ -204,6 +227,9 @@ public final class ProxyAdvanced {
         ipAllow.forEach(ip::add);
         o.add("ipAllow", ip);
         o.addProperty("backendInsecure", backendInsecure);
+        o.addProperty("backendProtocol", backendProtocol);
+        o.addProperty("h2MaxConcurrentStreams", h2MaxConcurrentStreams);
+        o.addProperty("h2MaxConns", h2MaxConns);
         o.addProperty("upstreamKeepalive", upstreamKeepalive);
         o.addProperty("upstreamIdleSec", upstreamIdleSec);
         o.addProperty("upstreamMaxIdleConns", upstreamMaxIdleConns);

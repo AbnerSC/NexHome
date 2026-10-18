@@ -38,11 +38,18 @@ import java.util.concurrent.TimeUnit;
  * 启用回源连接池时，本处理器在交换之间常驻于连接上：读完后端 {@code LastHttpContent}
  * 且响应可保活、请求体已完整转发、连接仍活跃时，归还 {@link ProxyCenter} 空闲池待复用
  * （{@link #beginExchange} 重新绑定新事务）；否则维持既有短连接语义用完即关。
+ * <p>
+ * 回源为 HTTP/2 时本处理器绑定在<em>流</em>上（{@code h2Stream = true}）：一条物理连接并发承载
+ * 多条流、各自一个实例，因此永不参与空闲池（{@link ProxyCenter#park}），「用完即关」关的是
+ * 本条流而非连接；trailer 随 {@link LastHttpContent#trailingHeaders()} 原样透传（gRPC 依赖）。
  */
 final class BackendRelay extends SimpleChannelInboundHandler<Object> {
 
     /** 该物理连接建连时是否按可池化对待（池化关闭则始终短连接） */
     private final boolean pooling;
+
+    /** 绑定在 h2 流而非物理连接上：不复用、不 park，关闭只影响本流 */
+    private final boolean h2Stream;
 
     // 当前交换（exchange）绑定，beginExchange 复位；空闲池parked期间 tx 置空
     private volatile ProxyHandler.Tx tx;
@@ -64,8 +71,9 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
     private long expiresAt;
     private long maxItemBytes;
 
-    BackendRelay(boolean pooling) {
+    BackendRelay(boolean pooling, boolean h2Stream) {
         this.pooling = pooling;
+        this.h2Stream = h2Stream;
     }
 
     @Override
@@ -109,6 +117,12 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
         }
         ProxySite site = tx.site;
         if (msg instanceof HttpResponse resp) {
+            if (resp.decoderResult().isFailure()) {
+                // 响应头超限/报文非法：解码器不抛异常，而是下发一个失败的空响应且不再产出内容，
+                // 若照常中继会向客户端宣告响应头后被永久挂起，此处直接判定网关错误
+                badResponse(ctx, resp.decoderResult().cause());
+                return;
+            }
             headSeen = true;
             status = resp.status().code();
             responseKeepAlive = HttpUtil.isKeepAlive(resp);
@@ -166,17 +180,23 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
                     writer = null;
                 }
                 tx.front.flush();
+                // 本端 keep-alive 意图快照：复用分支中 park 后的 finish 会同步排空 h1 流水线积压，
+                // 同一 relay 可能已在下一事务的 beginExchange 中被改写，不能事后再读该字段
+                boolean frontKa = frontKeepAlive;
                 // 可复用判定：连接池化 + 本站点开启池 + 后端响应允许保活 + 请求体已完整转发 + 连接仍活跃
-                boolean reusable = pooling && site.adv().upstreamKeepalive
+                // （h2 流不复用「连接」——物理连接由 ProxyCenter 的 h2 池按并发额度管理，此处只关本流）
+                boolean reusable = pooling && !h2Stream && site.adv().upstreamKeepalive
                         && responseKeepAlive && tx.requestBodyDone && ctx.channel().isActive();
                 if (reusable) {
                     tx.backend = null;   // 阻止 Tx.finish 关闭待复用的物理连接
-                    tx.finish(true);
-                    if (!frontKeepAlive) tx.front.close(); // 客户端要求关闭：响应完毕即关
+                    // 先归池再收尾：finish 同步排空流水线积压并立刻发起下一事务，
+                    // 若彼时连接尚未入池则复用落空（流水线下每请求多建一条后端连接）
                     ProxyCenter.park(site, ctx, this);
+                    tx.finish(true);
+                    if (!frontKa) tx.front.close(); // 客户端要求关闭：响应完毕即关
                 } else {
                     tx.finish(true);
-                    if (!frontKeepAlive) tx.front.close(); // 客户端要求关闭：响应完毕即关
+                    if (!frontKa) tx.front.close(); // 客户端要求关闭：响应完毕即关
                     ctx.close(); // 回源短连接（Connection: close）用完即关
                 }
             }
@@ -241,6 +261,24 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
         return list;
     }
 
+    /**
+     * 回源响应报文解码失败（典型为响应头超限）：记错后回 502 并断开两端。
+     * 尚未向客户端写出任何响应头，因此错页可安全送达；连接不可续用（不归还池）。
+     */
+    private void badResponse(ChannelHandlerContext ctx, Throwable cause) {
+        ProxyHandler.Tx tx = this.tx;
+        String why = cause == null ? "后端响应报文解码失败" : cause.getMessage();
+        ProxyCenter.noteError(tx.site, "后端响应报文非法: " + why);
+        abortWriter();
+        if (!tx.done.get()) {
+            ProxyCenter.sendSimple(tx.front, 502, "NexHome 代理：后端响应报文非法（" + why + "）",
+                    null, null, false);
+            tx.finish(false);
+        }
+        ctx.close();
+        tx.front.close();
+    }
+
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
         if (parked || tx == null) {
@@ -275,14 +313,23 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
             return;
         }
         ProxyHandler.Tx tx = this.tx;
-        if (tx != null && !headSeen && !tx.done.get()) {
-            ProxyCenter.noteError(tx.site, "后端在响应前关闭连接");
-            ProxyCenter.sendSimple(tx.front, 502,
-                    "NexHome 代理：后端在响应前关闭了连接，请检查后端服务与端口", null, null, false);
+        if (tx != null && !tx.done.get()) {
+            if (!headSeen) {
+                ProxyCenter.noteError(tx.site, "后端在响应前关闭连接");
+                ProxyCenter.sendSimple(tx.front, 502,
+                        "NexHome 代理：后端在响应前关闭了连接，请检查后端服务与端口", null, null, false);
+            } else {
+                // 响应头已写出后后端中断（FIN / RST_STREAM）：既不能补错误页，也绝不能把半截响应
+                // 当成完整交付——先把已转发的部分体刷给客户端，再立即终止前端连接
+                // （h1 关 TCP、h2 关本流即发 RST_STREAM），否则客户端只能等到自己的超时
+                // （与 exceptionCaught 的处理保持一致）。
+                ProxyCenter.noteError(tx.site, "后端在响应中途关闭连接");
+                tx.front.flush();
+            }
+            abortWriter();
+            tx.finish(false);
             tx.front.close();
         }
-        abortWriter();
-        if (tx != null) tx.finish(false);
     }
 
     private void abortWriter() {
