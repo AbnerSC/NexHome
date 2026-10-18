@@ -7,6 +7,8 @@ import com.nexhome.core.JsonUtils;
 import com.nexhome.core.Logs;
 import com.nexhome.module.cert.CertService;
 import io.javalin.Javalin;
+import io.javalin.compression.CompressionStrategy;
+import io.javalin.compression.Gzip;
 import io.javalin.config.RoutesConfig;
 import io.javalin.http.Context;
 import io.javalin.http.HandlerType;
@@ -231,6 +233,16 @@ public final class WebServer {
         Javalin created = Javalin.create(config -> {
             // 图标上传（multipart）需突破框架默认 1MB 请求体限制；业务层另有 2MB 上限并友好报错
             config.http.maxRequestSize = 8_000_000L;
+
+            // Javalin 默认开启 gzip 且不排除 application/octet-stream：定长二进制流
+            // （如下载测速）显式声明 Content-Length 后一旦被压缩，实际写出字节数与
+            // 声明不符，Jetty 收尾即抛 "written < content-length"；随机/已压缩负载
+            // 压缩也无收益徒耗 CPU。在默认排除列表基础上追加二进制流类型。
+            CompressionStrategy gzip = new CompressionStrategy(null, new Gzip());
+            List<String> excluded = new ArrayList<>(gzip.getExcludedMimeTypes());
+            excluded.add("application/octet-stream");
+            gzip.setExcludedMimeTypes(excluded);
+            config.http.compressionStrategy = gzip;
 
             // 前端静态资源：外部目录（开发热更新）或 classpath 的 /web 目录映射到根路径
             config.staticFiles.add(sf -> {

@@ -46,7 +46,6 @@ async function renderDashboard() {
     stats += card('🔀', `${proxyOn}<span class="muted" style="font-size:13px"> / ${proxyTotal}</span>`,
         proxyTotal > 0 && !proxy.listening ? '代理站点 · 未监听' : '代理站点 启用/总数',
         proxyTotal > 0 && !proxy.listening ? 'warn' : (proxyTotal > 0 ? 'ok' : ''), 'proxy');
-    stats += card('📈', fmtCount(visits.total), '代理访问 · 近 7 天', '', 'proxy');
     stats += card('🐳', docker.connected
         ? `${docker.running ?? 0}<span class="muted" style="font-size:13px"> / ${docker.containers ?? 0}</span>`
         : '<span class="muted" style="font-size:15px">未连接</span>',
