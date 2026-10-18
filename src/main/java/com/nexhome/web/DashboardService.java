@@ -2,10 +2,13 @@ package com.nexhome.web;
 
 import com.nexhome.core.Database;
 import com.nexhome.module.docker.DockerService;
+import com.nexhome.module.proxy.ProxyCenter;
 
 import java.lang.management.ManagementFactory;
 import java.sql.SQLException;
 import java.time.LocalDate;
+import java.time.YearMonth;
+import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -23,6 +26,17 @@ public final class DashboardService {
     /** 证书到期告警阈值（天），与自动续期窗口一致 */
     private static final int CERT_WARN_DAYS = 21;
 
+    /** 访问统计回看天数（与月分表策略配合，7 天至多命中 2 张月表） */
+    private static final int VISIT_DAYS = 7;
+    private static final DateTimeFormatter DAY_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    private static final DateTimeFormatter MONTH_FMT = DateTimeFormatter.ofPattern("yyyyMM");
+    private static final String VISIT_TABLE_PREFIX = "proxy_visit_stat_";
+
+    /** 来源地区口径：国内取省份，外国取国家，缺省归为未知（与 GeoResolver 记录口径一致） */
+    private static final String REGION_EXPR = "CASE WHEN COALESCE(country,'')='' THEN '未知' "
+            + "WHEN country='中国' AND COALESCE(province,'')!='' THEN province "
+            + "ELSE country END";
+
     private DashboardService() {
     }
 
@@ -35,7 +49,8 @@ public final class DashboardService {
         d.put("cert", cert());
         d.put("monitor", monitor());
         d.put("docker", DockerService.dashboardSummary());
-        d.put("alerts", alerts());
+        d.put("proxy", proxy());
+        d.put("visits", visits());
         return d;
     }
 
@@ -101,10 +116,80 @@ public final class DashboardService {
         return m;
     }
 
-    /** 最近告警/错误日志摘要（op_log ERROR/WARN，最多 10 条） */
-    private static List<Map<String, Object>> alerts() throws SQLException {
-        return Database.query("SELECT time, module, level, message FROM op_log "
-                + "WHERE level IN ('ERROR','WARN') ORDER BY id DESC LIMIT 10");
+    /** 代理站点：启用/总数 + 监听状态（有站点但未监听视为异常，前端橙色提示） */
+    private static Map<String, Object> proxy() throws SQLException {
+        Map<String, Object> row = Database.queryOne("SELECT COUNT(*) total, "
+                + "SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) enabled FROM proxy_site");
+        Map<String, Object> m = numMap(row, "total", "enabled");
+        m.put("listening", ProxyCenter.boundHttpPort() > 0);
+        return m;
+    }
+
+    /** 代理访问统计（最近 7 天）：每日总访问、网站 TOP10、来源地区 TOP10 */
+    private static Map<String, Object> visits() throws SQLException {
+        LocalDate today = LocalDate.now();
+        List<String> days = new ArrayList<>();
+        for (int i = VISIT_DAYS - 1; i >= 0; i--) days.add(today.minusDays(i).format(DAY_FMT));
+        String from = days.get(0), to = days.get(days.size() - 1);
+        String union = visitUnion(from, to);
+
+        List<Map<String, Object>> daily = new ArrayList<>();
+        List<Map<String, Object>> topSites = new ArrayList<>();
+        List<Map<String, Object>> topRegions = new ArrayList<>();
+        long total = 0;
+        if (!union.isEmpty()) {
+            Map<String, Object> dayHits = new LinkedHashMap<>();
+            for (Map<String, Object> r : Database.query("SELECT day, SUM(hits) hits FROM (" + union
+                    + ") WHERE day BETWEEN '" + from + "' AND '" + to + "' GROUP BY day")) {
+                dayHits.put(str(r, "day"), toLong(r.get("hits")));
+            }
+            for (String day : days) {
+                long hits = ((Number) dayHits.getOrDefault(day, 0L)).longValue();
+                total += hits;
+                daily.add(Map.of("day", day, "hits", hits));
+            }
+            for (Map<String, Object> r : Database.query("SELECT host, SUM(hits) hits FROM (" + union
+                    + ") WHERE day BETWEEN '" + from + "' AND '" + to
+                    + "' GROUP BY host ORDER BY hits DESC LIMIT 10")) {
+                topSites.add(Map.of("name", str(r, "host"), "hits", toLong(r.get("hits"))));
+            }
+            for (Map<String, Object> r : Database.query("SELECT " + REGION_EXPR + " region, SUM(hits) hits FROM ("
+                    + union + ") WHERE day BETWEEN '" + from + "' AND '" + to
+                    + "' GROUP BY region ORDER BY hits DESC LIMIT 10")) {
+                topRegions.add(Map.of("name", str(r, "region"), "hits", toLong(r.get("hits"))));
+            }
+        } else {
+            for (String day : days) daily.add(Map.of("day", day, "hits", 0L));
+        }
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("total", total);
+        m.put("days", daily);
+        m.put("topSites", topSites);
+        m.put("topRegions", topRegions);
+        return m;
+    }
+
+    /**
+     * 7 天窗口命中的访问月表 UNION 视图（day BETWEEN 的过滤在外层做）：
+     * 仅拼接真实存在的表，跨月窗口至多 2 张；无任何数据表时返回空串（外层跳过查询）。
+     */
+    private static String visitUnion(String from, String to) throws SQLException {
+        java.util.Set<String> existing = new java.util.HashSet<>();
+        for (Map<String, Object> r : Database.query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '"
+                        + VISIT_TABLE_PREFIX + "%'")) {
+            existing.add(str(r, "name"));
+        }
+        StringBuilder sb = new StringBuilder();
+        YearMonth m = YearMonth.parse(from.substring(0, 7));
+        YearMonth end = YearMonth.parse(to.substring(0, 7));
+        for (; !m.isAfter(end); m = m.plusMonths(1)) {
+            String table = VISIT_TABLE_PREFIX + m.format(MONTH_FMT);
+            if (!existing.contains(table)) continue;
+            if (sb.length() > 0) sb.append(" UNION ALL ");
+            sb.append("SELECT day, host, country, province, hits FROM ").append(table);
+        }
+        return sb.toString();
     }
 
     private static long daysRemaining(String notAfter, LocalDate today) {

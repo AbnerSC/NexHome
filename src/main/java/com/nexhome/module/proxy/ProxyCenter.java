@@ -508,6 +508,11 @@ public final class ProxyCenter {
                 .connect(new InetSocketAddress(s.backendHost(), s.backendPort()));
     }
 
+    /** 当前 HTTP 实际绑定端口（未监听返回 -1，总览代理状态卡用） */
+    public static int boundHttpPort() {
+        return boundHttp;
+    }
+
     /** 当前 HTTPS 实际绑定端口（未监听返回 -1，force_https 拼 Location 用） */
     public static int boundHttpsPort() {
         return boundHttps;

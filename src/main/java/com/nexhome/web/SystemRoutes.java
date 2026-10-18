@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import com.sun.management.OperatingSystemMXBean;
+import jakarta.servlet.http.HttpServletRequest;
 import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -156,6 +157,29 @@ public final class SystemRoutes {
         // ---------- 统一状态仪表盘（聚合各模块关键状态） ----------
         WebServer.route("GET", "/api/dashboard", ctx -> ctx.ok(DashboardService.summary()));
 
+        // ---------- 网络测速（浏览器 <-> 本系统链路，不经外部测速服务器） ----------
+        // 延迟/丢包探测：空载荷小响应，前端 fetch 计时多次往返取平均与失败率
+        WebServer.route("GET", "/api/system/speedtest/ping", ctx ->
+                ctx.raw(200, new byte[]{'P'}, "application/octet-stream"));
+        // 下载测速：?bytes= 指定流量（默认 32MB，上限 256MB），随机内容防中间层压缩虚高速率
+        WebServer.route("GET", "/api/system/speedtest/down", ctx -> {
+            long bytes = Math.min(Math.max(parseLong(ctx.query("bytes"), 32L << 20), 1L), 256L << 20);
+            ctx.javalin().status(200)
+                    .contentType("application/octet-stream")
+                    .header("Cache-Control", "no-store")
+                    .header("Content-Length", String.valueOf(bytes))
+                    .result(randomStream(bytes));
+        });
+        // 上传测速：读取并丢弃请求体，返回实收字节数（单请求体积受面板 8MB 限制，前端分片多次上传）
+        WebServer.route("POST", "/api/system/speedtest/up", ctx -> {
+            HttpServletRequest req = ctx.javalin().req();
+            long total = 0;
+            byte[] buf = new byte[64 * 1024];
+            try (InputStream in = req.getInputStream()) {
+                for (int n; (n = in.read(buf)) > 0; ) total += n;
+            }
+            ctx.ok(Map.of("bytes", total));
+        });
         // ---------- 访问来源识别（首页导航内外网智能切换依据） ----------
         // 内外网用两套域名时前端 hostname 无法区分，但 TCP 连接的源 IP 不会骗人：
         // 内网来源必然是私网/环回地址，外网来源必然是公网地址（经反代时取 XFF 首跳）
@@ -190,6 +214,46 @@ public final class SystemRoutes {
         } catch (NumberFormatException e) {
             return 0;
         }
+    }
+
+    /** 测速字节数等长整型参数解析，缺省/非法回退默认值 */
+    private static long parseLong(String s, long def) {
+        try {
+            return s == null ? def : Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    /** 伪随机字节流（下载测速）：按需生成不占内存，避免一次性分配数十 MB 大数组 */
+    private static InputStream randomStream(long bytes) {
+        return new InputStream() {
+            private long left = bytes;
+            private final byte[] tmp = new byte[8192];
+            private final java.util.Random rnd = new java.util.Random();
+
+            @Override
+            public int read() {
+                if (left <= 0) return -1;
+                left--;
+                return rnd.nextInt(256);
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) {
+                if (left <= 0) return -1;
+                int n = (int) Math.min(len, left);
+                int done = 0;
+                while (done < n) {
+                    int m = Math.min(tmp.length, n - done);
+                    rnd.nextBytes(tmp);
+                    System.arraycopy(tmp, 0, b, off + done, m);
+                    done += m;
+                }
+                left -= n;
+                return n;
+            }
+        };
     }
 
     /** 从 classpath 的 app.properties 读取注入的版本号，读取失败时回退为 unknown */
