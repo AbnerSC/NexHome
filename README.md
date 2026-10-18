@@ -100,3 +100,6 @@ docker compose up -d
 ## 四、参与开发
 1. 启动入口：`src/main/java/com/nexhome/NexHomeApp.java`
 2. 登录密码：首次启动随机生成并打印到控制台，无内置固定密码（源码中的数据库文件`data/nexhome.db`用户密码：123456789012）
+
+## 五、待办
+- [ ] 网络代理未识别header，所有请求都被识别为内网IP访问
