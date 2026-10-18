@@ -21,11 +21,12 @@ const speedState = { running: false, ping: '', loss: '', down: '', up: '' };
 const SPEED_TEST_MS = 10000;
 
 /**
- * 测速并发流数：单条 HTTP/1.1 连接的吞吐受单核 TLS 加解密与 socket 流控限制，
- * 跑不满千兆链路，多路并发才能压出真实带宽（与主流测速站点做法一致）。
- * 取 4 是兼顾浏览器同源连接数上限（HTTP/1.1 为 6）与多核利用率。
+ * 测速并发流数：每条 HTTP/1.1 连接的吞吐受服务端单线程 TLS 加解密与 socket 流控限制，
+ * 跑不满千兆链路，多路并发才能利用多核压出真实带宽（与主流测速站点做法一致）。
+ * 取 6 —— 浏览器同源 HTTP/1.1 连接数上限即 6，测速期间已暂停其他轮询，可全部用于测速；
+ * 实测 localhost fetch 4 路 149MB/s、6 路 173MB/s，NAS 上多核空闲时提升更明显。
  */
-const SPEED_STREAMS = 4;
+const SPEED_STREAMS = 6;
 
 async function renderDashboard() {
     let d;
@@ -117,7 +118,7 @@ async function renderDashboard() {
         <h3 class="dash-panel-title">⚡ 网络测速
           <span class="muted small" style="font-weight:400">（浏览器 ↔ 本系统链路，不经外部测速服务器）</span></h3>
         <div class="dash-speed-grid">
-          <div class="dash-speed-tile"><div class="v" id="st-ping">${speedState.ping || '--'}</div><div class="l">延迟（平均往返）</div></div>
+          <div class="dash-speed-tile"><div class="v" id="st-ping">${speedState.ping || '--'}</div><div class="l">延迟（中位往返）</div></div>
           <div class="dash-speed-tile"><div class="v" id="st-loss">${speedState.loss || '--'}</div><div class="l">丢包率（10 秒探测）</div></div>
           <div class="dash-speed-tile"><div class="v" id="st-down">${speedState.down || '--'}</div><div class="l">下载速率</div></div>
           <div class="dash-speed-tile"><div class="v" id="st-up">${speedState.up || '--'}</div><div class="l">上传速率</div></div>
@@ -180,23 +181,33 @@ async function runSpeedTest() {
                 return null;
             }
         };
-        // 预热两次不计入：首请求含连接建立/TLS 握手与冷启动路径，会显著抬高平均值
+        // 预热两次不计入：首请求含连接建立/TLS 握手与冷启动路径，会显著抬高结果
         await probe();
         await probe();
-        let ok = 0, lost = 0, sum = 0;
+        // 取中位数而非平均值：少量尖峰（NAS 掉频/GC/Docker 抖动）会把均值大幅拉高，
+        // 中位数才代表链路的典型往返（LibreSpeed 等也只报低分位/最小值）
+        const samples = [];
+        let lost = 0;
+        const median = () => {
+            if (!samples.length) return null;
+            const a = samples.slice().sort((x, y) => x - y);
+            return a[a.length >> 1];
+        };
         const tP = performance.now();
         while (performance.now() - tP < SPEED_TEST_MS) {
             const dt = await probe();
             if (dt === null) lost++;
-            else { ok++; sum += dt; }
+            else samples.push(dt);
             if (tick()) {
-                setV('ping', ok ? Math.round(sum / ok) + ' ms' : '失败');
-                setV('loss', Math.round(lost * 100 / (ok + lost)) + ' %');
+                const m = median();
+                if (m != null) setV('ping', Math.round(m) + ' ms');
+                setV('loss', Math.round(lost * 100 / (samples.length + lost)) + ' %');
             }
-            await new Promise(r => setTimeout(r, 20)); // 留出间隙，贴近真实浏览的请求节奏
+            await new Promise(r => setTimeout(r, 10)); // 小间隙：避免连续自压抬高 RTT，又不至于让 CPU 掉频
         }
-        setV('ping', ok ? Math.round(sum / ok) + ' ms' : '失败');
-        setV('loss', Math.round(lost * 100 / (ok + lost)) + ' %');
+        const mp = median();
+        setV('ping', mp != null ? Math.round(mp) + ' ms' : '失败');
+        setV('loss', Math.round(lost * 100 / (samples.length + lost)) + ' %');
 
         // 2) 下载速率：多路并发拉流，服务端按时长跑满 10 秒后正常收尾（无需中断请求）
         let got = 0;
