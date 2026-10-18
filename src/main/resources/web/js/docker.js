@@ -144,32 +144,40 @@ window.dockerPrunePrompt = async () => {
     try { list = await api('GET', '/api/docker/prune/preview'); }
     catch (e) { toast(e.message, 'err'); return; }
     if (!list.length) { toast('当前没有无标签（悬空）镜像需要清理', 'ok'); return; }
-    const total = list.reduce((s, i) => s + (i.size || 0), 0);
+    // 总量按“实际可回收”估算（Size − 共享层），而非虚拟大小之和，避免远大于清理结果
+    const total = list.reduce((s, i) => s + (i.reclaimable ?? i.size ?? 0), 0);
     const rows = list.map(i => {
         // 悬空镜像无 RepoTag，Docker 返回 <none>；此时以镜像 ID 作为可识别名称展示
         const untagged = !i.name || i.name === '<none>';
         const displayName = untagged ? i.shortId : i.name;
         const sub = untagged ? '' : `<div class="muted small docker-mono">${esc(i.shortId)}</div>`;
+        const rec = i.reclaimable ?? i.size ?? 0;
+        const vir = i.size ?? 0;
+        // 可回收与虚拟大小差异明显时（存在共享层），附带虚拟大小供参考
+        const sizeCell = vir > rec
+            ? `${fmtBytes(rec)}<div class="muted small">虚拟 ${fmtBytes(vir)}</div>`
+            : fmtBytes(rec);
         return `
       <tr>
         <td style="text-align:left;word-break:break-all">${esc(displayName)}${sub}</td>
         <td style="text-align:left">${esc(i.tag)}</td>
-        <td style="text-align:right">${fmtBytes(i.size)}</td>
+        <td style="text-align:right">${sizeCell}</td>
       </tr>`;
     }).join('');
     const html = `
       <div style="text-align:left;white-space:normal">
-        <div style="margin-bottom:8px">将清理以下 <b>${list.length}</b> 个无标签（悬空）镜像，共 <b>${fmtBytes(total)}</b>（不可恢复）：</div>
+        <div style="margin-bottom:8px">将清理以下 <b>${list.length}</b> 个无标签（悬空）镜像，预计可回收约 <b>${fmtBytes(total)}</b>（不可恢复）：</div>
         <div style="max-height:280px;overflow:auto">
           <table style="width:100%;font-size:12px">
             <thead><tr>
               <th style="text-align:left">镜像名称</th>
               <th style="text-align:left;width:80px">标签</th>
-              <th style="text-align:right;width:76px">体积</th>
+              <th style="text-align:right;width:110px">可回收</th>
             </tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>
+        <div class="muted small" style="margin-top:8px">多个镜像共享的基础层不会重复计入，实际回收空间以清理结果为准。</div>
       </div>`;
     if (!(await confirmBox({
         title: 'Docker 资源清理', html, boxWidth: '560px',

@@ -13,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -107,7 +108,14 @@ public final class DockerService {
         return r;
     }
 
-    /** 悬空（无标签）镜像列表：清理前预览，字段 id/shortId/name/tag/size/created */
+    /**
+     * 悬空（无标签）镜像列表：清理前预览，字段 id/shortId/name/tag/size/reclaimable/created。
+     * <p>
+     * size 为 /images/json 返回的虚拟大小（含全部层，多个悬空镜像间共享的基础层会被重复计入）；
+     * reclaimable 为“清理实际可回收”估算 = Size − SharedSize（独占层大小，取自 /system/df），
+     * 与 docker system df 的 RECLAIMABLE 口径一致。预览总量应使用 reclaimable，
+     * 否则虚拟大小之和会远大于 prune 实际回收的 SpaceReclaimed（共享层不会被释放）。
+     */
     private static List<JsonObject> danglingImages() throws IOException {
         String filters;
         try {
@@ -118,6 +126,18 @@ public final class DockerService {
         }
         JsonArray arr = JsonParser.parseString(
                 CLIENT.get("/images/json?all=1&filters=" + filters)).getAsJsonArray();
+        // 从 /system/df 取各镜像共享层大小，用于估算实际可回收空间；失败则回退虚拟大小
+        Map<String, Long> sharedSizes = new HashMap<>();
+        try {
+            JsonArray dfImages = optArray(
+                    JsonParser.parseString(CLIENT.get("/system/df")).getAsJsonObject(), "Images");
+            for (JsonElement el : dfImages) {
+                JsonObject im = el.getAsJsonObject();
+                sharedSizes.put(JsonUtils.str(im, "Id"), optLong(im, "SharedSize"));
+            }
+        } catch (Exception ignored) {
+            // /system/df 较慢或不可用时，reclaimable 回退为虚拟大小，不影响预览
+        }
         List<JsonObject> list = new ArrayList<>();
         for (JsonElement el : arr) {
             JsonObject img = el.getAsJsonObject();
@@ -143,16 +163,20 @@ public final class DockerService {
                     name = at > 0 ? d.substring(0, at) : d;
                 }
             }
+            long size = optLong(img, "Size");
+            Long shared = sharedSizes.get(id);
+            long reclaimable = shared == null ? size : Math.max(0, size - shared);
             JsonObject o = new JsonObject();
             o.addProperty("id", id);
             o.addProperty("shortId", id.startsWith("sha256:") ? id.substring(7, Math.min(19, id.length())) : id);
             o.addProperty("name", name);
             o.addProperty("tag", tag);
-            o.addProperty("size", optLong(img, "Size"));
+            o.addProperty("size", size);
+            o.addProperty("reclaimable", reclaimable);
             o.addProperty("created", optLong(img, "Created"));
             list.add(o);
         }
-        list.sort((a, b) -> Long.compare(optLong(b, "size"), optLong(a, "size")));
+        list.sort((a, b) -> Long.compare(optLong(b, "reclaimable"), optLong(a, "reclaimable")));
         return list;
     }
 

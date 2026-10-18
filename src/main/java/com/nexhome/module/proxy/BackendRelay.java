@@ -192,6 +192,18 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
         super.channelReadComplete(ctx);
     }
 
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
+        // 请求体方向背压恢复：后端（回源）写缓冲回落至可写后，继续从前端拉取未转发完的请求体。
+        // 与 ProxyHandler.handleContent 中「后端不可写则暂停 ctx.read()」配对，构成大请求体上传的端到端流控。
+        ProxyHandler.Tx tx = this.tx;
+        if (!parked && ctx.channel().isWritable() && tx != null && !tx.done.get()
+                && !tx.requestBodyDone && tx.backendReady) {
+            tx.front.read();
+        }
+        super.channelWritabilityChanged(ctx);
+    }
+
     /** 上游 Cache-Control 优先的有效期（秒）；0 = 不缓存 */
     private static int cacheTtl(HttpResponse resp, ProxyAdvanced adv) {
         if (!adv.cacheRespectUpstream) return adv.cacheTtlSec;

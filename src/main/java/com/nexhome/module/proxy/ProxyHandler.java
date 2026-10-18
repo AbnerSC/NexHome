@@ -224,6 +224,10 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
                 tx.pendingBody = null;
                 b.flush();
             }
+            // 大请求体（如 Docker 层 PUT）在首读批次后不会自动续读：前端 autoRead=false 期间
+            // 必须显式驱动续读，否则后端等不到完整 body 而超时（对齐 nginx 请求体流式转发）。
+            // 无体请求（GET 或空 POST）已由 LastHttpContent 置 requestBodyDone，不会误读下一个流水线请求。
+            if (!tx.requestBodyDone && b.isWritable()) ctx.read();
         });
     }
 
@@ -249,7 +253,14 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
             }
         } else if (tx.backendReady && tx.backend != null) {
             tx.backend.writeAndFlush(c.retain());
-            if (c instanceof LastHttpContent) tx.requestBodyDone = true;
+            if (c instanceof LastHttpContent) {
+                tx.requestBodyDone = true;
+            } else if (tx.backend.isWritable()) {
+                // 请求体方向流控：后端仍可写则显式拉取下一段请求体（首读批次后不会自动续读）；
+                // 后端写缓冲积压（不可写）时暂停拉取，待其可写由 BackendRelay.channelWritabilityChanged 恢复，
+                // 从而把后端背压逐级传导回客户端，避免大请求体停滞或无界缓冲。
+                ctx.read();
+            }
         } else {
             tx.pendingBody.add(c.retain());
         }
