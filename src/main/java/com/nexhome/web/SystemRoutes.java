@@ -189,14 +189,21 @@ public final class SystemRoutes {
                     .header("Cache-Control", "no-store")
                     .result(speedStream(ms));
         });
-        // 上传测速：读取并丢弃请求体，返回实收字节数（前端按时长多路并发分片上传）
-        // 大缓冲减少 TLS/输入流的读取次数，读后即弃不占内存
+        // 上传测速：流式读取并丢弃请求体直到 EOF，返回实收字节数（前端多路并发持续推流到时关闭流）。
+        // 大缓冲减少 TLS/输入流的读取次数，读后即弃不占内存；直接读 Servlet 裸输入流，
+        // 不经 Javalin 请求体缓存（maxRequestSize 只限制 bodyAsBytes 缓存路径），
+        // 单请求可达数百 MB 不受全局 8MB 限制。
+        // 60 秒封顶：防御异常客户端无限推流长期占用请求线程（正常测量单路不超过测速时长）
         WebServer.route("POST", "/api/system/speedtest/up", ctx -> {
             HttpServletRequest req = ctx.javalin().req();
             long total = 0;
+            final long deadline = System.nanoTime() + 60_000_000_000L;
             byte[] buf = new byte[256 * 1024];
             try (InputStream in = req.getInputStream()) {
-                for (int n; (n = in.read(buf)) > 0; ) total += n;
+                for (int n; (n = in.read(buf)) > 0; ) {
+                    total += n;
+                    if (System.nanoTime() >= deadline) break;
+                }
             }
             ctx.ok(Map.of("bytes", total));
         });

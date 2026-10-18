@@ -136,7 +136,9 @@ async function renderDashboard() {
 
 /**
  * 网络测速：延迟/丢包、下载、上传三个阶段各测 10 秒。
- * 速率阶段多路并发拉/推流；测速期间暂停仪表盘自动刷新与顶栏监控轮询，
+ * 速率阶段多路并发拉/推流；测量前先短时预热全部并发连接，
+ * 避免新建连接的握手与 TCP 慢启动计入测量窗口；上传优先流式推流（fetch duplex），
+ * 让连接全程满载而非整片上传后空等响应往返；测速期间暂停仪表盘自动刷新与顶栏监控轮询，
  * 避免额外请求抢占浏览器同源连接数与服务端 CPU 干扰测量。
  */
 async function runSpeedTest() {
@@ -209,7 +211,16 @@ async function runSpeedTest() {
         setV('ping', mp != null ? Math.round(mp) + ' ms' : '失败');
         setV('loss', Math.round(lost * 100 / (samples.length + lost)) + ' %');
 
-        // 2) 下载速率：多路并发拉流，服务端按时长跑满 10 秒后正常收尾（无需中断请求）
+        // 2) 下载速率：先预热全部并发连接（延迟阶段只用过 1 条连接，其余 5 条的
+        //    TLS 建连与慢启动开销不应计入测量窗口），再计时多路并发拉流，
+        //    服务端按时长跑满 10 秒后正常收尾（无需中断请求）
+        await Promise.all(Array.from({ length: SPEED_STREAMS }, () =>
+            fetch(API_BASE + '/api/system/speedtest/down?ms=600',
+                { headers: { 'X-Token': TOKEN }, cache: 'no-store' })
+                .then(async r => {
+                    if (!r.ok) throw new Error('下载测速请求失败: HTTP ' + r.status);
+                    await r.arrayBuffer();
+                })));
         let got = 0;
         const tD = performance.now();
         const pull = async () => {
@@ -228,31 +239,87 @@ async function runSpeedTest() {
         if (!got) throw new Error('下载测速未收到数据');
         setV('down', rate(got, tD));
 
-        // 3) 上传速率：多路并发推流，2MB 高熵分片循环上传至 10 秒
-        //    分片不宜过大（服务端逐请求分配读缓冲）也不宜过小（每请求有固定开销）
-        //    getRandomValues 单次上限 65536 字节，需分片填充
-        const CHUNK = 2 * 1024 * 1024;
-        const chunk = new Uint8Array(CHUNK);
-        for (let off = 0; off < CHUNK; off += 65536) {
-            crypto.getRandomValues(chunk.subarray(off, Math.min(off + 65536, CHUNK)));
+        // 3) 上传速率：优先流式推流（fetch + duplex:'half'）——整条连接 10 秒连续满载。
+        //    旧“整片 POST 等响应再发下一片”的模式，每片之间连接空转一个往返周期，
+        //    千兆链路实测只能压出约 1/3 带宽；流式模式由浏览器按网络节奏回调 pull 入块
+        //    （默认高水位 1 块，天然背压，推流节奏即网络真实吞吐节奏），到时 close() 结束，
+        //    服务端读到 EOF 返回实收字节数作为权威计量。不支持流式请求体的浏览器回退为
+        //    8MB 大分片整片 POST（分片越大，每片往返空转的占比越小）。
+        const UP_URL = API_BASE + '/api/system/speedtest/up';
+        const UP_BLOCK = 1024 * 1024;
+        const upBlock = new Uint8Array(UP_BLOCK); // getRandomValues 单次上限 65536 字节，需分片填充
+        for (let off = 0; off < UP_BLOCK; off += 65536) {
+            crypto.getRandomValues(upBlock.subarray(off, Math.min(off + 65536, UP_BLOCK)));
         }
+        // 流式上传能力探测：不支持的浏览器 Request 构造器直接抛 TypeError
+        const canStreamUp = (() => {
+            try { new Request('', { method: 'POST', body: new ReadableStream(), duplex: 'half' }); return true; }
+            catch (e) { return false; }
+        })();
+        // 兜底：流式请求卡死时中止全部上传，避免测速永久挂起
+        const upAbort = new AbortController();
+        const upGuard = setTimeout(() => upAbort.abort(), SPEED_TEST_MS + 20_000);
         let sent = 0;
-        const tU = performance.now();
-        const push = async () => {
-            while (performance.now() - tU < SPEED_TEST_MS) {
-                const r = await fetch(API_BASE + '/api/system/speedtest/up', {
-                    method: 'POST',
-                    headers: { 'X-Token': TOKEN, 'Content-Type': 'application/octet-stream' },
-                    body: chunk
-                });
+        let tU = performance.now();
+        const streamUp = ms => { // 单路流式推流 ms 毫秒，返回该路服务端实收字节数
+            const end = performance.now() + ms;
+            return fetch(UP_URL, {
+                method: 'POST',
+                headers: { 'X-Token': TOKEN, 'Content-Type': 'application/octet-stream' },
+                body: new ReadableStream({
+                    pull(controller) {
+                        if (performance.now() >= end) controller.close();
+                        else {
+                            controller.enqueue(upBlock);
+                            sent += UP_BLOCK;
+                            if (tick()) setV('up', rate(sent, tU));
+                        }
+                    }
+                }),
+                duplex: 'half',
+                signal: upAbort.signal
+            }).then(async r => {
                 if (!r.ok) throw new Error('上传测速请求失败: HTTP ' + r.status);
-                await r.json();
-                sent += CHUNK;
-                if (tick()) setV('up', rate(sent, tU));
-            }
+                return (await r.json()).data.bytes;
+            });
         };
-        await Promise.all(Array.from({ length: SPEED_STREAMS }, push));
-        setV('up', rate(sent, tU));
+        try {
+            if (canStreamUp) {
+                // 预热：下载阶段的连接对发送方向未经考验，先让 6 条连接度过 TCP 慢启动（不计入测量）
+                await Promise.all(Array.from({ length: SPEED_STREAMS }, () => streamUp(600)));
+                sent = 0;
+                tU = performance.now();
+                const ups = await Promise.all(Array.from({ length: SPEED_STREAMS }, () => streamUp(SPEED_TEST_MS)));
+                const upTotal = ups.reduce((a, b) => a + b, 0);
+                if (!upTotal) throw new Error('上传测速未发出数据');
+                setV('up', rate(upTotal, tU));
+            } else {
+                const CHUNK = 8 * 1024 * 1024;
+                const chunk = new Uint8Array(CHUNK);
+                for (let off = 0; off < CHUNK; off += 65536) {
+                    crypto.getRandomValues(chunk.subarray(off, Math.min(off + 65536, CHUNK)));
+                }
+                let total = 0;
+                const push = async () => {
+                    while (performance.now() - tU < SPEED_TEST_MS) {
+                        const r = await fetch(UP_URL, {
+                            method: 'POST',
+                            headers: { 'X-Token': TOKEN, 'Content-Type': 'application/octet-stream' },
+                            body: chunk,
+                            signal: upAbort.signal
+                        });
+                        if (!r.ok) throw new Error('上传测速请求失败: HTTP ' + r.status);
+                        const j = await r.json();
+                        total += (j.data && j.data.bytes) || CHUNK;
+                        if (tick()) setV('up', rate(total, tU));
+                    }
+                };
+                await Promise.all(Array.from({ length: SPEED_STREAMS }, push));
+                setV('up', rate(total, tU));
+            }
+        } finally {
+            clearTimeout(upGuard);
+        }
         toast('测速完成');
     } catch (e) {
         toast('测速失败: ' + e.message, 'err');
