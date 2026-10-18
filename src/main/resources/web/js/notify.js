@@ -99,7 +99,7 @@ function notifyConfigFields(type, cfg) {
           <div class="field full" style="margin-top:2px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--text)">
             <input type="checkbox" name="c_saveSent" style="width:auto;margin:0" ${cfg.saveSent ? 'checked' : ''}
               onchange="document.querySelectorAll('.imap-only').forEach(e=>e.style.display=this.checked?'':'none')">
-            保存到「已发送」文件夹（经 IMAP 存档，mailu 等自建邮箱网页端可见）</label></div>
+            保存到「已发送」文件夹（经 IMAP 存档）</label></div>
           <div class="field imap-only" style="display:${cfg.saveSent ? '' : 'none'}"><label>IMAP 服务器</label>
             <input name="c_imapHost" value="${v('imapHost')}" placeholder="留空同 SMTP 服务器"></div>
           <div class="field imap-only" style="display:${cfg.saveSent ? '' : 'none'}"><label>IMAP 端口</label>
