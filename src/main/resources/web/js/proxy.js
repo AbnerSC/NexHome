@@ -59,13 +59,13 @@ async function renderProxy() {
       </div>
       <div class="panel"><table>
         <thead><tr>
-          <th style="width:180px">站点</th>
+          <th style="width:250px">站点</th>
           <th>域名 / 路径</th>
-          <th>后端</th>
+          <th style="width: 400px">后端</th>
           <th style="width:80px">证书</th>
           <th style="width:130px">流量 / 错误</th>
-          <th style="width:70px">启用</th>
-          <th style="width:170px">操作</th>
+          <th style="width:80px">启用</th>
+          <th style="width:120px">操作</th>
         </tr></thead>
         <tbody id="pxTbody"><tr><td colspan="7" class="muted">加载中...</td></tr></tbody>
       </table></div>`;
