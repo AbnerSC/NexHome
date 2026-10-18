@@ -208,6 +208,15 @@ CREATE TABLE IF NOT EXISTS proxy_site (
     created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
+-- 反向代理访问记录（按月分表，表由 VisitStats 在首次落库前动态创建，建表语句在类内维护）
+-- 表名   : proxy_visit_stat_yyyymm（当月一张，按天×域名×客户端IP 聚合，无逐请求明细）
+-- host      : 请求 Host 头的域名（小写、去端口），非站点名称——同一站点多域名分开记录
+-- country/province/city : 客户端 IP 归属地（在线解析，中文）；国内记到省/市，外国仅记国家，
+--                          内网为「局域网」，尚未解析到时为空（解析完成后由落库回填）
+-- hits      : 该聚合维度累计访问次数（路由命中即计一次，含被访问控制拒绝的请求）
+-- 保留策略 : 超过保留期（app_config proxy.visit.retention_months，默认 12 个月）的整月表直接
+--            DROP——元数据级操作瞬时完成，规避上亿行大表 DELETE 的写放大与碎片问题
+
 -- 告警通知渠道表（统一通知中心：Webhook / Email / 钉钉，各模块事件按启用渠道扇出；
 -- 穿透任务等可按任务自选渠道扇出，见 stun_task.notify_channels）
 -- type   : WEBHOOK（通用 HTTP 回调） / EMAIL（SMTP 邮件） / DINGTALK（钉钉自定义机器人）

@@ -68,7 +68,9 @@ public final class ProxyService {
      * 绑定失败不抛出（不拖垮进程），写入 {@code proxy.last_error} 供前端展示。
      */
     public static void init() {
+        GeoResolver.load(); // IP 归属地离线库（ip2region xdb，外部可覆盖，均缺失时降级留空）
         ProxyCache.init(ProxyService::siteExists);
+        VisitStats.init(); // 访问记录周期落库（独立于监听开关，关停期间不丢已累积增量）
         try {
             applyListener();
         } catch (Exception e) {
@@ -305,9 +307,11 @@ public final class ProxyService {
         }
     }
 
-    /** 关停接线：释放监听线程组（供 shutdown hook 调用） */
+    /** 关停接线：冲刷访问记录、释放离线库与监听线程组（供 shutdown hook 调用） */
     public static void shutdown() {
         ProxyCenter.shutdown();
+        VisitStats.flushNow(); // 落库最后不足一个周期的访问增量，避免丢失
+        GeoResolver.close(); // 释放 ip2region 库句柄
     }
 
     /** 供 CertService 续期成功时热加载证书 */

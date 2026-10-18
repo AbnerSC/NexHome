@@ -110,6 +110,13 @@
             <groupId>io.netty</groupId>
             <artifactId>netty-transport</artifactId>
         </dependency>
+        <!-- ip2region：离线 IP 归属地库（xdb 库文件随包内置，外部可覆盖），
+             解析代理访问客户端 IP 为“国家/省/市”，无在线接口依赖 -->
+        <dependency>
+            <groupId>org.lionsoul</groupId>
+            <artifactId>ip2region</artifactId>
+            <version>3.3.7</version>
+        </dependency>
     </dependencies>
 
     <build>

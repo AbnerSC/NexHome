@@ -100,6 +100,8 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
 
         ProxyAdvanced adv = site.adv();
         String clientIp = ProxyCenter.clientAddr(ctx.channel()).getAddress().getHostAddress();
+        // 访问统计：路由命中即计一次（含被访问控制拒绝的请求），仅内存累加，不阻塞转发
+        VisitStats.record(host, clientIp);
 
         // 访问控制链：IP 白名单 -> BasicAuth -> 限流 -> 请求体上限
         if (!adv.ipAllow.isEmpty() && !ipAllowed(clientIp, adv.ipAllow)) {
