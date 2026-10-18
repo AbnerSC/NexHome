@@ -28,6 +28,24 @@ public final class SystemRoutes {
     /** 应用版本号：构建期由 Maven 从 pom.xml 注入到 app.properties */
     private static final String VERSION = readVersion();
 
+    /** 测速默认时长（毫秒）：延迟/下载/上传三个阶段统一按时长测量 */
+    private static final long SPEED_TEST_DEFAULT_MS = 10_000L;
+
+    /**
+     * 测速高熵负载块（1MB 随机数据，只读复用）：循环拷贝即可持续输出不可压缩负载。
+     * 边生成边写会把吞吐压在伪随机数生成器上（java.util.Random 每 4 字节一次 nextInt，
+     * 实测仅 ~50MB/s，正好卡在千兆链路以下），而 memcpy 不构成瓶颈。
+     * 周期 1MB 远大于 deflate 的 32KB 回溯窗口，重复不会让中间层压缩出虚高速率。
+     */
+    private static final byte[] SPEED_BLOCK = new byte[1 << 20];
+
+    static {
+        new java.util.Random().nextBytes(SPEED_BLOCK);
+    }
+
+    /** 延迟探测响应体（单字节，避免每请求重复分配） */
+    private static final byte[] PING_BODY = {'P'};
+
     private SystemRoutes() {
     }
 
@@ -160,21 +178,23 @@ public final class SystemRoutes {
         // ---------- 网络测速（浏览器 <-> 本系统链路，不经外部测速服务器） ----------
         // 延迟/丢包探测：空载荷小响应，前端 fetch 计时多次往返取平均与失败率
         WebServer.route("GET", "/api/system/speedtest/ping", ctx ->
-                ctx.raw(200, new byte[]{'P'}, "application/octet-stream"));
-        // 下载测速：?bytes= 指定流量（默认 32MB，上限 256MB），随机内容防中间层压缩虚高速率
+                ctx.raw(200, PING_BODY, "application/octet-stream"));
+        // 下载测速：?ms= 指定测量时长（默认 10 秒，上限 60 秒），服务端按时长输出高熵流后正常收尾。
+        // 不声明 Content-Length（按时长输出无法预知总字节数）而由 Jetty 分块传输：
+        // 既避免定长与实际写出字节数不符，也无需前端到时中断请求（中断会在服务端写出时踩到断连）
         WebServer.route("GET", "/api/system/speedtest/down", ctx -> {
-            long bytes = Math.min(Math.max(parseLong(ctx.query("bytes"), 32L << 20), 1L), 256L << 20);
+            long ms = Math.min(Math.max(parseLong(ctx.query("ms"), SPEED_TEST_DEFAULT_MS), 500L), 60_000L);
             ctx.javalin().status(200)
                     .contentType("application/octet-stream")
                     .header("Cache-Control", "no-store")
-                    .header("Content-Length", String.valueOf(bytes))
-                    .result(randomStream(bytes));
+                    .result(speedStream(ms));
         });
-        // 上传测速：读取并丢弃请求体，返回实收字节数（单请求体积受面板 8MB 限制，前端分片多次上传）
+        // 上传测速：读取并丢弃请求体，返回实收字节数（前端按时长多路并发分片上传）
+        // 大缓冲减少 TLS/输入流的读取次数，读后即弃不占内存
         WebServer.route("POST", "/api/system/speedtest/up", ctx -> {
             HttpServletRequest req = ctx.javalin().req();
             long total = 0;
-            byte[] buf = new byte[64 * 1024];
+            byte[] buf = new byte[256 * 1024];
             try (InputStream in = req.getInputStream()) {
                 for (int n; (n = in.read(buf)) > 0; ) total += n;
             }
@@ -216,7 +236,7 @@ public final class SystemRoutes {
         }
     }
 
-    /** 测速字节数等长整型参数解析，缺省/非法回退默认值 */
+    /** 测速时长等长整型参数解析，缺省/非法回退默认值 */
     private static long parseLong(String s, long def) {
         try {
             return s == null ? def : Long.parseLong(s.trim());
@@ -225,33 +245,33 @@ public final class SystemRoutes {
         }
     }
 
-    /** 伪随机字节流（下载测速）：按需生成不占内存，避免一次性分配数十 MB 大数组 */
-    private static InputStream randomStream(long bytes) {
+    /**
+     * 测速下载流：按时长跑出高熵数据，到点返回 -1 正常收尾。
+     * 只读共享 {@link #SPEED_BLOCK}，不随请求分配内存（多路并发测速亦仅一份负载块）。
+     */
+    private static InputStream speedStream(long millis) {
         return new InputStream() {
-            private long left = bytes;
-            private final byte[] tmp = new byte[8192];
-            private final java.util.Random rnd = new java.util.Random();
+            private final long deadline = System.nanoTime() + millis * 1_000_000L;
+            private int pos;
 
             @Override
             public int read() {
-                if (left <= 0) return -1;
-                left--;
-                return rnd.nextInt(256);
+                if (System.nanoTime() >= deadline) return -1;
+                int b = SPEED_BLOCK[pos] & 0xFF;
+                pos = pos + 1 >= SPEED_BLOCK.length ? 0 : pos + 1;
+                return b;
             }
 
             @Override
             public int read(byte[] b, int off, int len) {
-                if (left <= 0) return -1;
-                int n = (int) Math.min(len, left);
+                if (System.nanoTime() >= deadline) return -1;
                 int done = 0;
-                while (done < n) {
-                    int m = Math.min(tmp.length, n - done);
-                    rnd.nextBytes(tmp);
-                    System.arraycopy(tmp, 0, b, off + done, m);
-                    done += m;
+                while (done < len) {
+                    int n = Math.min(len - done, SPEED_BLOCK.length);
+                    System.arraycopy(SPEED_BLOCK, 0, b, off + done, n);
+                    done += n;
                 }
-                left -= n;
-                return n;
+                return done;
             }
         };
     }

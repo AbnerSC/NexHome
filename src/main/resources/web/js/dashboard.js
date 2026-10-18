@@ -17,6 +17,16 @@ function fmtMbps(bytesPerSec) { return (bytesPerSec * 8 / 1e6).toFixed(1) + ' Mb
 /** 测速结果缓存：页面 15 秒自动刷新时保留结果，测速中不中断展示 */
 const speedState = { running: false, ping: '', loss: '', down: '', up: '' };
 
+/** 测速时长：延迟/下载/上传三个阶段统一各测 10 秒 */
+const SPEED_TEST_MS = 10000;
+
+/**
+ * 测速并发流数：单条 HTTP/1.1 连接的吞吐受单核 TLS 加解密与 socket 流控限制，
+ * 跑不满千兆链路，多路并发才能压出真实带宽（与主流测速站点做法一致）。
+ * 取 4 是兼顾浏览器同源连接数上限（HTTP/1.1 为 6）与多核利用率。
+ */
+const SPEED_STREAMS = 4;
+
 async function renderDashboard() {
     let d;
     try { d = await api('GET', '/api/dashboard'); }
@@ -108,95 +118,144 @@ async function renderDashboard() {
           <span class="muted small" style="font-weight:400">（浏览器 ↔ 本系统链路，不经外部测速服务器）</span></h3>
         <div class="dash-speed-grid">
           <div class="dash-speed-tile"><div class="v" id="st-ping">${speedState.ping || '--'}</div><div class="l">延迟（平均往返）</div></div>
-          <div class="dash-speed-tile"><div class="v" id="st-loss">${speedState.loss || '--'}</div><div class="l">丢包率（10 次探测）</div></div>
+          <div class="dash-speed-tile"><div class="v" id="st-loss">${speedState.loss || '--'}</div><div class="l">丢包率（10 秒探测）</div></div>
           <div class="dash-speed-tile"><div class="v" id="st-down">${speedState.down || '--'}</div><div class="l">下载速率</div></div>
           <div class="dash-speed-tile"><div class="v" id="st-up">${speedState.up || '--'}</div><div class="l">上传速率</div></div>
         </div>
         <div class="dash-speed-actions">
           <button class="btn primary" id="stBtn" onclick="runSpeedTest()"${speedState.running ? ' disabled' : ''}>
             ${speedState.running ? '测速中…' : '开始测速'}</button>
-          <span class="dash-speed-note">测量浏览器到本系统的网络质量；测速期间请避免占用带宽的其他任务，结果不受页面自动刷新影响。</span>
+          <span class="dash-speed-note">测量浏览器到本系统的网络质量：延迟/下载/上传各测 10 秒（速率阶段 ${SPEED_STREAMS} 路并发），
+            测速期间已暂停页面自动刷新以免干扰，请避免其他占用带宽的任务。</span>
         </div>
       </div>
       <div class="tip">数据每 15 秒自动刷新一次；点击顶部指标卡可跳转到对应模块查看详情。</div>`;
     setRefresh(renderDashboard, 15000);
 }
 
-/** 网络测速：延迟/丢包（10 次探测）、下载（32MB 流式读取）、上传（4MB 分片 × 6 次累计） */
+/**
+ * 网络测速：延迟/丢包、下载、上传三个阶段各测 10 秒。
+ * 速率阶段多路并发拉/推流；测速期间暂停仪表盘自动刷新与顶栏监控轮询，
+ * 避免额外请求抢占浏览器同源连接数与服务端 CPU 干扰测量。
+ */
 async function runSpeedTest() {
     if (speedState.running) return;
     speedState.running = true;
-    const btn = document.getElementById('stBtn');
-    if (btn) { btn.disabled = true; btn.textContent = '测速中…'; }
+    const syncBtn = () => {
+        const b = document.getElementById('stBtn');
+        if (b) { b.disabled = speedState.running; b.textContent = speedState.running ? '测速中…' : '开始测速'; }
+    };
     const setV = (k, v) => {
         speedState[k] = v;
         const el = document.getElementById('st-' + k);
         if (el) el.textContent = v;
     };
     ['ping', 'loss', 'down', 'up'].forEach(k => setV(k, '--'));
+    syncBtn();
+    setRefresh(null);    // 停掉 15 秒整页重绘（其聚合请求会抢连接与 CPU）
+    stopSysMetrics();    // 停掉顶栏 5 秒监控轮询
+    let seq = 0, lastUi = 0;
+    const tick = () => { // 高频回包按 200ms 节流刷新，避免 DOM 写入拖慢测量本身
+        const t = performance.now();
+        if (t - lastUi < 200) return false;
+        lastUi = t;
+        return true;
+    };
+    const rate = (bytes, since) => fmtMbps(bytes / ((performance.now() - since) / 1000));
     try {
-        // 1) 延迟与丢包：10 次小载荷往返，5 秒超时计为丢失
-        let ok = 0, lost = 0, sum = 0;
-        for (let i = 0; i < 10; i++) {
+        // 1) 延迟与丢包：小载荷连续往返，5 秒未回计一次丢失
+        const probe = async () => {
             const t0 = performance.now();
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 5000);
             try {
-                const ctrl = new AbortController();
-                const timer = setTimeout(() => ctrl.abort(), 5000);
-                const r = await fetch(API_BASE + '/api/system/speedtest/ping?n=' + Math.round(t0) + '_' + i,
+                const r = await fetch(API_BASE + '/api/system/speedtest/ping?n=' + Date.now() + '_' + (++seq),
                     { headers: { 'X-Token': TOKEN }, cache: 'no-store', signal: ctrl.signal });
                 clearTimeout(timer);
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 await r.arrayBuffer();
-                sum += performance.now() - t0;
-                ok++;
-            } catch (e) { lost++; }
-            setV('ping', ok ? Math.round(sum / ok) + ' ms' : '失败');
-            setV('loss', Math.round(lost * 100 / (i + 1)) + ' %');
-            await new Promise(r => setTimeout(r, 80));
+                return performance.now() - t0;
+            } catch (e) {
+                clearTimeout(timer);
+                return null;
+            }
+        };
+        // 预热两次不计入：首请求含连接建立/TLS 握手与冷启动路径，会显著抬高平均值
+        await probe();
+        await probe();
+        let ok = 0, lost = 0, sum = 0;
+        const tP = performance.now();
+        while (performance.now() - tP < SPEED_TEST_MS) {
+            const dt = await probe();
+            if (dt === null) lost++;
+            else { ok++; sum += dt; }
+            if (tick()) {
+                setV('ping', ok ? Math.round(sum / ok) + ' ms' : '失败');
+                setV('loss', Math.round(lost * 100 / (ok + lost)) + ' %');
+            }
+            await new Promise(r => setTimeout(r, 20)); // 留出间隙，贴近真实浏览的请求节奏
         }
+        setV('ping', ok ? Math.round(sum / ok) + ' ms' : '失败');
+        setV('loss', Math.round(lost * 100 / (ok + lost)) + ' %');
 
-        // 2) 下载速率：边读边统计，实时刷新显示
-        const DOWN_BYTES = 32 * 1024 * 1024;
+        // 2) 下载速率：多路并发拉流，服务端按时长跑满 10 秒后正常收尾（无需中断请求）
         let got = 0;
-        const t0 = performance.now();
-        const resp = await fetch(API_BASE + '/api/system/speedtest/down?bytes=' + DOWN_BYTES,
-            { headers: { 'X-Token': TOKEN }, cache: 'no-store' });
-        if (!resp.ok) throw new Error('下载测速请求失败: HTTP ' + resp.status);
-        const reader = resp.body.getReader();
-        for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            got += value.length;
-            setV('down', fmtMbps(got / ((performance.now() - t0) / 1000)));
-        }
+        const tD = performance.now();
+        const pull = async () => {
+            const resp = await fetch(API_BASE + '/api/system/speedtest/down?ms=' + SPEED_TEST_MS,
+                { headers: { 'X-Token': TOKEN }, cache: 'no-store' });
+            if (!resp.ok) throw new Error('下载测速请求失败: HTTP ' + resp.status);
+            const reader = resp.body.getReader();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                got += value.length;
+                if (tick()) setV('down', rate(got, tD));
+            }
+        };
+        await Promise.all(Array.from({ length: SPEED_STREAMS }, pull));
         if (!got) throw new Error('下载测速未收到数据');
+        setV('down', rate(got, tD));
 
-        // 3) 上传速率：4MB 随机分片多次上传（单请求体积受面板限制，累计 24MB）
-        const CHUNK = 4 * 1024 * 1024;
+        // 3) 上传速率：多路并发推流，2MB 高熵分片循环上传至 10 秒
+        //    分片不宜过大（服务端逐请求分配读缓冲）也不宜过小（每请求有固定开销）
+        //    getRandomValues 单次上限 65536 字节，需分片填充
+        const CHUNK = 2 * 1024 * 1024;
         const chunk = new Uint8Array(CHUNK);
         for (let off = 0; off < CHUNK; off += 65536) {
             crypto.getRandomValues(chunk.subarray(off, Math.min(off + 65536, CHUNK)));
         }
         let sent = 0;
-        const t1 = performance.now();
-        while (sent < CHUNK * 6) {
-            const r = await fetch(API_BASE + '/api/system/speedtest/up', {
-                method: 'POST',
-                headers: { 'X-Token': TOKEN, 'Content-Type': 'application/octet-stream' },
-                body: chunk
-            });
-            if (!r.ok) throw new Error('上传测速请求失败: HTTP ' + r.status);
-            await r.json();
-            sent += CHUNK;
-            setV('up', fmtMbps(sent / ((performance.now() - t1) / 1000)));
-        }
+        const tU = performance.now();
+        const push = async () => {
+            while (performance.now() - tU < SPEED_TEST_MS) {
+                const r = await fetch(API_BASE + '/api/system/speedtest/up', {
+                    method: 'POST',
+                    headers: { 'X-Token': TOKEN, 'Content-Type': 'application/octet-stream' },
+                    body: chunk
+                });
+                if (!r.ok) throw new Error('上传测速请求失败: HTTP ' + r.status);
+                await r.json();
+                sent += CHUNK;
+                if (tick()) setV('up', rate(sent, tU));
+            }
+        };
+        await Promise.all(Array.from({ length: SPEED_STREAMS }, push));
+        setV('up', rate(sent, tU));
         toast('测速完成');
     } catch (e) {
         toast('测速失败: ' + e.message, 'err');
     } finally {
         speedState.running = false;
-        // 页面 15 秒自动刷新会重建按钮节点，结束时重新查询当前节点同步状态
-        const b = document.getElementById('stBtn');
-        if (b) { b.disabled = false; b.textContent = '开始测速'; }
+        // 仍处于已登录的主视图才恢复轮询与重绘（测速中途退出登录时不应把请求重新拉起）
+        if (!$('#mainView').classList.contains('hidden')) {
+            startSysMetrics();
+            if (currentPage === 'dashboard') {
+                // 测速耗时 30 秒且期间未刷新，回到总览重绘各面板并恢复自动刷新（按钮状态由模板按 running 渲染）
+                renderDashboard().catch(() => { });
+            } else {
+                syncBtn(); // 已切走页面：仅同步按钮状态，不覆盖当前页内容
+            }
+        }
     }
 }
