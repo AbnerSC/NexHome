@@ -97,7 +97,7 @@ function notifyConfigFields(type, cfg) {
           <div class="field"><label>发件人 (From)</label><input name="c_from" value="${v('from')}" placeholder="留空则用用户名"></div>
           <div class="field full"><label>收件人 (To) <b>*</b></label><input name="c_to" required value="${v('to')}" placeholder="多个收件人以逗号分隔"></div>
           <div class="field full" style="margin-top:2px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--text)">
-            <input type="checkbox" name="c_saveSent" style="width:auto;margin:0" ${cfg.saveSent ? 'checked' : ''}
+            <input type="checkbox" name="c_saveSent" ${cfg.saveSent ? 'checked' : ''}
               onchange="document.querySelectorAll('.imap-only').forEach(e=>e.style.display=this.checked?'':'none')">
             保存到「已发送」文件夹（经 IMAP 存档）</label></div>
           <div class="field imap-only" style="display:${cfg.saveSent ? '' : 'none'}"><label>IMAP 服务器</label>

@@ -3,6 +3,9 @@
    设计语言：深空底色 + 流动极光背景 + 磨砂玻璃面板 + 霓虹渐变高光 + 丰富微动效。
    动画优先使用 transform/opacity/filter（GPU 友好），并在 reduced-motion 下降级。 */
 :root {
+    /* 深色渲染原生控件（下拉箭头、数字步进器、复选框等），与主题底色一致 */
+    color-scheme: dark;
+
     /* 底色与层次 */
     --bg: #070b18;
     --bg-2: #0b1024;
@@ -572,18 +575,40 @@ tbody tr:hover { box-shadow: inset 3px 0 0 var(--cyan); }
 .switch input:checked + .slider:before { transform: translateX(18px); background: #fff; box-shadow: 0 0 8px rgba(255, 255, 255, .8); }
 
 /* ---------- 表单 ---------- */
-/* 全局表单控件兜底：覆盖未包在 .field 内的裸输入框（如 STUN webhook 行、Docker 过滤框），
-   避免深色主题下露出浏览器默认白底。更具体的 .field/.login-card 规则会覆盖本条。 */
-input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]),
-select, textarea {
+/* 全局表单控件统一规范：所有输入框/下拉/文本域（无论是否包在 .field 内）共用同一套
+   尺寸、圆角、占位符与聚焦反馈；裸输入框（代理端口、STUN Webhook 行、日志筛选等）
+   不再露出浏览器默认样式。整体包在 :where() 中保持零优先级，仅作兜底默认值，
+   更具体的 .field/.login-card/.form-inline 规则可自由覆盖宽度与内边距等。 */
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]), select, textarea) {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 13px;
+    font-family: inherit;
+    line-height: 1.45;
     background: rgba(9, 14, 32, .55);
     color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    font-family: inherit;
+    transition: border-color .2s, box-shadow .2s, background .2s;
 }
-input:focus, select:focus, textarea:focus { outline: none; }
+:where(select) { cursor: pointer; }
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]), select, textarea)::placeholder { color: rgba(167, 179, 214, .7); }
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]), select, textarea):hover { border-color: var(--border-strong); }
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]), select, textarea):focus {
+    outline: none;
+    border-color: var(--cyan);
+    box-shadow: 0 0 0 3px rgba(34, 211, 238, .16), var(--glow-cyan);
+    background: rgba(9, 14, 32, .72);
+}
+/* 只读/禁用查看态（如访问与安全设置未进入编辑时） */
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]), select, textarea):disabled {
+    background: rgba(255, 255, 255, .04);
+    color: var(--muted);
+    cursor: not-allowed;
+}
 select option { background: var(--panel-solid); color: var(--text); }
+
+/* 原生复选框/单选按钮：跟随主题色渲染，避免深色界面里突兀的浏览器默认蓝 */
+input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); cursor: pointer; }
 
 /* 行内代码：霓虹青胶囊 */
 code {
@@ -602,32 +627,10 @@ code {
 .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .field label b { color: var(--pink); }
 
+/* .field 内控件只需覆盖布局项（宽度/内边距），外观统一由上方全局规范提供 */
 .field input, .field select, .field textarea {
     width: 100%;
-    padding: 9px 11px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    font-size: 13px;
-    background: rgba(9, 14, 32, .55);
-    color: var(--text);
-    font-family: inherit;
-    transition: all .2s;
-}
-.field input::placeholder, .field textarea::placeholder { color: rgba(167, 179, 214, .7); }
-.field select option { background: var(--panel-solid); color: var(--text); }
-
-.field input:focus, .field select:focus, .field textarea:focus {
-    outline: none;
-    border-color: var(--cyan);
-    box-shadow: 0 0 0 3px rgba(34, 211, 238, .16), var(--glow-cyan);
-    background: rgba(9, 14, 32, .72);
-}
-
-/* 只读查看态（如访问与安全设置未进入编辑时） */
-.field input:disabled, .field select:disabled, .field textarea:disabled {
-    background: rgba(255, 255, 255, .04);
-    color: var(--muted);
-    cursor: not-allowed;
+    padding: 8px 12px;
 }
 
 .form-foot { margin-top: 18px; text-align: right; display: flex; gap: 10px; justify-content: flex-end; }
@@ -658,6 +661,29 @@ code {
 .ph-ref[open] > summary::before { content: "▾"; }
 .ph-ref > summary b { color: var(--cyan); font-weight: 600; }
 .ph-ref-body { padding: 2px 12px 12px; }
+
+/* ---------- STUN Webhook 编辑行：方法+地址一行，请求头/体/参数与调用状态纵向堆叠 ----------
+   结构与尺寸统一收敛到类名，替代原先散落在 JS 里的内联样式 */
+.wh-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding: 12px;
+    margin-bottom: 12px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--code-bg);
+}
+.wh-row-head { display: flex; gap: 8px; align-items: center; flex-basis: 100%; }
+.wh-method { width: 92px; flex-shrink: 0; }
+.wh-url { flex: 1; min-width: 220px; }
+.wh-fields { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; width: 100%; }
+.wh-fields label { display: block; margin-bottom: 3px; }
+.wh-row textarea { width: 100%; font-size: 12px; }
+.wh-headers, .wh-params { min-height: 36px; }
+.wh-body { min-height: 100px; font-family: Consolas, "Courier New", monospace; }
+.wh-status { flex-basis: 100%; }
 
 /* ---------- 模态框 ---------- */
 .modal-mask {
@@ -1292,9 +1318,46 @@ th.docker-sort:hover { color: var(--cyan); text-shadow: var(--glow-cyan); }
 
 /* ============ 反向代理中心模块 ============ */
 .panel-title { font-weight: 600; margin-bottom: 12px; color: var(--text); }
-.form-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; }
-.form-inline .field-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
-.form-inline input[type=number] { width: 96px; }
+
+/* 行内表单（如代理中心服务设置）：开关组 + 内嵌标签输入胶囊 + 按钮混排一行 */
+.form-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
+
+/* 开关 + 说明文字组合，与相邻控件垂直居中对齐 */
+.form-inline .inline-switch { display: inline-flex; align-items: center; gap: 8px; }
+
+/* 内嵌标签输入胶囊：说明文字与输入框同处一个圆角容器，适合端口等短数字输入 */
+.form-inline .field-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 13px;
+    color: var(--muted);
+    background: rgba(9, 14, 32, .4);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 4px 6px 4px 12px;
+    transition: border-color .2s, box-shadow .2s;
+}
+.form-inline .field-inline:focus-within {
+    border-color: var(--cyan);
+    box-shadow: 0 0 0 3px rgba(34, 211, 238, .16), var(--glow-cyan);
+}
+/* 胶囊内输入框：去掉自身边框融入容器，聚焦时仅提亮底色 */
+.form-inline .field-inline input {
+    width: 88px;
+    padding: 5px 8px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    text-align: center;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+.form-inline .field-inline input:focus { box-shadow: none; background: rgba(9, 14, 32, .55); }
+/* 胶囊内隐藏数字步进按钮，居中数字更干净；步进可用键盘上下键 */
+.form-inline .field-inline input::-webkit-outer-spin-button,
+.form-inline .field-inline input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.form-inline .field-inline input[type=number] { -moz-appearance: textfield; appearance: textfield; }
 
 /* 站点编辑模态框的页签 */
 .px-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }

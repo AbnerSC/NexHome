@@ -31,11 +31,12 @@ async function renderProxy() {
       <div class="panel">
         <div class="panel-title">服务设置与监听状态</div>
         <form id="proxySetForm" class="form-inline">
-          <label class="switch" title="开启后绑定端口对外提供代理服务">
-            <input type="checkbox" name="enabled" id="pxEnabled"><span class="slider"></span></label>
-          <span class="muted small">启用代理</span>
-          <span class="field-inline">HTTP 端口 <input name="httpPort" id="pxHttp" type="number" min="1" max="65535" style="width:96px"></span>
-          <span class="field-inline">HTTPS 端口 <input name="httpsPort" id="pxHttps" type="number" min="1" max="65535" style="width:96px"></span>
+          <span class="inline-switch" title="开启后绑定端口对外提供代理服务">
+            <label class="switch"><input type="checkbox" name="enabled" id="pxEnabled"><span class="slider"></span></label>
+            <span class="muted small">启用代理</span>
+          </span>
+          <span class="field-inline">HTTP 端口 <input name="httpPort" id="pxHttp" type="number" min="1" max="65535" placeholder="80"></span>
+          <span class="field-inline">HTTPS 端口 <input name="httpsPort" id="pxHttps" type="number" min="1" max="65535" placeholder="443"></span>
           <button class="btn primary" type="submit">保存并应用</button>
           <span id="pxListenStatus" class="small muted"></span>
         </form>

@@ -556,7 +556,6 @@ window.stunWhAdd = (w, status) => {
     if (!list) return;
     const row = document.createElement('div');
     row.className = 'wh-row';
-    row.style.cssText = 'display:flex;gap:8px;align-items:flex-start;margin-bottom:12px;flex-wrap:wrap;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--code-bg)';
     const headersText = Object.entries(w.headers || {}).map(([k, v]) => k + ': ' + v).join('\n');
     const paramsText = Object.entries(w.params || {}).map(([k, v]) => k + '=' + v).join('\n');
     const bodyText = w.body || '';
@@ -566,26 +565,26 @@ window.stunWhAdd = (w, status) => {
         : '尚未调用';
     const isPost = w.method !== 'GET';
     row.innerHTML = `
-      <div style="display:flex;gap:8px;align-items:center;flex-basis:100%">
-        <select class="wh-method" style="width:90px;flex-shrink:0"><option ${w.method !== 'GET' ? 'selected' : ''}>POST</option><option ${w.method === 'GET' ? 'selected' : ''}>GET</option></select>
-        <input class="wh-url" style="flex:1;min-width:220px" placeholder="https://example.com/hooks/stun" value="${esc(w.url || '')}">
+      <div class="wh-row-head">
+        <select class="wh-method"><option ${w.method !== 'GET' ? 'selected' : ''}>POST</option><option ${w.method === 'GET' ? 'selected' : ''}>GET</option></select>
+        <input class="wh-url" placeholder="https://example.com/hooks/stun" value="${esc(w.url || '')}">
         <button type="button" class="btn small danger" title="删除此条">✕</button>
       </div>
-      <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0;width:100%">
+      <div class="wh-fields">
         <div>
-          <label class="small muted" style="display:block;margin-bottom:3px">请求头（每行 key: value，如 Authorization: Bearer xxx）</label>
-          <textarea class="wh-headers" style="width:100%;min-height:36px;font-size:12px" placeholder="Authorization: Bearer xxx\nX-Custom: value">${esc(headersText)}</textarea>
+          <label class="small muted">请求头（每行 key: value，如 Authorization: Bearer xxx）</label>
+          <textarea class="wh-headers" placeholder="Authorization: Bearer xxx\nX-Custom: value">${esc(headersText)}</textarea>
         </div>
         <div class="wh-body-wrap" style="${isPost ? '' : 'display:none'}">
-          <label class="small muted" style="display:block;margin-bottom:3px">JSON 请求体（支持 <code>\${字段}</code> 占位符，留空则自动发送全部结果字段）</label>
-          <textarea class="wh-body" style="width:100%;min-height:100px;font-family:Consolas,monospace;font-size:12px" placeholder='{"event":"\${event}","task":"\${name}","ip":"\${mapped_ip}","port":"\${mapped_port}","extra":{"key":"value"}}'>${esc(bodyText)}</textarea>
+          <label class="small muted">JSON 请求体（支持 <code>\${字段}</code> 占位符，留空则自动发送全部结果字段）</label>
+          <textarea class="wh-body" placeholder='{"event":"\${event}","task":"\${name}","ip":"\${mapped_ip}","port":"\${mapped_port}","extra":{"key":"value"}}'>${esc(bodyText)}</textarea>
         </div>
         <div class="wh-params-wrap" style="${!isPost ? '' : 'display:none'}">
-          <label class="small muted" style="display:block;margin-bottom:3px">自定义参数（GET 查询串，每行 key=value，支持 <code>\${字段}</code> 占位符）</label>
-          <textarea class="wh-params" style="width:100%;min-height:36px;font-size:12px" placeholder="token=abc123\naddr=\${mapped_addr}">${esc(paramsText)}</textarea>
+          <label class="small muted">自定义参数（GET 查询串，每行 key=value，支持 <code>\${字段}</code> 占位符）</label>
+          <textarea class="wh-params" placeholder="token=abc123\naddr=\${mapped_addr}">${esc(paramsText)}</textarea>
         </div>
       </div>
-      <div class="wh-status small muted" style="flex-basis:100%">${st}</div>`;
+      <div class="wh-status small muted">${st}</div>`;
     row.querySelector('button').addEventListener('click', () => row.remove());
     // 切换 GET/POST 时显示/隐藏对应字段
     row.querySelector('.wh-method').addEventListener('change', e => {

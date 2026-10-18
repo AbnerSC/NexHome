@@ -103,7 +103,7 @@ window.monForm = async (id) => {
             ${['HTTP', 'TCP', 'UDP'].map(v => `<option value="${v}" ${t.type === v ? 'selected' : ''}>${v}</option>`).join('')}
           </select></div>
         <div class="field full"><label>探测目标 <b>*</b></label>
-          <input name="target" id="mTarget" required value="${esc(t.target || '')}" autocomplete="off" placeholder="">
+          <input name="target" id="mTarget" required value="${esc(t.target || '')}" autocomplete="off">
           <div class="small muted" id="mTargetHint"></div></div>
         <div class="field" id="mMethodField"><label>请求方法</label>
           <select name="method"><option ${t.method !== 'POST' ? 'selected' : ''}>GET</option><option ${t.method === 'POST' ? 'selected' : ''}>POST</option></select></div>

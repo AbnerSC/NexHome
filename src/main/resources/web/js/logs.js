@@ -36,7 +36,7 @@ async function refreshLogsRows() {
 async function renderLogs() {
     $('#pageBody').innerHTML = `
       <div class="toolbar">
-        <select id="logModuleSel" class="btn" style="padding:6px 10px">
+        <select id="logModuleSel">
           <option value="">全部模块</option>
           ${['SYSTEM', 'AUTH', 'DDNS', 'STUN', 'WOL', 'CERT', 'NAV', 'DOCKER'].map(m =>
               `<option value="${m}" ${logModule === m ? 'selected' : ''}>${m}</option>`).join('')}
