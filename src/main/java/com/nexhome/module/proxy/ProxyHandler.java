@@ -7,6 +7,7 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.http.DefaultHttpContent;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.DefaultHttpResponse;
@@ -23,7 +24,7 @@ import io.netty.handler.codec.http.LastHttpContent;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.channels.FileChannel;
-import java.nio.file.Files;
+import java.nio.ByteBuffer;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.time.format.DateTimeFormatter;
@@ -367,18 +368,19 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
     private void serveCache(ChannelHandlerContext ctx, HttpRequest req, ProxyCache.Entry hit) {
         boolean keepAlive = !isH2 && HttpUtil.isKeepAlive(req);
         if (isH2) {
+            // h2 下 FileRegion 零拷贝不可用（DATA 帧须切帧并经流控），改 64KB 分块流式直出：
+            // 避免整文件 readAllBytes 撑大堆（并发大文件直出的堆峰值 ≈ 并发数 × 文件大小），
+            // 上一块写出完成（受 h2 流控放行，天然背压）后再读下一块
+            java.nio.channels.FileChannel fc;
             try {
-                byte[] body = Files.readAllBytes(hit.file);
-                io.netty.handler.codec.http.DefaultFullHttpResponse full =
-                        new io.netty.handler.codec.http.DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
-                                HttpResponseStatus.valueOf(hit.status),
-                                Unpooled.wrappedBuffer(body));
-                cachedHead(hit).headers().forEach(e -> full.headers().add(e.getKey(), e.getValue()));
-                ctx.writeAndFlush(full);
+                fc = FileChannel.open(hit.file, StandardOpenOption.READ);
             } catch (Exception e) {
                 ProxyCenter.sendSimple(ctx, 500, "缓存文件读取失败: " + e.getMessage(), null, null, false);
                 ctx.close();
+                return;
             }
+            ctx.write(cachedHead(hit));
+            pumpCacheChunk(ctx, fc, hit.size);
             return;
         }
         java.nio.channels.FileChannel fc = null;
@@ -410,6 +412,54 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
             }
             ProxyCenter.sendSimple(ctx, 500, "缓存文件读取失败: " + e.getMessage(), null, null, false);
             ctx.close();
+        }
+    }
+
+    /** h2 缓存直出分块大小：64KB，平衡系统调用次数与单块堆占用 */
+    private static final int CACHE_CHUNK = 64 * 1024;
+
+    /**
+     * h2 缓存直出泵：按 {@link #CACHE_CHUNK} 逐块读文件写 DATA 帧，
+     * 块间以写出回调衔接——写不出去（流控窗口满/客户端慢）就不继续读盘，自带背压。
+     */
+    private static void pumpCacheChunk(ChannelHandlerContext ctx, FileChannel channel, long remaining) {
+        try {
+            if (remaining <= 0) { // 发送完毕（含 0 字节文件）：END_STREAM 收尾并关闭文件
+                ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT)
+                        .addListener((ChannelFutureListener) f -> closeQuietly(channel));
+                return;
+            }
+            int n = (int) Math.min(CACHE_CHUNK, remaining);
+            ByteBuf buf = ctx.alloc().buffer(n, n);
+            ByteBuffer nio = buf.nioBuffer(0, n);
+            int read = channel.read(nio);
+            if (read <= 0) { // 文件比索引记录短：响应头已发出无法改报错误，重置流收尾
+                buf.release();
+                closeQuietly(channel);
+                ctx.close();
+                return;
+            }
+            buf.writerIndex(read);
+            long left = remaining - read;
+            ctx.writeAndFlush(new DefaultHttpContent(buf))
+                    .addListener((ChannelFutureListener) f -> {
+                        if (!f.isSuccess()) { // 客户端断开/流被重置：释放文件即止
+                            closeQuietly(channel);
+                            ctx.close();
+                            return;
+                        }
+                        pumpCacheChunk(ctx, channel, left);
+                    });
+        } catch (Exception e) {
+            closeQuietly(channel);
+            ctx.close();
+        }
+    }
+
+    private static void closeQuietly(FileChannel ch) {
+        try {
+            ch.close();
+        } catch (Exception ignored) {
         }
     }
 
