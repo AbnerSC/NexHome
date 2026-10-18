@@ -4,6 +4,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.DefaultHttpResponse;
@@ -15,6 +16,7 @@ import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.ReadTimeoutException;
+import io.netty.handler.timeout.ReadTimeoutHandler;
 
 import java.nio.charset.StandardCharsets;
 import java.time.ZoneOffset;
@@ -24,37 +26,92 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.NoSuchElementException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 后端响应中继（普通消息级路径）：改写响应头后流式回写前端连接；
  * 满足缓存条件时旁路 tee 写入 {@link ProxyCache} 文件缓存。
- * 后端连接与前端连接绑定在同一事件循环（ProxyCenter.connectBackend），
- * 全部读写在单线程内完成，无跨线程时序问题。
+ * <p>
+ * 一条物理后端连接绑定一个本处理器实例，且与前端连接位于同一事件循环
+ * （ProxyCenter.openBackend），全部读写在单线程内完成，无跨线程时序问题。
+ * 启用回源连接池时，本处理器在交换之间常驻于连接上：读完后端 {@code LastHttpContent}
+ * 且响应可保活、请求体已完整转发、连接仍活跃时，归还 {@link ProxyCenter} 空闲池待复用
+ * （{@link #beginExchange} 重新绑定新事务）；否则维持既有短连接语义用完即关。
  */
 final class BackendRelay extends SimpleChannelInboundHandler<Object> {
 
-    private final ProxyHandler.Tx tx;
-    private final boolean keepAlive;
+    /** 该物理连接建连时是否按可池化对待（池化关闭则始终短连接） */
+    private final boolean pooling;
 
-    // 缓存旁路状态
+    // 当前交换（exchange）绑定，beginExchange 复位；空闲池parked期间 tx 置空
+    private volatile ProxyHandler.Tx tx;
+    private ProxySite site;
+    private boolean frontKeepAlive;
+
+    // 空闲池状态（仅在其 event loop 线程访问）
+    volatile boolean parked;
+    volatile ProxySite lastSite;              // 归还/剔除时据以计算路由 key
+    ScheduledFuture<?> evict;                 // 空闲回收定时任务
+    private ChannelHandlerContext selfCtx;
+
+    // 缓存/响应解析旁路状态（每次交换复位）
     private boolean headSeen;
+    private boolean responseKeepAlive;         // 后端响应是否允许保活（HttpUtil.isKeepAlive）
     private int status;
     private ProxyCache.Writer writer;
     private List<String[]> storeHeaders;
     private long expiresAt;
     private long maxItemBytes;
 
-    BackendRelay(ProxyHandler.Tx tx, boolean keepAlive) {
+    BackendRelay(boolean pooling) {
+        this.pooling = pooling;
+    }
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) {
+        selfCtx = ctx; // pipeline 就绪，供 beginExchange/park 动态增删读超时处理器
+    }
+
+    /** 开始一次交换：绑定事务并复位旁路状态；复用连接从池取出后调用，会恢复读超时、取消空闲回收 */
+    void beginExchange(ProxySite site, ProxyHandler.Tx tx, boolean frontKeepAlive) {
+        this.site = site;
         this.tx = tx;
-        this.keepAlive = keepAlive;
+        this.frontKeepAlive = frontKeepAlive;
+        this.lastSite = site;
+        this.parked = false;
+        this.headSeen = false;
+        this.responseKeepAlive = false;
+        this.status = 0;
+        this.writer = null;
+        this.storeHeaders = null;
+        cancelEvict();
+        // 上一次交换可能因前端背压将后端 autoRead 置 false，park 后取用需恢复，否则读不到本次响应
+        selfCtx.channel().config().setAutoRead(true);
+        ChannelPipeline p = selfCtx.pipeline();
+        if (p.get("brx") == null)
+            p.addBefore("brelay", "brx", new ReadTimeoutHandler(site.adv().idleSec, TimeUnit.SECONDS));
+    }
+
+    /** 交换结束归还池时摘除读超时（空闲期不应触发 504），由 ProxyCenter.park 调用 */
+    void removeReadTimeout() {
+        ChannelPipeline p = selfCtx.pipeline();
+        if (p.get("brx") != null) p.remove("brx");
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
+        ProxyHandler.Tx tx = this.tx;
+        if (parked || tx == null) {
+            // 空闲池状态下不应再有入站数据：视为协议错乱，直接关闭连接
+            ctx.close();
+            return;
+        }
         ProxySite site = tx.site;
         if (msg instanceof HttpResponse resp) {
             headSeen = true;
             status = resp.status().code();
+            responseKeepAlive = HttpUtil.isKeepAlive(resp);
             DefaultHttpResponse out = new DefaultHttpResponse(HttpVersion.HTTP_1_1, resp.status(),
                     new DefaultHttpHeaders());
             ProxyHandler.copyHeaders(resp.headers(), out.headers());
@@ -81,7 +138,7 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
             }
             String xc = adv.cacheEnabled ? (store ? "MISS" : "BYPASS") : null;
             if (xc != null) out.headers().set("X-Cache", xc);
-            HttpUtil.setKeepAlive(out, keepAlive);
+            HttpUtil.setKeepAlive(out, frontKeepAlive);
             // 上游 chunked / close 定界（无 Content-Length）时必须为下游重新声明分帧：
             // 否则前端编码器裸写 body 字节且 keep-alive 下不关连接，客户端无法判定结束而挂起。
             // 1xx/204/205/304 无 body，无需分帧。
@@ -109,9 +166,19 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
                     writer = null;
                 }
                 tx.front.flush();
-                tx.finish(true);
-                if (!keepAlive) tx.front.close(); // 客户端要求关闭：响应完毕即关
-                ctx.close(); // 回源短连接（Connection: close）用完即关
+                // 可复用判定：连接池化 + 本站点开启池 + 后端响应允许保活 + 请求体已完整转发 + 连接仍活跃
+                boolean reusable = pooling && site.adv().upstreamKeepalive
+                        && responseKeepAlive && tx.requestBodyDone && ctx.channel().isActive();
+                if (reusable) {
+                    tx.backend = null;   // 阻止 Tx.finish 关闭待复用的物理连接
+                    tx.finish(true);
+                    if (!frontKeepAlive) tx.front.close(); // 客户端要求关闭：响应完毕即关
+                    ProxyCenter.park(site, ctx, this);
+                } else {
+                    tx.finish(true);
+                    if (!frontKeepAlive) tx.front.close(); // 客户端要求关闭：响应完毕即关
+                    ctx.close(); // 回源短连接（Connection: close）用完即关
+                }
             }
         }
     }
@@ -120,7 +187,8 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
     public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
         // 每批读到即刷出：流式响应（SSE/大文件）不依赖 LastHttpContent 才下发，
         // 上游分帧异常时也不会把已到字节卡成黑洞
-        if (headSeen) tx.front.flush();
+        ProxyHandler.Tx tx = this.tx;
+        if (headSeen && tx != null) tx.front.flush();
         super.channelReadComplete(ctx);
     }
 
@@ -163,30 +231,46 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        if (!headSeen) {
-            int code = cause instanceof ReadTimeoutException ? 504 : 502;
-            String msg = code == 504
-                    ? "后端响应超时（" + tx.site.adv().idleSec + " 秒无响应头）"
-                    : "后端连接失败: " + cause.getMessage();
-            ProxyCenter.noteError(tx.site, msg);
-            ProxyCenter.sendSimple(tx.front, code, "NexHome 代理：" + msg, null, null, false);
+        if (parked || tx == null) {
+            // 空闲池连接的异常（多为对端关闭）：仅从池剔除并关闭，不涉及任何前端事务
+            ProxyCenter.evictParked(ctx.channel(), this);
+            ctx.close();
+            return;
         }
-        abortWriter();
-        tx.finish(false);
-        ctx.close();
-        tx.front.close(); // 响应流中断无法续用 keep-alive
+        ProxyHandler.Tx tx = this.tx;
+        if (!tx.done.get()) {
+            if (!headSeen) {
+                int code = cause instanceof ReadTimeoutException ? 504 : 502;
+                String msg = code == 504
+                        ? "后端响应超时（" + tx.site.adv().idleSec + " 秒无响应头）"
+                        : "后端连接失败: " + cause.getMessage();
+                ProxyCenter.noteError(tx.site, msg);
+                ProxyCenter.sendSimple(tx.front, code, "NexHome 代理：" + msg, null, null, false);
+            }
+            abortWriter();
+            tx.finish(false);
+            ctx.close();
+            tx.front.close(); // 响应流中断无法续用 keep-alive
+        } else {
+            ctx.close();
+        }
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        if (!headSeen && !tx.done.get()) {
+        if (parked) {
+            ProxyCenter.evictParked(ctx.channel(), this);
+            return;
+        }
+        ProxyHandler.Tx tx = this.tx;
+        if (tx != null && !headSeen && !tx.done.get()) {
             ProxyCenter.noteError(tx.site, "后端在响应前关闭连接");
             ProxyCenter.sendSimple(tx.front, 502,
                     "NexHome 代理：后端在响应前关闭了连接，请检查后端服务与端口", null, null, false);
             tx.front.close();
         }
         abortWriter();
-        tx.finish(false);
+        if (tx != null) tx.finish(false);
     }
 
     private void abortWriter() {
@@ -194,6 +278,19 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
             writer.abort();
             writer = null;
         }
+    }
+
+    void cancelEvict() {
+        if (evict != null) {
+            evict.cancel(false);
+            evict = null;
+        }
+    }
+
+    /** 归还空闲池时清除与已完成事务的绑定（parked 期间不得再引用任何前端连接） */
+    void txParked() {
+        this.tx = null;
+        this.site = null;
     }
 }
 

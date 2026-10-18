@@ -12,6 +12,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoop;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
@@ -52,6 +53,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.NoSuchElementException;
 import java.util.Base64;
@@ -72,8 +74,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>HTTPS 口：SNI 选证（{@link SslStore}），ALPN 协商 h2 / http/1.1</li>
  * </ul>
  * 请求流水线：路由匹配（域名通配 + 路径前缀）→ force_https / IP 白名单 / BasicAuth / 限流 /
- * 文件缓存 → 头部改写（XFF 等 + 自定义）→ 后端连接（每请求短连接，对齐 nginx 默认
- * 不启用 upstream keepalive）→ 响应流式回写（tee 写缓存）；
+ * 文件缓存 → 头部改写（XFF 等 + 自定义）→ 后端连接（默认每请求短连接，对齐 nginx 默认
+ * 不启用 upstream keepalive；站点开启 {@code upstreamKeepalive} 后按后端 host:port + 事件循环
+ * 复用空闲连接）→ 响应流式回写（tee 写缓存）；
  * Upgrade 请求走全原始字节隧道（101 后双端原始泵，WebSocket 透传，仅 HTTP/1.1 连接）。
  * <p>
  * 站点与证书热更新：路由表/证书库原子替换，不影响存量连接。
@@ -85,6 +88,16 @@ public final class ProxyCenter {
     }
 
     static final AttributeKey<Boolean> IS_HTTPS = AttributeKey.valueOf("nx-proxy-https");
+
+    /** 后端连接上常驻的中继处理器（用于连接复用：取出后重新绑定新事务） */
+    static final AttributeKey<BackendRelay> RELAY = AttributeKey.valueOf("nx-backend-relay");
+
+    /**
+     * 回源空闲连接池：路由 key → (事件循环 → 空闲连接队列)。
+     * 每个 (key, loop) 分片仅由该 loop 线程读写（后端连接与前端连接同循环），无需加锁。
+     */
+    private static final ConcurrentHashMap<String, ConcurrentHashMap<EventLoop, ArrayDeque<Channel>>> POOL =
+            new ConcurrentHashMap<>();
 
     /** HTTP/2 客户端连接预面（prior-knowledge 魔数，24 字节） */
     private static final byte[] H2_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
@@ -142,6 +155,7 @@ public final class ProxyCenter {
     }
 
     public static synchronized void stop() {
+        clearPool();
         closeChannel(httpCh);
         httpCh = null;
         boundHttp = -1;
@@ -179,7 +193,7 @@ public final class ProxyCenter {
         ServerBootstrap b = new ServerBootstrap()
                 .group(boss, worker)
                 .channel(NioServerSocketChannel.class)
-                .option(ChannelOption.SO_BACKLOG, 512)
+                .option(ChannelOption.SO_BACKLOG, 1024)
                 .childOption(ChannelOption.SO_KEEPALIVE, true)
                 .childOption(ChannelOption.TCP_NODELAY, true);
         b.childHandler(new ChannelInitializer<SocketChannel>() {
@@ -477,6 +491,112 @@ public final class ProxyCenter {
             backendTls = c;
         }
         return c;
+    }
+
+    /**
+     * 连接后端（消息级中继路径）：启用 {@code upstreamKeepalive} 时优先从当前事件循环的
+     * 空闲池按后端路由取回可复用连接（返回已完成 future，调用方监听器随即在同一线程内
+     * 写回源请求）；无空闲连接则新建。未启用池化时等价于每请求新建短连接。
+     *
+     * <p>返回的 channel 均已绑定 {@link #RELAY} 属性；调用方在连接就绪后通过
+     * {@code relay.beginExchange(...)} 绑定本次事务再写请求。
+     */
+    static ChannelFuture openBackend(ProxySite s, ChannelHandlerContext front) {
+        ProxyAdvanced adv = s.adv();
+        EventLoop loop = front.channel().eventLoop();
+        if (adv.upstreamKeepalive) {
+            ConcurrentHashMap<EventLoop, ArrayDeque<Channel>> perLoop = POOL.get(routeKey(s));
+            ArrayDeque<Channel> dq = perLoop == null ? null : perLoop.get(loop);
+            if (dq != null) {
+                while (!dq.isEmpty()) {
+                    Channel c = dq.pollLast(); // LIFO：优先复用最近使用的，最大化后端侧保活命中
+                    BackendRelay r = c.attr(RELAY).get();
+                    if (r != null && r.parked && c.isActive()) {
+                        r.parked = false;
+                        r.cancelEvict();
+                        return c.newSucceededFuture();
+                    }
+                    // 陈旧条目（已关闭/已不在 parked 态）：确保关闭后丢弃
+                    if (c.isActive()) c.close();
+                }
+            }
+        }
+        BackendRelay relay = new BackendRelay(adv.upstreamKeepalive);
+        return new Bootstrap()
+                .group(loop)
+                .channel(NioSocketChannel.class)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000)
+                .handler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel ch) {
+                        if ("https".equals(s.scheme())) {
+                            ch.pipeline().addLast(backendTlsCtx(adv.backendInsecure).newHandler(
+                                    ch.alloc(), s.backendHost(), s.backendPort()));
+                        }
+                        ch.pipeline().addLast(new HttpClientCodec(4096, 8192, 65536));
+                        ch.pipeline().addLast("brelay", relay);
+                        ch.attr(RELAY).set(relay);
+                    }
+                })
+                .connect(new InetSocketAddress(s.backendHost(), s.backendPort()));
+    }
+
+    /**
+     * 交换结束将后端连接归还空闲池（由 {@link BackendRelay} 在确认响应可保活后调用）：
+     * 摘除读超时、置 parked、入队并安排空闲回收。池已满或站点已关池化则直接关闭。
+     */
+    static void park(ProxySite s, ChannelHandlerContext ctx, BackendRelay relay) {
+        Channel ch = ctx.channel();
+        relay.removeReadTimeout();
+        ProxyAdvanced adv = s.adv();
+        if (!adv.upstreamKeepalive) {
+            ch.close();
+            return;
+        }
+        ArrayDeque<Channel> dq = POOL
+                .computeIfAbsent(routeKey(s), k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(ch.eventLoop(), k -> new ArrayDeque<>());
+        if (dq.size() >= adv.upstreamMaxIdleConns) { // 池已满：不再保留，关闭回收 fd
+            ch.close();
+            return;
+        }
+        relay.parked = true;
+        relay.txParked();   // 清除与已完成事务的绑定，parked 期间不引用任何前端
+        dq.addLast(ch);
+        relay.evict = ch.eventLoop().schedule(
+                () -> { if (relay.parked) ch.close(); }, adv.upstreamIdleSec, TimeUnit.SECONDS);
+    }
+
+    /** 空闲连接被关闭/异常时从池剔除（同 loop 线程回调，无锁） */
+    static void evictParked(Channel ch, BackendRelay relay) {
+        relay.parked = false;
+        relay.cancelEvict();
+        ProxySite s = relay.lastSite;
+        if (s == null) return;
+        ConcurrentHashMap<EventLoop, ArrayDeque<Channel>> perLoop = POOL.get(routeKey(s));
+        if (perLoop == null) return;
+        ArrayDeque<Channel> dq = perLoop.get(ch.eventLoop());
+        if (dq != null) dq.remove(ch);
+    }
+
+    /** 后端路由 key：scheme + host + port +（免校验 TLS 时附加标记） */
+    private static String routeKey(ProxySite s) {
+        return s.scheme() + "://" + s.backendHost() + ":" + s.backendPort()
+                + (s.adv().backendInsecure ? "#insecure" : "");
+    }
+
+    /** 停止/重启监听时清空并关闭全部空闲连接（先复制再关，避免 channelInactive 回调并发修改队列） */
+    private static void clearPool() {
+        for (ConcurrentHashMap<EventLoop, ArrayDeque<Channel>> perLoop : POOL.values()) {
+            for (ArrayDeque<Channel> dq : perLoop.values()) {
+                for (Channel c : dq.toArray(new Channel[0])) {
+                    BackendRelay r = c.attr(RELAY).get();
+                    if (r != null) r.cancelEvict();
+                    c.close();
+                }
+            }
+        }
+        POOL.clear();
     }
 
     /**

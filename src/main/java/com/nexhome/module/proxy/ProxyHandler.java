@@ -175,6 +175,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         tx = new Tx(ctx, site, st, cacheKey, methodGet, pathQuery);
         st.active.incrementAndGet();
         boolean keepAlive = !isH2 && HttpUtil.isKeepAlive(req);
+        ProxyAdvanced adv = site.adv();
         if (!isH2) ctx.channel().config().setAutoRead(false);
 
         // 构造回源头：剥离逐跳头与 Expect（对齐 nginx：Expect 不转发后端，也不代回 100），
@@ -182,7 +183,10 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         DefaultHttpRequest fwd = new DefaultHttpRequest(HttpVersion.HTTP_1_1, req.method(), upath,
                 new DefaultHttpHeaders());
         copyHeaders(req.headers(), fwd.headers());
-        fwd.headers().set(HttpHeaderNames.CONNECTION, "close");
+        // 启用回源连接池时不声明 close（HTTP/1.1 默认 keep-alive），供响应读完后归还复用；
+        // 否则维持既有短连接语义（每请求 close）
+        if (adv.upstreamKeepalive) HttpUtil.setKeepAlive(fwd, true);
+        else fwd.headers().set(HttpHeaderNames.CONNECTION, "close");
         // 上游 chunked 请求体（TE 已被剥离）：向后端重新声明 chunked 分帧，
         // 否则后端按连接关闭定界等待 body 而挂起不响应
         if (HttpUtil.isTransferEncodingChunked(req)) {
@@ -193,25 +197,30 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         String xff = req.headers().get("X-Forwarded-For");
         fwd.headers().set("X-Forwarded-For", xff == null || xff.isBlank() ? clientIp : xff + ", " + clientIp);
         fwd.headers().set("X-Forwarded-By", "NexHome");
-        applyHeaderOps(site.adv().reqHeaders, fwd.headers());
+        applyHeaderOps(adv.reqHeaders, fwd.headers());
 
-        ChannelFuture bf = ProxyCenter.connectBackend(site,
-                new BackendRelay(tx, keepAlive), tx.front, true);
+        ChannelFuture bf = ProxyCenter.openBackend(site, tx.front);
         tx.backend = bf.channel();
         // 关键：连接建立成功后再写回源请求。跨事件循环时，连接未完成时的预写与 flush
         // 不会被可靠地下发到 socket（表现为后端收不到完整请求、响应永远不到达），
         // 故统一放到 connect 监听器内，此时 backend channel 已 active 且可写。
+        // 复用连接返回的是已完成 future，监听器在同一事件循环线程内立即执行。
         bf.addListener((ChannelFutureListener) f -> {
             if (!f.isSuccess()) {
                 connectFailed(f, "后端连接失败: " + f.cause().getMessage());
                 return;
             }
             Channel b = f.channel();
+            BackendRelay relay = b.attr(ProxyCenter.RELAY).get();
+            if (relay != null) relay.beginExchange(site, tx, keepAlive);
             b.writeAndFlush(fwd);
             tx.backendReady = true;
             // 请求体先于连接到达的缓存内容直接续流
             if (tx.pendingBody != null && !tx.pendingBody.isEmpty()) {
-                for (Object o : tx.pendingBody) b.write(o);
+                for (Object o : tx.pendingBody) {
+                    b.write(o);
+                    if (o instanceof LastHttpContent) tx.requestBodyDone = true;
+                }
                 tx.pendingBody = null;
                 b.flush();
             }
@@ -240,6 +249,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
             }
         } else if (tx.backendReady && tx.backend != null) {
             tx.backend.writeAndFlush(c.retain());
+            if (c instanceof LastHttpContent) tx.requestBodyDone = true;
         } else {
             tx.pendingBody.add(c.retain());
         }
@@ -256,6 +266,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         final AtomicBoolean done = new AtomicBoolean();
         volatile Channel backend;
         volatile boolean tunnel, backendReady;
+        volatile boolean requestBodyDone; // 回源请求体是否已完整转发到后端（连接复用前置条件）
         List<Object> pendingBody = new ArrayList<>();
 
         Tx(ChannelHandlerContext front, ProxySite site, ProxyCenter.SiteStats st,
@@ -266,6 +277,8 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
             this.cacheKey = cacheKey;
             this.methodGet = methodGet;
             this.pathQuery = pathQuery;
+            // GET/无体请求默认视为已发完（HttpServerCodec 对无体请求即时下发 LastHttpContent）
+            this.requestBodyDone = methodGet;
         }
 
         /** 结束事务：活跃数归位、释放未转发请求体、关闭后端、恢复读取（幂等） */

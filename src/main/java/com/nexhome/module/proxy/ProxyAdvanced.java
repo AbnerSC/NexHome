@@ -27,6 +27,9 @@ import java.util.Set;
  *   "basicAuth":   {"user":"","pass":""},                           // Basic 认证（user 空=关闭）
  *   "ipAllow":     ["192.168.1.", "10.0.0.5"],                      // 来源 IP 白名单：精确 IP 或以点结尾的网段前缀（空=不限）
  *   "backendInsecure": false,                                       // 后端 HTTPS 跳过证书校验
+ *   "upstreamKeepalive": false,                                     // 回源长连接池（按后端 host:port 复用空闲连接）
+ *   "upstreamIdleSec": 60,                                          // 池内空闲连接回收秒数
+ *   "upstreamMaxIdleConns": 32,                                     // 每后端路由(每事件循环)保留的最大空闲连接数
  *   "cache":       {"enabled":false,"ttlSec":3600,"inactiveSec":604800,
  *                  "maxMB":256,"maxItemMB":8,"respectUpstream":true,
  *                  "extensions":["js","css","png"]}                 // 文件缓存（nginx 风格）
@@ -59,6 +62,14 @@ public final class ProxyAdvanced {
     public String authUser = "", authPass = "";
     public List<String> ipAllow = List.of();
     public boolean backendInsecure = false;
+
+    // ---------- 回源长连接池（upstream keepalive） ----------
+    /** 是否复用回源连接（默认关闭：每请求短连接，对齐 nginx 默认不启用 upstream keepalive） */
+    public boolean upstreamKeepalive = false;
+    /** 池内空闲连接最长保留时间（秒），超时即回收，兼顾后端自身的 keep-alive 空闲关闭 */
+    public int upstreamIdleSec = 60;
+    /** 每个后端路由在每个事件循环上保留的最大空闲连接数 */
+    public int upstreamMaxIdleConns = 32;
 
     // ---------- 文件缓存 ----------
     public boolean cacheEnabled = false;
@@ -140,6 +151,9 @@ public final class ProxyAdvanced {
             a.ipAllow = List.copyOf(list);
         }
         a.backendInsecure = JsonUtils.bool(o, "backendInsecure", a.backendInsecure);
+        a.upstreamKeepalive = JsonUtils.bool(o, "upstreamKeepalive", a.upstreamKeepalive);
+        a.upstreamIdleSec = rangeInt(o, "upstreamIdleSec", a.upstreamIdleSec, 1, 3600, "upstreamIdleSec");
+        a.upstreamMaxIdleConns = rangeInt(o, "upstreamMaxIdleConns", a.upstreamMaxIdleConns, 1, 4096, "upstreamMaxIdleConns");
 
         if (o.has("cache") && !o.get("cache").isJsonNull()) {
             JsonObject c = o.getAsJsonObject("cache");
@@ -190,6 +204,9 @@ public final class ProxyAdvanced {
         ipAllow.forEach(ip::add);
         o.add("ipAllow", ip);
         o.addProperty("backendInsecure", backendInsecure);
+        o.addProperty("upstreamKeepalive", upstreamKeepalive);
+        o.addProperty("upstreamIdleSec", upstreamIdleSec);
+        o.addProperty("upstreamMaxIdleConns", upstreamMaxIdleConns);
         JsonObject c = new JsonObject();
         c.addProperty("enabled", cacheEnabled);
         c.addProperty("ttlSec", cacheTtlSec);

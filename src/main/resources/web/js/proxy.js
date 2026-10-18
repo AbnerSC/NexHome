@@ -249,6 +249,12 @@ window.pxForm = async (id) => {
           <div class="field full"><label>IP 白名单</label><input id="aIpAllow" placeholder="192.168.1., 10.0.0.5（精确 IP 或以点结尾的网段前缀，逗号分隔，留空=不限）"></div>
           <div class="field"><label>后端 TLS 免校验（自签 https 后端）</label>
             <select id="aInsecure"><option value="true">是</option><option value="false">否</option></select></div>
+          <div class="field full adv-cache-title"><b>回源长连接（upstream keepalive）</b></div>
+          <div class="field"><label>启用回源连接池</label>
+            <select id="aUpstreamKa"><option value="true">启用（复用空闲连接）</option><option value="false">关闭（每请求短连接）</option></select></div>
+          <div class="field"><label>空闲连接回收（秒）</label><input id="aUpstreamIdle" type="number" min="1" max="3600"></div>
+          <div class="field"><label>每后端空闲连接上限</label><input id="aUpstreamMax" type="number" min="1" max="4096"></div>
+          <div class="small muted full">对 <b>https 回源</b> 与 <b>跨主机后端</b> 收益明显（省去每请求 TLS/TCP 建连）；纯 localhost HTTP 后端收益有限，可按需开启。</div>
           <div class="field full adv-cache-title"><b>文件缓存</b></div>
           <div class="field"><label>启用缓存</label><select id="cEnabled"><option value="true">是</option><option value="false">否</option></select></div>
           <div class="field"><label>缓存时长（秒）</label><input id="cTtl" type="number" min="1"></div>
@@ -328,6 +334,9 @@ function pxFillAdvControls() {
     $('#aAuthPass').value = ba.pass || '';
     $('#aIpAllow').value = (a.ipAllow || []).join(', ');
     $('#aInsecure').value = String(!!a.backendInsecure);
+    $('#aUpstreamKa').value = String(!!a.upstreamKeepalive);
+    $('#aUpstreamIdle').value = a.upstreamIdleSec ?? 60;
+    $('#aUpstreamMax').value = a.upstreamMaxIdleConns ?? 32;
     $('#cEnabled').value = String(!!c.enabled);
     $('#cTtl').value = c.ttlSec ?? 3600;
     $('#cMaxItem').value = c.maxItemMB ?? 8;
@@ -353,6 +362,9 @@ function pxReadAdvControls() {
     const ip = csv($('#aIpAllow').value);
     if (ip.length) a.ipAllow = ip; else delete a.ipAllow;
     a.backendInsecure = $('#aInsecure').value === 'true';
+    a.upstreamKeepalive = $('#aUpstreamKa').value === 'true';
+    a.upstreamIdleSec = num($('#aUpstreamIdle').value) || 60;
+    a.upstreamMaxIdleConns = num($('#aUpstreamMax').value) || 32;
     a.cache = {
         enabled: $('#cEnabled').value === 'true',
         ttlSec: num($('#cTtl').value) || 3600,
