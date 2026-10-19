@@ -87,6 +87,18 @@ final class StunRunner {
      */
     private static final int TCP_SPARES = 60;
 
+    /**
+     * WAN 腿 socket 显式发送缓冲（字节）：CGNAT/移动宽带链路 RTT 高（实测可达 200ms），
+     * 内核自动扩窗在短连接上来不及涨到线速所需的带宽时延积（BDP=带宽×RTT，50Mbps×200ms≈1.25MB）。
+     * 显式给足 4MB 让单流一次爬坡即可填满 BDP。<b>注意</b>：显式设置会关闭该 socket 的内核自动调优，
+     * 故取值须覆盖「上行带宽×最大 RTT」并留余量，过小反而封死窗口上限。
+     */
+    private static final int WAN_SO_SNDBUF = 4 * 1024 * 1024;
+    /** WAN 腿 socket 显式接收缓冲（字节），取值理由同 {@link #WAN_SO_SNDBUF}（上行方向由对端窗口决定，本端收窗同样需覆盖 BDP） */
+    private static final int WAN_SO_RCVBUF = 4 * 1024 * 1024;
+    /** TCP 监听 backlog：默认 50，多线程下载器/并发测速握手会排队，放大到 256 减少入站握手丢失 */
+    private static final int TCP_BACKLOG = 256;
+
     private final long id;
     private final String name;
     private final String protocol;
@@ -626,7 +638,7 @@ final class StunRunner {
             try {
                 ServerSocket ss = new ServerSocket();
                 ss.setReuseAddress(true);
-                ss.bind(new InetSocketAddress(port));
+                ss.bind(new InetSocketAddress(port), TCP_BACKLOG);
                 return ss;
             } catch (Exception e) {
                 last = e;
@@ -785,6 +797,14 @@ final class StunRunner {
     private void pipeToTarget(Socket client) {
         try (client; Socket target = new Socket(targetIp, targetPort)) {
             Logs.info(Logs.STUN, "任务[" + name + "] 外网连接: " + client.getRemoteSocketAddress());
+            // WAN 腿调优：关 Nagle（小请求不积包、不掉一个 RTT 的停顿）+ 显式大收发缓冲（单流更快填满 BDP）。
+            // 这是与 Lucky 单隧道相比每连接冷启动最直接的缓解点；对多流并发超发导致的衰减只能部分改善。
+            tuneWanSocket(client);
+            try {
+                target.setTcpNoDelay(true); // 内网腿多为 localhost，仅需关 Nagle，缓冲交内核自动调优
+            } catch (Exception ignored) {
+                // 平台不支持时忽略，不影响转发
+            }
             // 对端不是自测回环连接时记录真实外网访问时刻：作为通道实际在用的证据，
             // 自测未通过时据此避免误重穿把可用映射丢弃。自测回环判定：本机直连公网映射的
             // 探测窗口内（源经回流改写，LAN IP/路由器 IP/公网出口 IP 均有可能），
@@ -800,6 +820,25 @@ final class StunRunner {
             copy(client, target);
         } catch (Exception e) {
             Logs.warn(Logs.STUN, "任务[" + name + "] 转发失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 对 WAN 腿 socket 做低延迟 + 大缓冲调优。缓冲须在连接建立后尽早设置以覆盖整个传输生命周期；
+     * 单项失败（平台/内核限制）静默跳过，绝不因调优异常中断转发管道。
+     */
+    private static void tuneWanSocket(Socket s) {
+        try {
+            s.setTcpNoDelay(true);
+        } catch (Exception ignored) {
+        }
+        try {
+            s.setSendBufferSize(WAN_SO_SNDBUF);
+        } catch (Exception ignored) {
+        }
+        try {
+            s.setReceiveBufferSize(WAN_SO_RCVBUF);
+        } catch (Exception ignored) {
         }
     }
 
