@@ -133,7 +133,7 @@ public final class SystemRoutes {
             info.put("name", "NexHome 联枢");
             info.put("version", VERSION);
             info.put("javaVersion", System.getProperty("java.version"));
-            info.put("os", System.getProperty("os.name") + " " + System.getProperty("os.arch"));
+            info.put("os", osDisplay());
             // 实际监听端口（启动期可端口自愈，与配置值不一致时以此为准）
             info.put("port", WebServer.httpPort());
             info.put("httpsEnabled", WebServer.httpsActive());
@@ -244,6 +244,48 @@ public final class SystemRoutes {
             String ip = ctx.clientIp();
             ctx.ok(Map.of("lan", isPrivateSource(ip), "ip", ip));
         });
+    }
+
+    /**
+     * 操作系统展示名缓存：仅计算一次。
+     * <p>
+     * Linux 下优先读取 {@code /etc/os-release} 的 {@code PRETTY_NAME}（如 "Ubuntu 24.04 LTS"、
+     * "openEuler 24.03 (LTS-SP3)"），读不到或文件不存在时回退为 "os.name os.arch"；
+     * 非 Linux（Windows/macOS）本身已有明确名称，直接使用 "os.name os.arch"。
+     */
+    private static volatile String osDisplay;
+
+    private static String osDisplay() {
+        String cached = osDisplay;
+        if (cached != null) return cached;
+        synchronized (SystemRoutes.class) {
+            if (osDisplay == null) osDisplay = detectOsDisplay();
+            return osDisplay;
+        }
+    }
+
+    private static String detectOsDisplay() {
+        String fallback = System.getProperty("os.name") + " " + System.getProperty("os.arch");
+        if (!"linux".equalsIgnoreCase(System.getProperty("os.name"))) return fallback;
+        try {
+            Path p = Path.of("/etc/os-release");
+            if (!Files.isReadable(p)) return fallback;
+            for (String line : Files.readAllLines(p)) {
+                String s = line.trim();
+                if (!s.startsWith("PRETTY_NAME=")) continue;
+                String name = s.substring("PRETTY_NAME=".length()).trim();
+                // 去掉成对的双引号或单引号
+                if (name.length() >= 2 && (name.charAt(0) == '"' || name.charAt(0) == '\'')
+                        && name.charAt(name.length() - 1) == name.charAt(0)) {
+                    name = name.substring(1, name.length() - 1);
+                }
+                name = name.trim();
+                if (!name.isEmpty()) return name;
+            }
+        } catch (IOException ignored) {
+            // 读取失败按兜底展示
+        }
+        return fallback;
     }
 
     /** 是否内网来源：环回/私网/链路本地/组播及运营商 CGNAT(100.64.0.0/10) 均视为内网，其余视为公网 */
