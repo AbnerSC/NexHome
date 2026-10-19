@@ -183,13 +183,19 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         }
         String host = ProxyCenter.hostOnly(hostHdr);
         String uri = req.uri();
-        if (!uri.startsWith("/") || uri.contains("..")) {
+        if (!uri.startsWith("/")) {
             ProxyCenter.sendSimple(ctx, 400, "仅支持标准请求路径（不支持 CONNECT/绝对 URI）", null, null, false);
             return;
         }
         int q = uri.indexOf('?');
         String path = q < 0 ? uri : uri.substring(0, q);
         String query = q < 0 ? "" : uri.substring(q + 1);
+        // 路径穿越防护只针对「段级 ..」（/a/../b），不能用 contains("..")：
+        // 否则 Gitea compare 等合法路径里的 "..."（如 release-v1.2.0...release-v1.3.0）会被误伤
+        if (hasDotDotSegment(path)) {
+            ProxyCenter.sendSimple(ctx, 400, "请求路径非法（包含 .. 上跳段）", null, null, false);
+            return;
+        }
 
         ProxySite site = ProxyCenter.route(host, path);
         if (site == null) {
@@ -287,6 +293,20 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
 
         beginRelay(ctx, site, req, upath, path + (query.isEmpty() ? "" : "?" + query),
                 peerIp, st, cacheKey, HttpMethod.GET.equals(req.method()));
+    }
+
+    /** 按 '/' 切分后是否存在恰好等于 ".." 的路径段（真正的上跳穿越）；
+     *  段内包含连续点（如 "a...b"、"..hidden"）不算，避免误伤合法业务路径 */
+    private static boolean hasDotDotSegment(String path) {
+        int start = 0;
+        while (start <= path.length()) {
+            int slash = path.indexOf('/', start);
+            int end = slash < 0 ? path.length() : slash;
+            if (end - start == 2 && path.charAt(start) == '.' && path.charAt(start + 1) == '.') return true;
+            if (slash < 0) break;
+            start = slash + 1;
+        }
+        return false;
     }
 
     /** 消息级中继：改写请求头后连后端，请求体流式转发；h1 期间暂停读取实现串行 */
