@@ -15,6 +15,7 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.EventLoop;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
@@ -222,6 +223,8 @@ public final class ProxyCenter {
                 .option(ChannelOption.SO_BACKLOG, 1024)
                 .childOption(ChannelOption.SO_KEEPALIVE, true)
                 .childOption(ChannelOption.TCP_NODELAY, true);
+        if (FAST_PATH && FP_WMARK_HIGH > 0 && FP_WMARK_LOW > 0)
+            b.childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(FP_WMARK_LOW, FP_WMARK_HIGH));
         b.childHandler(new ChannelInitializer<SocketChannel>() {
             @Override
             protected void initChannel(SocketChannel ch) {
@@ -365,13 +368,56 @@ public final class ProxyCenter {
     // ==================== pipeline 安装 ====================
 
     /**
-     * HTTP 报文解析上限（前后端对称）：初始行 4KB、头部总量 64KB、分块 8KB。
+     * HTTP 报文解析上限（前后端对称）：初始行 4KB、头部总量 64KB、分块 64KB。
      * 回源侧曾误用 8KB 头限额，后端返回大 Cookie/JWT 头时解码失败会拖挂事务，
      * 故两侧统一取同一组常量，超限一律由 {@link BackendRelay} 显式回 502。
      */
     static final int MAX_INITIAL_LINE = 4096;
     static final int MAX_HEADER_SIZE = 65536;
-    static final int MAX_CHUNK_SIZE = 8192;
+    /**
+     * 分块解码粒度（每个 {@code HttpContent} 上限字节），前后端编解码器共用。
+     * 可用 {@code -Dnx.proxy.chunk} 覆盖以便压测敏感度。
+     * <p>出厂默认 64KB（由早期 8KB 提升而来）。本机高吞吐多流 A/B（同机回环、直连基线、fastpath 关闭隔离变量，
+     * 每组 3 轮取中位）实测：64KB 已同时使下载与上传进入收益平台——再抬到 128KB/256KB 无统计上显著增益
+     * （上传中位 64K≈5.5、128K≈4.8 Gbps，差异落在回环噪声带内；早前观测到的 128K“8.5 Gbps”为单轮冷启动离群值）。
+     * 因更大分块只增单连接缓冲、无实测吞吐回报，故保留 64KB；特殊链路可用 {@code -Dnx.proxy.chunk} 自行试验。
+     */
+    static final int MAX_CHUNK_SIZE = Integer.getInteger("nx.proxy.chunk", 65536);
+
+    // ==================== 高速转发优化（点3+4，可 A/B 回退） ====================
+
+    /**
+     * 高速转发路径优化总开关。默认开启，但出厂只启用经验证为正向的 {@code TCP_NODELAY}（回源出站显式
+     * 关闭 Nagle，实测上传略优、下载中性）；{@code SO_SNDBUF/RCVBUF} 与抬高的写水位默认关闭，需在系统属性显式指定才生效。
+     * <p>本机高吞吐压测（同机回环、直连 ~10Gbps 基线，HTTP 与自签名 HTTPS 各 3 轮中位）实测：
+     * <ul>
+     *   <li>回源 TCP_NODELAY：上传 HTTP +5%、其余中性——保留默认开启；</li>
+     *   <li>抬高写水位（256K/1M）：下载 -10~12%、上传 -7% 左右——默认关闭（Netty 默认 32K/64K 更优）；</li>
+     *   <li>显式收发缓冲（4MB）：下载/上传 -10% 左右——默认关闭（交 OS 自动调优更优）。</li>
+     * </ul>
+     * 后者负作用的机理：代理瓶颈在「单流被钉在单个 EventLoop 串行处理」而非 socket 缓冲或可写翻转频率，
+     * 抬高水位反而推迟背压、加剧出站排队与内存拷贝，固定大缓冲则抑制了 Windows 的收发窗口自动调优。
+     * 均保留为 {@code -Dnx.proxy.wmHigh/wmLow/soBuf} 可选旋钮，供特殊链路自行试验；{@code -Dnx.proxy.fastpath=false} 全量回退。
+     */
+    static final boolean FAST_PATH = !"false".equalsIgnoreCase(System.getProperty("nx.proxy.fastpath", "true"));
+    /** 子开关（仅 FAST_PATH 为真时生效）：各自可独立启停以便逐项 A/B */
+    static final boolean FP_NODELAY = !"false".equalsIgnoreCase(System.getProperty("nx.proxy.fpNodelay", "true"));
+    static final int FP_SOBUF = Integer.getInteger("nx.proxy.soBuf", 0); // <=0 不改（保留 OS 自动调优）
+    static final int FP_WMARK_HIGH = Integer.getInteger("nx.proxy.wmHigh", 0); // <=0 不改（保留 Netty 默认 32K/64K）
+    static final int FP_WMARK_LOW = Integer.getInteger("nx.proxy.wmLow", 0);
+
+    /** 回源出站连接的高速优化项（仅在 {@link #FAST_PATH} 生效）：按子开关逐项应用 */
+    private static void applyFastPath(io.netty.bootstrap.Bootstrap b) {
+        if (!FAST_PATH) return;
+        if (FP_NODELAY) b.option(ChannelOption.TCP_NODELAY, true);
+        if (FP_SOBUF > 0) {
+            b.option(ChannelOption.SO_SNDBUF, FP_SOBUF)
+                    .option(ChannelOption.SO_RCVBUF, FP_SOBUF);
+        }
+        if (FP_WMARK_HIGH > 0 && FP_WMARK_LOW > 0) {
+            b.option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(FP_WMARK_LOW, FP_WMARK_HIGH));
+        }
+    }
 
     /** HTTP/1.1 pipeline：编解码（头总量 64KB）+ 转发处理器 */
     static void installHttp1(io.netty.channel.ChannelPipeline p, boolean https) {
@@ -622,14 +668,15 @@ public final class ProxyCenter {
     private static void connectH1Backend(ProxySite s, EventLoop loop, int attempt, BiConsumer<Channel, Throwable> ready) {
         ProxyAdvanced adv = s.adv();
         BackendRelay relay = new BackendRelay(adv.upstreamKeepalive, false);
-        new Bootstrap()
+        Bootstrap bb = new Bootstrap()
                 .group(loop)
                 .channel(NioSocketChannel.class)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000)
-                .handler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel ch) {
-                        if ("https".equals(s.scheme())) {
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000);
+        applyFastPath(bb);
+        bb.handler(new ChannelInitializer<SocketChannel>() {
+            @Override
+            protected void initChannel(SocketChannel ch) {
+                if ("https".equals(s.scheme())) {
                             ch.pipeline().addLast(backendTlsCtx(adv.backendInsecure).newHandler(
                                     ch.alloc(), s.backendHost(), s.backendPort()));
                         }
@@ -943,14 +990,15 @@ public final class ProxyCenter {
     /** h2 后端连接的 TCP 建连（瞬时失败按 {@link #CONNECT_RETRIES} 重试一次，与 h1 同一判据） */
     private static void connectH2Parent(ProxySite s, H2Shard sh, EventLoop loop, H2Conn conn) {
         ProxyAdvanced adv = s.adv();
-        new Bootstrap()
+        Bootstrap bb = new Bootstrap()
                 .group(loop)
                 .channel(NioSocketChannel.class)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000)
-                .handler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel ch) {
-                        conn.bind(ch);
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000);
+        applyFastPath(bb);
+        bb.handler(new ChannelInitializer<SocketChannel>() {
+            @Override
+            protected void initChannel(SocketChannel ch) {
+                conn.bind(ch);
                         if (conn.tls) {
                             ch.pipeline().addLast(backendH2TlsCtx(adv.backendInsecure).newHandler(
                                     ch.alloc(), s.backendHost(), s.backendPort()));
@@ -1171,14 +1219,15 @@ public final class ProxyCenter {
      */
     static ChannelFuture connectBackend(ProxySite s, io.netty.channel.ChannelHandler handler,
                                         ChannelHandlerContext front, boolean withCodec) {
-        return new Bootstrap()
+        Bootstrap bb = new Bootstrap()
                 .group(front.channel().eventLoop())
                 .channel(NioSocketChannel.class)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, s.adv().connectSec * 1000)
-                .handler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel ch) {
-                        if ("https".equals(s.scheme())) {
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, s.adv().connectSec * 1000);
+        applyFastPath(bb);
+        return bb.handler(new ChannelInitializer<SocketChannel>() {
+            @Override
+            protected void initChannel(SocketChannel ch) {
+                if ("https".equals(s.scheme())) {
                             ch.pipeline().addLast(backendTlsCtx(s.adv().backendInsecure).newHandler(
                                     ch.alloc(), s.backendHost(), s.backendPort()));
                         }

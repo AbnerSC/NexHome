@@ -414,14 +414,12 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
                 tx.pendingBody.add(c.retain());
             }
         } else if (tx.backendReady && tx.backend != null) {
-            tx.backend.writeAndFlush(c.retain());
+            // 请求体方向批量下发：本批次只 write 不 flush，统一由 channelReadComplete 一次 flush + 续读，
+            // 把「每个 HttpContent 一次 writeAndFlush + ctx.read」的逐块系统调用降为「每读批次一次」。
+            tx.backend.write(c.retain());
             if (c instanceof LastHttpContent) {
+                tx.backend.flush(); // 请求体收尾必须立即下发，触发后端产生响应
                 tx.requestBodyDone = true;
-            } else if (tx.backend.isWritable()) {
-                // 请求体方向流控：后端仍可写则显式拉取下一段请求体（首读批次后不会自动续读）；
-                // 后端写缓冲积压（不可写）时暂停拉取，待其可写由 BackendRelay.channelWritabilityChanged 恢复，
-                // 从而把后端背压逐级传导回客户端，避免大请求体停滞或无界缓冲。
-                ctx.read();
             }
         } else {
             tx.pendingBody.add(c.retain());
@@ -768,9 +766,16 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
 
     @Override
     public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        // 上传方向批量收尾：把本读批次累积的请求体一次性 flush 给后端，并在后端仍可写时续拉下一批
+        // （后端不可写＝写缓冲积压，暂停续读，由 BackendRelay.channelWritabilityChanged 恢复，形成端到端流控）
+        Tx t = tx;
+        if (!isH2 && t != null && !t.done.get() && t.backendReady && t.backend != null && !t.requestBodyDone) {
+            t.backend.flush();
+            if (t.backend.isWritable()) ctx.read();
+        }
         // 等待后端响应阶段保持读兴趣（见 beginRelay）：autoRead=false 下若不做一次 read，
         // 前端提前断开无法感知，事务悬挂至后端读超时才回收（请求体上传阶段仍由可写回调驱动续读）
-        if (!isH2 && tx != null && !tx.done.get() && tx.requestBodyDone
+        if (!isH2 && t != null && !t.done.get() && t.requestBodyDone
                 && !ctx.channel().config().isAutoRead() && ctx.channel().isActive()) {
             ctx.read();
         }
