@@ -8,6 +8,7 @@ import com.nexhome.core.Logs;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.management.ManagementFactory;
 import com.sun.management.OperatingSystemMXBean;
 import jakarta.servlet.http.HttpServletRequest;
@@ -30,6 +31,22 @@ public final class SystemRoutes {
 
     /** 测速默认时长（毫秒）：延迟/下载/上传三个阶段统一按时长测量 */
     private static final long SPEED_TEST_DEFAULT_MS = 10_000L;
+
+    /** 下载流单请求最长存活时间（毫秒）：浏览器主动中断之外的服务端兜底，防止请求线程被长期占用 */
+    private static final long SPEED_DOWN_MAX_MS = 60_000L;
+
+    /**
+     * 下载流单请求字节兜底上限：只靠时长封顶时，超快链路（localhost / 同机房反向代理）
+     * 下实测单流可达 870MB/s，16GB 相当于给最长存活时间再套一层量级上限；
+     * 取这个数是为了不截断任何真实硬件上的合法测量窗口（10 秒窗口连 loopback 也跑不到）。
+     */
+    private static final long SPEED_DOWN_MAX_BYTES = 16L << 30;
+
+    /** 预热定长响应字节上限（预热只需跑通握手与慢启动，给几百 KB 足够） */
+    private static final long SPEED_DOWN_MAX_FIXED_BYTES = 32L << 20;
+
+    /** 上传流单请求最长读取时间（毫秒）：防御异常客户端无限推流 */
+    private static final long SPEED_UP_MAX_MS = 60_000L;
 
     /**
      * 测速高熵负载块（1MB 随机数据，只读复用）：循环拷贝即可持续输出不可压缩负载。
@@ -179,17 +196,27 @@ public final class SystemRoutes {
         // 延迟/丢包探测：空载荷小响应，前端 fetch 计时多次往返取平均与失败率
         WebServer.route("GET", "/api/system/speedtest/ping", ctx ->
                 ctx.raw(200, PING_BODY, "application/octet-stream"));
-        // 下载测速：?ms= 指定测量时长（默认 10 秒，上限 60 秒），服务端按时长输出高熵流后正常收尾。
-        // 不声明 Content-Length（按时长输出无法预知总字节数）而由 Jetty 分块传输：
-        // 既避免定长与实际写出字节数不符，也无需前端到时中断请求（中断会在服务端写出时踩到断连）
+        // 下载测速：测量窗口由浏览器控制（到点主动中断请求），服务端只负责持续输出高熵流并做兜底封顶。
+        // 不能反过来让服务端“按时长写满再收尾”：服务端与浏览器之间只要隔着反向代理或有较大的
+        // 内核/中间层缓冲（远程访问面板的常见链路），写出就不会被真实链路背压阻塞——几百毫秒就灌完
+        // 几 MB 并正常收尾，浏览器还要按链路真实速率慢慢收，表现为测速一分多钟不结束且速率严重偏低。
+        // 窗口计时交给客户端后，结果与链路上的缓冲深度无关。
+        // ?bytes= 定长小响应：预热连接专用，显式声明 Content-Length，写完即收尾，不参与计时；
+        // ?ms=    单请求最长存活时间（默认 10 秒，上限 60 秒）：纯兜底，正常测速由浏览器先到点中断。
+        // 不声明 Content-Length 的流式响应由 Jetty 分块传输，客户端中断在写出时抛 IOException，
+        // 属正常收尾，在 speedWrite 内静默处理，不冒泡成 500 与错误日志。
         WebServer.route("GET", "/api/system/speedtest/down", ctx -> {
-            long ms = Math.min(Math.max(parseLong(ctx.query("ms"), SPEED_TEST_DEFAULT_MS), 500L), 60_000L);
-            ctx.javalin().status(200)
+            long fixed = clamp(parseLong(ctx.query("bytes"), 0L), 0L, SPEED_DOWN_MAX_FIXED_BYTES);
+            long ms = clamp(parseLong(ctx.query("ms"), SPEED_TEST_DEFAULT_MS), 500L, SPEED_DOWN_MAX_MS);
+            io.javalin.http.Context j = ctx.javalin();
+            j.status(200)
                     .contentType("application/octet-stream")
-                    .header("Cache-Control", "no-store")
-                    .result(speedStream(ms));
+                    .header("Cache-Control", "no-store");
+            if (fixed > 0) j.res().setContentLengthLong(fixed);
+            speedWrite(j.outputStream(), fixed, ms);
         });
-        // 上传测速：流式读取并丢弃请求体直到 EOF，返回实收字节数（前端多路并发持续推流到时关闭流）。
+        // 上传测速：流式读取并丢弃请求体直到 EOF，返回实收字节数（前端多路并发持续推流到时关闭流，
+        // 或兜底中断请求）。
         // 大缓冲减少 TLS/输入流的读取次数，读后即弃不占内存；直接读 Servlet 裸输入流，
         // 不经 Javalin 请求体缓存（maxRequestSize 只限制 bodyAsBytes 缓存路径），
         // 单请求可达数百 MB 不受全局 8MB 限制。
@@ -197,13 +224,16 @@ public final class SystemRoutes {
         WebServer.route("POST", "/api/system/speedtest/up", ctx -> {
             HttpServletRequest req = ctx.javalin().req();
             long total = 0;
-            final long deadline = System.nanoTime() + 60_000_000_000L;
+            final long deadline = System.nanoTime() + SPEED_UP_MAX_MS * 1_000_000L;
             byte[] buf = new byte[256 * 1024];
             try (InputStream in = req.getInputStream()) {
-                for (int n; (n = in.read(buf)) > 0; ) {
+                while (System.nanoTime() < deadline) {
+                    int n = in.read(buf);
+                    if (n < 0) break; // 客户端推完收尾（EOF）：正常结束
                     total += n;
-                    if (System.nanoTime() >= deadline) break;
                 }
+            } catch (IOException clientGone) {
+                // 客户端中途断连（兜底 abort / 页面切走）：已收字节数仍是有效计量，照常返回而非抛 500
             }
             ctx.ok(Map.of("bytes", total));
         });
@@ -235,6 +265,11 @@ public final class SystemRoutes {
         return Math.round(ratio * 1000.0) / 10.0;
     }
 
+    /** 长整型参数夹到 [min,max] 区间 */
+    private static long clamp(long v, long min, long max) {
+        return Math.min(Math.max(v, min), max);
+    }
+
     private static int parsePage(String s) {
         try {
             return s == null ? 0 : Integer.parseInt(s);
@@ -253,34 +288,27 @@ public final class SystemRoutes {
     }
 
     /**
-     * 测速下载流：按时长跑出高熵数据，到点返回 -1 正常收尾。
-     * 只读共享 {@link #SPEED_BLOCK}，不随请求分配内存（多路并发测速亦仅一份负载块）。
+     * 向响应输出流持续写出高熵负载：{@code fixed > 0} 时写满该字节数即收尾（预热）；
+     * 否则一直写到 {@code maxMs} 超时或触到字节兜底上限（正常测速由浏览器到点中断）。
+     * <p>
+     * 逐块 flush：把在途数据压到最小，浏览器中断后服务端能下一次写出即感知，
+     * 负载也不会被提前堆进中间代理的缓冲。只读共享 {@link #SPEED_BLOCK}，
+     * 不随请求分配内存（多路并发测速亦仅一份负载块）。
      */
-    private static InputStream speedStream(long millis) {
-        return new InputStream() {
-            private final long deadline = System.nanoTime() + millis * 1_000_000L;
-            private int pos;
-
-            @Override
-            public int read() {
-                if (System.nanoTime() >= deadline) return -1;
-                int b = SPEED_BLOCK[pos] & 0xFF;
-                pos = pos + 1 >= SPEED_BLOCK.length ? 0 : pos + 1;
-                return b;
+    private static void speedWrite(OutputStream out, long fixed, long maxMs) {
+        final long cap = fixed > 0 ? fixed : SPEED_DOWN_MAX_BYTES;
+        final long deadline = System.nanoTime() + maxMs * 1_000_000L;
+        long sent = 0;
+        try {
+            while (sent < cap && (fixed > 0 || System.nanoTime() < deadline)) {
+                int n = (int) Math.min(SPEED_BLOCK.length, cap - sent);
+                out.write(SPEED_BLOCK, 0, n);
+                out.flush();
+                sent += n;
             }
-
-            @Override
-            public int read(byte[] b, int off, int len) {
-                if (System.nanoTime() >= deadline) return -1;
-                int done = 0;
-                while (done < len) {
-                    int n = Math.min(len - done, SPEED_BLOCK.length);
-                    System.arraycopy(SPEED_BLOCK, 0, b, off + done, n);
-                    done += n;
-                }
-                return done;
-            }
-        };
+        } catch (IOException clientGone) {
+            // 浏览器测速窗口到点中断请求，或用户中途切走页面：链路已断，静默收尾
+        }
     }
 
     /** 从 classpath 的 app.properties 读取注入的版本号，读取失败时回退为 unknown */

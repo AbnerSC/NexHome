@@ -1248,8 +1248,28 @@ th.docker-sort:hover { color: var(--cyan); text-shadow: var(--glow-cyan); }
 }
 .dash-speed-tile .v { font-size: 19px; font-weight: 700; color: #eef2ff; font-variant-numeric: tabular-nums; }
 .dash-speed-tile .l { font-size: 12px; color: var(--muted); margin-top: 5px; }
+/* 数值下方的附属小字（最低~最高区间、抖动样本数）：预留一行高度，避免测速中途内容出现时卡片跳动 */
+.dash-speed-tile .s { font-size: 11px; color: var(--muted); margin-top: 4px; min-height: 14px; opacity: .85; font-variant-numeric: tabular-nums; }
 .dash-speed-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .dash-speed-note { font-size: 12px; color: var(--muted); }
+
+/* 测速整体进度：阶段步骤胶囊 + 总进度条 + 说明文案，仅测速期间显示（隐藏由模板按 running 加 .hidden） */
+.dash-speed-prog { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.st-prog-steps { display: inline-flex; gap: 6px; flex-shrink: 0; }
+.st-prog-step {
+    font-size: 12px;
+    color: var(--muted);
+    background: rgba(109, 139, 255, .08);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    white-space: nowrap;
+}
+.st-prog-step.cur { color: #eef2ff; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+.st-prog-step.done { color: #6ee7b7; border-color: rgba(52, 211, 153, .4); }
+.st-prog-bar { flex: 1; min-width: 140px; height: 6px; border-radius: 3px; background: rgba(255, 255, 255, .06); overflow: hidden; }
+.st-prog-bar i { display: block; height: 100%; border-radius: 3px; background: var(--grad-primary); box-shadow: 0 0 6px rgba(109, 139, 255, .5); transition: width .4s ease; }
+.st-prog-txt { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 @media (max-width: 1200px) {
     .dash-visit-grid { grid-template-columns: 1fr; }
