@@ -177,13 +177,30 @@ async function loadDiagNmt() {
         <tr><td>${esc(c.name)}</td>
             <td class="diag-val">${fmtDiagMB(c.committedMB)}</td>
             <td class="diag-val muted">${fmtDiagMB(c.reservedMB)}</td></tr>`).join('');
+    // 与启动基线的差值：直接指出哪一类原生内存长大了（内存不释放定位关键）
+    let diffHtml = '';
+    if (d.diff && d.diff.length) {
+        const drows = d.diff.map(r => `
+            <tr><td>${esc(r.name)}</td>
+                <td class="diag-val muted">${fmtDiagMB(r.baseMB)}</td>
+                <td class="diag-val">${fmtDiagMB(r.nowMB)}</td>
+                <td class="diag-val" style="color:${r.deltaMB > 0 ? 'var(--red)' : 'var(--green)'}">${r.deltaMB > 0 ? '+' : ''}${r.deltaMB} MB</td></tr>`).join('');
+        diffHtml = `
+          <h3 style="font-size:14px;margin:16px 0 8px">与启动基线的变化（自 ${esc(d.baselineTime || '')}）</h3>
+          <div class="tip">原生内存合计变化 <b style="color:${d.totalDeltaMB > 0 ? 'var(--red)' : 'var(--green)'}">${d.totalDeltaMB > 0 ? '+' : ''}${d.totalDeltaMB} MB</b>，下表按增幅排序，增长最多的类别即内存不释放的嫌疑人。</div>
+          <table>
+            <thead><tr><th>类别</th><th style="width:120px">启动时</th><th style="width:120px">当前</th><th style="width:120px">变化</th></tr></thead>
+            <tbody>${drows}</tbody>
+          </table>`;
+    }
     box.innerHTML = `
         <table>
           <thead><tr><th>类别</th><th style="width:140px">已提交</th><th style="width:140px">保留</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="3" class="muted">无分类数据</td></tr>'}</tbody>
         </table>
         <div class="small muted" style="margin-top:8px">合计已提交 ${fmtDiagMB(d.totalCommittedMB)} · 保留 ${fmtDiagMB(d.totalReservedMB)}（
-          JVM 堆只是其中一项；Netty 池化等堆外分配多归在 Internal/Other。结果缓存约 60 秒）</div>`;
+          JVM 堆只是其中一项；Netty 池化等堆外分配多归在 Internal/Other。结果缓存约 60 秒）</div>
+        ${diffHtml}`;
 }
 
 function armDiagRefresh() {

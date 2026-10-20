@@ -23,6 +23,7 @@ import org.eclipse.jetty.server.SecureRequestCustomizer;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.server.SslConnectionFactory;
+import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 
 import java.io.ByteArrayOutputStream;
@@ -231,6 +232,11 @@ public final class WebServer {
     private static void launch(WebAccessConfig.Snapshot snap, Path webDir, boolean https,
                                WebAccessConfig.CertInfo cert, int httpPort, boolean selfHeal) {
         Javalin created = Javalin.create(config -> {
+            // Jetty 请求线程池收敛：Javalin 默认上限 250、空闲 60s 回收。阻塞式 handler 下，
+            // 测速等长连接负载会把线程数棘轮式推高（每线程栈触页后驻留 RSS，实测只升不降）；
+            // NAS 面板场景 64 封顶充裕，空闲 30s 即回收，避免线程原生栈长期占用
+            config.jetty.threadPool = new QueuedThreadPool(64, 8, 30_000, null);
+
             // 图标上传（multipart）需突破框架默认 1MB 请求体限制；业务层另有 2MB 上限并友好报错
             config.http.maxRequestSize = 8_000_000L;
 

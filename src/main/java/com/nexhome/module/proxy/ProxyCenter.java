@@ -4,6 +4,7 @@ import com.nexhome.core.Logs;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -141,6 +142,18 @@ public final class ProxyCenter {
     private ProxyCenter() {
     }
 
+    /**
+     * 代理专用池化分配器：默认池 direct arena = CPU×2（8 核即 16 arena）、chunk 默认 16MB
+     * （pageSize 8K << maxOrder 11）。大流量回源（如经代理的第三方测速）会把多个 direct arena
+     * 批量撑到 16MB chunk，且已用 chunk 归还 OS 前长期驻留 RSS，低内存容器里表现为
+     * 「测速后内存不回落」。收敛：direct arena 降为 CPU 数、chunk 改为 4MB（8K<<9），
+     * 撑幅按倍缩小、归还粒度更细；heap arena 维持默认（属 GC 堆、不额外占 RSS）。
+     * 仅挂到代理两端 channel（不改全局默认，WebServer/其他模块不受影响）。
+     */
+    static final PooledByteBufAllocator ALLOCATOR = new PooledByteBufAllocator(true,
+            Runtime.getRuntime().availableProcessors() * 2, Runtime.getRuntime().availableProcessors(),
+            8192, 9, 512, 128, true, 0);
+
     // ==================== 生命周期 ====================
 
     /**
@@ -221,6 +234,7 @@ public final class ProxyCenter {
                 .group(boss, worker)
                 .channel(NioServerSocketChannel.class)
                 .option(ChannelOption.SO_BACKLOG, 1024)
+                .childOption(ChannelOption.ALLOCATOR, ALLOCATOR)
                 .childOption(ChannelOption.SO_KEEPALIVE, true)
                 .childOption(ChannelOption.TCP_NODELAY, true);
         if (FAST_PATH && FP_WMARK_HIGH > 0 && FP_WMARK_LOW > 0)
@@ -671,7 +685,8 @@ public final class ProxyCenter {
         Bootstrap bb = new Bootstrap()
                 .group(loop)
                 .channel(NioSocketChannel.class)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000);
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000)
+                .option(ChannelOption.ALLOCATOR, ALLOCATOR);
         applyFastPath(bb);
         bb.handler(new ChannelInitializer<SocketChannel>() {
             @Override
@@ -993,7 +1008,8 @@ public final class ProxyCenter {
         Bootstrap bb = new Bootstrap()
                 .group(loop)
                 .channel(NioSocketChannel.class)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000);
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, adv.connectSec * 1000)
+                .option(ChannelOption.ALLOCATOR, ALLOCATOR);
         applyFastPath(bb);
         bb.handler(new ChannelInitializer<SocketChannel>() {
             @Override
@@ -1222,7 +1238,8 @@ public final class ProxyCenter {
         Bootstrap bb = new Bootstrap()
                 .group(front.channel().eventLoop())
                 .channel(NioSocketChannel.class)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, s.adv().connectSec * 1000);
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, s.adv().connectSec * 1000)
+                .option(ChannelOption.ALLOCATOR, ALLOCATOR);
         applyFastPath(bb);
         return bb.handler(new ChannelInitializer<SocketChannel>() {
             @Override

@@ -70,6 +70,9 @@ public final class DiagService {
     // NMT 明细按需缓存（仅在访问 /api/diag/nmt 时生成，正常采样/日常运行不触发）
     private static volatile Map<String, Object> nmtCache;
     private static volatile long nmtCacheAt;
+    // 启动时的 NMT 基线（分类名 → committed MB）：与当前值作差即「哪一类原生内存长大了」
+    private static volatile Map<String, Double> nmtBaseline;
+    private static volatile String nmtBaselineTime;
 
     private DiagService() {
     }
@@ -86,6 +89,17 @@ public final class DiagService {
     public static void init() {
         sample();
         Tasks.every(INTERVAL_SEC, INTERVAL_SEC, DiagService::sample);
+        if (nmtEnabled()) {
+            // 启动即取一次 NMT 基线（一次性，几毫秒）：之后差值可直接定位原生内存增长类别
+            Tasks.run(() -> {
+                Map<String, Object> b = collectNmt();
+                Map<String, Double> m = catCommittedMap(b);
+                if (m != null && !m.isEmpty()) {
+                    nmtBaseline = m;
+                    nmtBaselineTime = TS.format(Instant.now());
+                }
+            });
+        }
         Logs.info(Logs.SYS, "内存诊断采样已启动：间隔 " + INTERVAL_SEC + " 秒，保留 " + CAPACITY + " 个样本");
     }
 
@@ -225,15 +239,19 @@ public final class DiagService {
             MBeanServer server = ManagementFactory.getPlatformMBeanServer();
             ObjectName name = new ObjectName("com.sun.management:type=DiagnosticCommand");
             String text = (String) server.invoke(
-                    name, "VMNativeMemory",
+                    name, "vmNativeMemory",
                     new Object[]{new String[]{"summary"}},
                     new String[]{"[Ljava.lang.String;"});
             parseNmt(text, out);
             out.put("available", true);
+            appendBaselineDiff(out);
         } catch (Exception e) {
             // 精简 JRE / MBean 不可用 / 命令失败：优雅降级，仅提示不影响其它诊断数据
+            // 带上异常类型，避免 getMessage() 为 null 时无法定位
+            String why = e.getMessage();
             out.put("available", false);
-            out.put("reason", "读取 NMT 失败：" + e.getMessage());
+            out.put("reason", "读取 NMT 失败：" + e.getClass().getSimpleName()
+                    + (why == null || why.isBlank() ? "" : " - " + why));
         }
         return out;
     }
@@ -243,9 +261,9 @@ public final class DiagService {
                 .stream().anyMatch(a -> a.contains("NativeMemoryTracking"));
     }
 
-    // 分类行形如：-      Java Heap (reserved=NNNK, committed=MMMKB)
+    // 分类行形如：-      Java Heap (reserved=NNNKB, committed=MMMKB[, Max. Commit=KKKKB])
     private static final Pattern NMT_CAT =
-            Pattern.compile("^-\\s+(.+?)\\s+\\(reserved=(\\d+)KB,\\s*committed=(\\d+)KB\\)");
+            Pattern.compile("^-\\s+(.+?)\\s+\\(reserved=(\\d+)KB,\\s*committed=(\\d+)KB(?:,\\s*Max. Commit=(-?\\d+)KB)?\\)");
     private static final Pattern NMT_RES = Pattern.compile("reserved=(\\d+)KB");
     private static final Pattern NMT_COM = Pattern.compile("committed=(\\d+)KB");
 
@@ -273,6 +291,47 @@ public final class DiagService {
 
     private static double kbToMb(long kb) {
         return Math.round(kb / 102.4) / 10.0;
+    }
+
+    private static Map<String, Double> catCommittedMap(Map<String, Object> parsed) {
+        Object cats = parsed.get("categories");
+        if (!(cats instanceof List<?> list)) return null;
+        Map<String, Double> m = new LinkedHashMap<>();
+        for (Object o : list) {
+            if (o instanceof Map<?, ?> c && c.get("name") instanceof String name
+                    && c.get("committedMB") instanceof Number n) {
+                m.put(name, n.doubleValue());
+            }
+        }
+        return m;
+    }
+
+    /** 附加工具：当前各分类与启动基线的 committed 差值（按增幅降序），定位原生内存增长类别 */
+    private static void appendBaselineDiff(Map<String, Object> out) {
+        Map<String, Double> base = nmtBaseline;
+        if (base == null || base.isEmpty()) return;
+        Map<String, Double> now = catCommittedMap(out);
+        if (now == null) return;
+        List<Map<String, Object>> diff = new ArrayList<>();
+        double total = 0;
+        for (Map.Entry<String, Double> e : now.entrySet()) {
+            double d = e.getValue() - base.getOrDefault(e.getKey(), 0.0);
+            total += d;
+            if (Math.abs(d) >= 0.05) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("name", e.getKey());
+                row.put("baseMB", round1(base.getOrDefault(e.getKey(), 0.0)));
+                row.put("nowMB", round1(e.getValue()));
+                row.put("deltaMB", round1(d));
+                diff.add(row);
+            }
+        }
+        diff.sort(Comparator.comparingDouble((Map<String, Object> r) ->
+                ((Number) r.get("deltaMB")).doubleValue()).reversed());
+        out.put("baselineTime", nmtBaselineTime);
+        out.put("baselineTotalMB", round1(base.values().stream().mapToDouble(Double::doubleValue).sum()));
+        out.put("totalDeltaMB", round1(total));
+        out.put("diff", diff);
     }
 
     /** 关联分析：定位时间线中的最大内存跳变，并取该时刻前后窗口的 op_log 事件 */
