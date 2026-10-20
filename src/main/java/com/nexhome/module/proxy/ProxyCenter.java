@@ -440,6 +440,20 @@ public final class ProxyCenter {
      */
     static final int H2_STREAM_WINDOW = Integer.getInteger("nx.proxy.h2StreamWin", 1024 * 1024);
 
+    /**
+     * h2 子流（前端）出站写缓冲高水位（KB，低水位取一半）；0 = 不改（Netty 默认 32K/64K）。
+     * <p>
+     * 下载方向的停后端读由 {@code BackendRelay} 根据 {@code front.channel().isWritable()} 判定，
+     * 而 h2 子流的可写性恢复条件是「写缓冲回落到低水位以下 且 父连接可写」
+     * （{@code AbstractHttp2StreamChannel}），默认 32K/64K 对 h2 出站太敏感：窗口未用满就先停后端读。
+     * 抬高水位后代理内常备待发数据，窗口一开即发满。本地环回实测（512MB 流式下载，3 轮取最优）：
+     * 单连接 1/2/4 流由 117.0/105.4/83.9 MB/s 抬到 139.6/119.7/98.3 MB/s（多流场景 +17%）。
+     * 取 1MB 为收益/内存折中（再大到 2MB 仅多 +8%）；代价是每条 h2 下载流最多多缓冲一个高水位量。
+     * 注意：单连接多流不扩展的根源是 h2 <em>连接级</em>流控窗口（由客户端通告，Chrome 15MB、Node 64KB），
+     * 代理无法代劳；本项只能把已有窗口用满。
+     */
+    static final int H2_DL_WM = Integer.getInteger("nx.proxy.h2DlWm", 1024);
+
     /** 回源出站连接的高速优化项（仅在 {@link #FAST_PATH} 生效）：按子开关逐项应用 */
     private static void applyFastPath(io.netty.bootstrap.Bootstrap b) {
         if (!FAST_PATH) return;
@@ -484,6 +498,10 @@ public final class ProxyCenter {
         p.addLast(new Http2MultiplexHandler(new ChannelInitializer<Channel>() {
             @Override
             protected void initChannel(Channel ch) {
+                if (H2_DL_WM > 0) {
+                    ch.config().setWriteBufferWaterMark(
+                            new WriteBufferWaterMark(H2_DL_WM * 512, H2_DL_WM * 1024));
+                }
                 ch.attr(IS_HTTPS).set(https);
                 ch.pipeline().addLast(new Http2StreamFrameToHttpObjectCodec(true),
                         new ProxyHandler(https, true));
