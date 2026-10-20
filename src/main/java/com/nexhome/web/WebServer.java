@@ -479,7 +479,14 @@ public final class WebServer {
         sslFactory.setSslContext(WebAccessConfig.buildSslContext(cert.certFile(), cert.keyFile()));
         sslFactory.setIncludeProtocols("TLSv1.2", "TLSv1.3");
         HttpConfiguration httpsConfig = new HttpConfiguration();
-        httpsConfig.addCustomizer(new SecureRequestCustomizer());
+        // 面板 HTTPS 连接器常被「代理中心」当作 HTTPS 回源后端：前置代理终结公网 TLS 后，
+        // 按 nginx 语义原样透传公网域名的 Host 头，而面板本地只挂载一张证书（未必覆盖该公网域名）。
+        // Jetty 的 SecureRequestCustomizer 默认开启 SNI Host Check，会校验「实际下发的本地证书」是否
+        // 匹配请求 Host，失配即回 400 Invalid SNI（错误页再被代理透传给浏览器）。回源链路下该校验无意义
+        // 且必然误杀，故关闭 sniHostCheck——公网证书与域名归属的校验交由前置代理负责。
+        SecureRequestCustomizer customizer = new SecureRequestCustomizer();
+        customizer.setSniHostCheck(false);
+        httpsConfig.addCustomizer(customizer);
         ServerConnector sslConnector = new ServerConnector(server,
                 new SslConnectionFactory(sslFactory, HttpVersion.HTTP_1_1.asString()),
                 new HttpConnectionFactory(httpsConfig));
