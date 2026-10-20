@@ -1081,6 +1081,23 @@ code {
 .log-cell-time { white-space: nowrap; color: var(--muted); font-size: 12px; }
 .log-cell-msg { word-break: break-all; }
 
+/* ---------- 内存诊断 ---------- */
+.diag-track {
+    height: 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, .08);
+    overflow: hidden;
+    min-width: 120px;
+}
+.diag-track i { display: block; height: 100%; border-radius: 4px; transition: width .4s ease; }
+.diag-val { white-space: nowrap; font-variant-numeric: tabular-nums; color: #eef2ff; }
+.diag-svg { width: 100%; height: 220px; display: block; background: rgba(9, 14, 32, .5); border: 1px solid var(--border); border-radius: 10px; }
+.diag-legend { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin-bottom: 8px; font-size: 12px; color: var(--text); }
+.diag-legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+.diag-dbars { display: flex; align-items: flex-end; gap: 1px; height: 60px; margin-bottom: 6px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+.diag-dbar { flex: 1; min-width: 2px; background: var(--grad-primary); border-radius: 2px 2px 0 0; opacity: .85; }
+.diag-analysis table { margin-bottom: 4px; }
+
 .pager { display: flex; gap: 8px; align-items: center; margin-top: 12px; justify-content: flex-end; }
 
 /* ---------- Docker 模块 ---------- */

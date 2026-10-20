@@ -17,6 +17,7 @@ import com.nexhome.module.stun.StunServerService;
 import com.nexhome.module.stun.StunService;
 import com.nexhome.module.stun.TrafficStats;
 import com.nexhome.module.wol.WolService;
+import com.nexhome.web.DiagService;
 import com.nexhome.web.SystemRoutes;
 import com.nexhome.web.WebServer;
 
@@ -59,6 +60,7 @@ public final class NexHomeApp {
             NotifyService.registerRoutes();
             MonitorService.registerRoutes();
             ProxyService.registerRoutes();
+            DiagService.registerRoutes();
 
             // 5. 启动业务调度与后台任务
             ProviderConfigService.init(); // 服务商凭证配置旧库迁移
@@ -71,6 +73,7 @@ public final class NexHomeApp {
             NotifyService.init();    // 通知日志定期清理
             MonitorService.init();   // 恢复可用性监控定时探测
             ProxyService.init();     // 初始化代理文件缓存并按开关拉起监听（在 CertService 之后，证书清单已就绪）
+            DiagService.init();      // 启动内存诊断周期采样（供诊断页做内存跳变与日志关联分析）
 
             // 6. 启动内置 Web 服务器（前端静态资源 + API 同端口，HTTPS/安全入口见系统设置）
             WebServer.start();
