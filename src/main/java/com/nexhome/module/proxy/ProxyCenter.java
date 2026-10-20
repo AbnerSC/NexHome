@@ -144,15 +144,17 @@ public final class ProxyCenter {
 
     /**
      * 代理专用池化分配器：默认池 direct arena = CPU×2（8 核即 16 arena）、chunk 默认 16MB
-     * （pageSize 8K << maxOrder 11）。大流量回源（如经代理的第三方测速）会把多个 direct arena
-     * 批量撑到 16MB chunk，且已用 chunk 归还 OS 前长期驻留 RSS，低内存容器里表现为
-     * 「测速后内存不回落」。收敛：direct arena 降为 CPU 数、chunk 改为 4MB（8K<<9），
-     * 撑幅按倍缩小、归还粒度更细；heap arena 维持默认（属 GC 堆、不额外占 RSS）。
-     * 仅挂到代理两端 channel（不改全局默认，WebServer/其他模块不受影响）。
+     * （pageSize 8K << maxOrder 11），且 useCacheForAllThreads 默认开启——每个 I/O 线程的本地缓存
+     * 即使空闲也长期持有 buffer。大流量回源（如经代理的第三方测速、面板自身经代理的测速流）会把
+     * 多个 direct arena 批量撑到 chunk 上限，已用 chunk 归还 OS 前长期驻留 RSS，低内存容器里表现为
+     * 「测速后内存不回落」（NMT 看不到这块，走的是 Unsafe.allocateMemory）。
+     * 收敛（面向家用低并发：48 站点 ~1k 请求/日）：arena 数降到 2、chunk 改 4MB（8K<<9）、
+     * 关闭线程本地缓存（buffer 用完即归 arena 而非滞留线程），大幅压低高水位驻留；
+     * 归还粒度更细。heap arena 属 GC 堆不额外占 RSS，同样收敛到 2。仅挂代理两端 channel，
+     * 不改全局默认（WebServer/其他模块不受影响）。
      */
     static final PooledByteBufAllocator ALLOCATOR = new PooledByteBufAllocator(true,
-            Runtime.getRuntime().availableProcessors() * 2, Runtime.getRuntime().availableProcessors(),
-            8192, 9, 512, 128, true, 0);
+            2, 2, 8192, 9, 256, 64, false, 0);
 
     // ==================== 生命周期 ====================
 

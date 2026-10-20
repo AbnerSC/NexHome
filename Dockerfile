@@ -51,11 +51,11 @@ COPY --from=build /build/target/nexhome.jar app.jar
 # 表现为 RSS 涨上去不回落（堆与 NIO 直接缓冲均无变化）。限成 2 个 arena 后 freed 内存集中在堆顶可被 trim 回收。
 ENV MALLOC_ARENA_MAX=2
 
-# JVM 内存自适应：堆上限按容器内存限制（cgroup；裸机运行时为物理总内存）的 50% 自动计算
+# JVM 内存自适应：堆上限按容器内存限制（cgroup；裸机运行时为物理总内存）的 40% 自动计算
 # （-XX:MaxRAMPercentage），无需固定 -Xmx，低配/高配环境均可自适应；
-# 剩余 ~50% 留给 Metaspace(≤128m)/CodeCache(≤64m)/线程栈等非堆内存；
+# 剩余 ~60% 留给 Metaspace(≤128m)/CodeCache(≤64m)/线程栈等非堆内存；
 # 低内存调优：Serial GC + 小线程栈（ip2region 已用 VIndexCache 按需读文件，无需大堆）
 # NativeMemoryTracking=summary：开启轻量原生内存跟踪，供「内存诊断」页拆分堆外（Netty 池化等）占用；仅记类别汇总，开销约 5% 内、无额外线程
-ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-XX:MaxRAMPercentage=50.0", "-XX:NativeMemoryTracking=summary", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
+ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-XX:MaxRAMPercentage=40.0", "-XX:NativeMemoryTracking=summary", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
 
 EXPOSE 8090
