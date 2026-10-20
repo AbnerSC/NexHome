@@ -422,6 +422,24 @@ public final class ProxyCenter {
     static final int FP_WMARK_HIGH = Integer.getInteger("nx.proxy.wmHigh", 0); // <=0 不改（保留 Netty 默认 32K/64K）
     static final int FP_WMARK_LOW = Integer.getInteger("nx.proxy.wmLow", 0);
 
+    /**
+     * 前端 HTTP/2 的本地流控窗口（字节）。Netty 默认取 RFC 基线 65535，而 h2 窗口是信用制：
+     * 本代理只在读批次里放开窗口（{@code ProxyHandler} 的 autoRead 泵，与 Netty 一致——
+     * {@code WINDOW_UPDATE} 仅在 {@code AbstractHttp2StreamChannel.beginRead()} 发出），于是单流上传
+     * 稳态速率被钉在「窗口 / RTT」。同机应用层延迟中继实测（16MB PUT，后端收满、均返回 200）：
+     * <ul>
+     *   <li>往返 40ms：64KB→0.6 MB/s（16MB 耗 26.8 秒）、512KB→6.8、1MB→10.9、2MB→18.1；</li>
+     *   <li>往返 80ms：512KB→4.3 MB/s（速率随 RTT 反比衰减，印证窗口是硬上限）；</li>
+     *   <li>同机回环（往返≈0）：64KB 亦能跑 68 MB/s，故本项在低延迟链路无可测差异。</li>
+     * </ul>
+     * 连接级窗口由 Netty 按「基线 + 2×增量」自动放大（{@code Http2FrameCodec#tryExpandConnectionFlowControlWindow}），
+     * 故单连接在途数据受控于约 3 倍此值。代价：每条未被消费的流最多缓冲一个窗口量（直内存），
+     * 慢回源场景按并发流数线性增长；取 1MB 是在「高 RTT 上传提速 18 倍」与
+     * {@code MaxDirectMemorySize=64m} 之间取的中位（单连接在途上限约 3MB）；
+     * 低延迟/内存紧张链路可 {@code -Dnx.proxy.h2StreamWin=65535} 回退 Netty 默认，0 同义。
+     */
+    static final int H2_STREAM_WINDOW = Integer.getInteger("nx.proxy.h2StreamWin", 1024 * 1024);
+
     /** 回源出站连接的高速优化项（仅在 {@link #FAST_PATH} 生效）：按子开关逐项应用 */
     private static void applyFastPath(io.netty.bootstrap.Bootstrap b) {
         if (!FAST_PATH) return;
@@ -456,7 +474,13 @@ public final class ProxyCenter {
                 super.userEventTriggered(ctx, evt);
             }
         });
-        p.addLast(Http2FrameCodecBuilder.forServer().build());
+        Http2FrameCodecBuilder h2 = Http2FrameCodecBuilder.forServer();
+        if (H2_STREAM_WINDOW > 0) {
+            // defaultSettings() 就是 builder 原本的初始设置（见 AbstractHttp2ConnectionHandlerBuilder），
+            // 此处只改窗口，不动 maxConcurrentStreams / maxHeaderListSize 等既有通告
+            h2.initialSettings(Http2Settings.defaultSettings().initialWindowSize(H2_STREAM_WINDOW));
+        }
+        p.addLast(h2.build());
         p.addLast(new Http2MultiplexHandler(new ChannelInitializer<Channel>() {
             @Override
             protected void initChannel(Channel ch) {

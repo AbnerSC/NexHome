@@ -41,7 +41,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * 单请求/单流转发处理器（HTTP/1.1 连接与 HTTP/2 流复用同一实现）。
  * <p>
- * HTTP/1.1 连接处理期间暂停读取（autoRead=false）实现请求串行化，避免流水线请求内容误转发；
+ * 事务进行期间一律暂停前端自动读取（autoRead=false）：
+ * h1 借此实现请求串行化，避免流水线请求内容误转发；
+ * h2 借此形成流控背压——流的本地窗口只在 {@code beginRead()} 时以 WINDOW_UPDATE 放开，
+ * 不 read 即不放开窗口，客户端被流控钉住，请求体不会在代理内无界堆积。
+ * 因此两协议的上传方向都由「channelReadComplete 一次 flush + 按需续读」同一套泵驱动。
+ * <p>
  * Upgrade 请求走原始字节隧道；其余走消息级中继（头部改写 + 内容流式回写 + 缓存旁路落盘）。
  */
 final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
@@ -307,7 +312,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         return false;
     }
 
-    /** 消息级中继：改写请求头后连后端，请求体流式转发；h1 期间暂停读取实现串行 */
+    /** 消息级中继：改写请求头后连后端，请求体流式转发；事务期间暂停前端读取 */
     private void beginRelay(ChannelHandlerContext ctx, ProxySite site, HttpRequest req,
                             String upath, String pathQuery, String peerIp, ProxyCenter.SiteStats st,
                             String cacheKey, boolean methodGet) {
@@ -316,7 +321,9 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         st.active.incrementAndGet();
         boolean keepAlive = !isH2 && HttpUtil.isKeepAlive(req);
         ProxyAdvanced adv = site.adv();
-        if (!isH2) ctx.channel().config().setAutoRead(false);
+        // h1：串行化；h2：靠「不 read 就不发 WINDOW_UPDATE」把背压顶回客户端，
+        // 否则回源建连/TLS 握手期间到达的请求体会全量堆在代理内（堆与池缓冲双双膨胀）
+        ctx.channel().config().setAutoRead(false);
 
         // 构造回源头：剥离逐跳头与 Expect（对齐 nginx：Expect 不转发后端，也不代回 100），
         // 追加 XFF/XFP/XFH 与自定义头改写
@@ -335,6 +342,13 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
             // 否则后端按连接关闭定界等待 body 而挂起不响应
             if (HttpUtil.isTransferEncodingChunked(req)) {
                 HttpUtil.setTransferEncodingChunked(fwd, true);
+            } else if (isH2 && HttpUtil.getContentLength(req, -1) < 0
+                    && !HttpMethod.GET.equals(req.method()) && !HttpMethod.HEAD.equals(req.method())) {
+                // h2 没有 chunked 概念，请求体由 END_STREAM 定界，客户端常不带 content-length
+                // （浏览器 fetch(stream, {duplex:'half'}) 即典型）。转发到 h1 后端时若既无 CL 又无 TE，
+                // 后端只能按「连接关闭」定界 → 永远等不到体结束，挂到读超时（实测 30 秒无响应）。
+                // 故按 h1 语义重新声明 chunked，由请求体收尾的 LastHttpContent 写终止块定界。
+                HttpUtil.setTransferEncodingChunked(fwd, true);
             }
         }
         fwd.headers().set("X-Forwarded-Proto", https ? "https" : "http");
@@ -346,12 +360,11 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
 
         // 捕获本次事务引用：流水线重放会推进 tx 字段，迟到的连接回调不得误伤后续事务
         final Tx t = tx;
-        if (!isH2) {
-            // autoRead=false 后 Netty 会撤走 OP_READ 兴趣，客户端在事务进行中提前断开（abort）
-            // 就无人唤醒，事务与两端 fd 悬挂到后端读超时才回收；此处显式保持一次读兴趣，
-            // 以便感知 FIN/RST 与流水线后续请求（后者进积压队列，不在此直接处理）
-            ctx.read();
-        }
+        // autoRead=false 后 Netty 会撤走读兴趣（h1 撤 OP_READ、h2 停发 WINDOW_UPDATE），
+        // 客户端在事务进行中提前断开（abort / RST_STREAM）就无人唤醒，
+        // 事务与两端 fd 悬挂到后端读超时才回收；此处显式保持一次读兴趣，
+        // 以便感知断开与流水线后续请求（后者进积压队列，不在此直接处理）
+        ctx.read();
         // 关键：回源可用后再写回源请求。跨事件循环时，连接/流未就绪时的预写与 flush
         // 不会被可靠地下发到 socket（表现为后端收不到完整请求、响应永远不到达），
         // 故统一放到就绪回调内，此时 backend channel 已 active 且可写。
@@ -768,13 +781,15 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
         // 上传方向批量收尾：把本读批次累积的请求体一次性 flush 给后端，并在后端仍可写时续拉下一批
         // （后端不可写＝写缓冲积压，暂停续读，由 BackendRelay.channelWritabilityChanged 恢复，形成端到端流控）
         Tx t = tx;
-        if (!isH2 && t != null && !t.done.get() && t.backendReady && t.backend != null && !t.requestBodyDone) {
+        if (t != null && !t.done.get() && t.backendReady && t.backend != null && !t.requestBodyDone) {
+            // h2 同样必须在此 flush：曾经此处带 !isH2 守卫，导致 h2 上传的请求体除收尾外永不刷出，
+            // 后端等不到体、客户端被流控钉死（实测 32MB 上传 11 秒仅下发 0.1MB）
             t.backend.flush();
             if (t.backend.isWritable()) ctx.read();
         }
         // 等待后端响应阶段保持读兴趣（见 beginRelay）：autoRead=false 下若不做一次 read，
         // 前端提前断开无法感知，事务悬挂至后端读超时才回收（请求体上传阶段仍由可写回调驱动续读）
-        if (!isH2 && t != null && !t.done.get() && t.requestBodyDone
+        if (t != null && !t.done.get() && t.requestBodyDone
                 && !ctx.channel().config().isAutoRead() && ctx.channel().isActive()) {
             ctx.read();
         }
