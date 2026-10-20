@@ -662,6 +662,82 @@ code {
 .ph-ref > summary b { color: var(--cyan); font-weight: 600; }
 .ph-ref-body { padding: 2px 12px 12px; }
 
+/* ---------- STUN 任务表单：勾选列表（ESA 解析记录 / 回源规则 / 通知渠道共用） ----------
+   原样式是 JS 里的内联字符串，既做不了悬停与选中反馈，又被上方 `.field input` 的
+   width:100%/padding 命中行内复选框 —— 勾选框被拉伸撑满整行、文字挤到最右侧。
+   这里收敛为类名并显式复位复选框尺寸，每行按「勾选框 + 名称与说明 + 右侧状态」三段排布。 */
+.pick-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pick-hint { font-size: 12px; color: var(--muted); }
+
+.pick-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+
+/* 选择器多带一层 .pick-list：抬高到 (0,2,0) 以压过 `.field label` 的 display:block/次要灰/下边距 */
+.pick-list .pick-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--code-bg);
+    font-size: 12.5px;
+    color: var(--text);   /* 覆盖 .field label 的次要灰：勾选行的名称是正文信息，不该整行发暗 */
+    margin: 0;            /* 覆盖 .field label 的下边距，行间距统一交给 .pick-list 的 gap */
+    cursor: pointer;
+    transition: border-color .18s, background .18s, box-shadow .18s;
+}
+.pick-list .pick-row:hover { border-color: var(--border-strong); background: rgba(109, 139, 255, .1); }
+
+/* 复选框必须显式复位：否则会继承 .field input 的 width:100% 与内边距，把整行布局顶乱 */
+.pick-list .pick-row > input[type="checkbox"] {
+    flex: 0 0 auto;
+    width: 15px;
+    height: 15px;
+    padding: 0;
+    margin: 0;
+}
+
+/* 已勾选项：霓虹青描边 + 左侧指示条，一眼看出这条会被写入 */
+.pick-list .pick-row:has(> input:checked) {
+    border-color: rgba(34, 211, 238, .45);
+    background: rgba(34, 211, 238, .08);
+    box-shadow: inset 2px 0 0 var(--cyan);
+}
+
+.pick-main { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pick-name { font-weight: 600; color: #eef2ff; word-break: break-all; }
+.pick-desc { font-size: 11.5px; color: var(--muted); word-break: break-all; }
+.pick-side { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; }
+/* 通知渠道行右侧的类型徽标按行高收紧 */
+.pick-side .badge { font-size: 11px; padding: 2px 8px; }
+
+/* 行尾状态标：未与线上核对（中性）/ 线上未找到、渠道已停用已删除（警示） */
+.pick-tag {
+    font-size: 11px;
+    line-height: 1.6;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: rgba(148, 163, 200, .1);
+    color: var(--muted);
+    white-space: nowrap;
+}
+.pick-tag.err {
+    border-color: rgba(251, 113, 133, .4);
+    background: rgba(251, 113, 133, .12);
+    color: #fda4af;
+}
+
+/* 空态 / 加载态：虚线占位框，尺寸贴近勾选行，拉取前后不跳版 */
+.pick-empty {
+    padding: 10px 12px;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, .02);
+    font-size: 12px;
+    color: var(--muted);
+}
+
 /* ---------- STUN Webhook 编辑行：方法+地址一行，请求头/体/参数与调用状态纵向堆叠 ----------
    结构与尺寸统一收敛到类名，替代原先散落在 JS 里的内联样式 */
 .wh-row {

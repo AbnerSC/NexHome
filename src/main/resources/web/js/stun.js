@@ -118,9 +118,15 @@ function esaCollect(sel) {
         .map(i => ({ id: i.dataset.id, name: i.dataset.name }));
 }
 
-/** 表单内 ESA 勾选行的基础样式 */
-const ESA_ROW = 'display:flex;gap:8px;align-items:center;padding:6px 8px;margin-bottom:4px;'
-    + 'border:1px solid var(--border);border-radius:6px;background:var(--code-bg);font-size:12px;cursor:pointer';
+/** 勾选行统一结构（外观见 style.css .pick-row）：复选框 + 名称/说明 + 右侧状态标，
+ *  ESA 解析记录、回源规则与通知渠道三处共用；side 传 HTML（徽标/状态胶囊） */
+function pickRow(o) {
+    return `<label class="pick-row">
+        <input type="checkbox" data-id="${esc(String(o.id))}" data-name="${esc(o.name)}" ${o.on ? 'checked' : ''}>
+        <span class="pick-main"><span class="pick-name">${esc(o.name)}</span>${o.desc ? `<span class="pick-desc">${esc(o.desc)}</span>` : ''}</span>
+        ${o.side ? `<span class="pick-side">${o.side}</span>` : ''}
+      </label>`;
+}
 
 /** 手动立即同步一次 ESA，弹窗展示逐条明细（记录值 / 回源端口的 from→to 与结果） */
 window.stunEsaSync = async id => {
@@ -210,20 +216,19 @@ window.stunForm = async (id) => {
     let notifyChannels = [];
     try { notifyChannels = await api('GET', '/api/notify/channels'); } catch (e) { /* ignore */ }
     const notifyChecked = new Set(notifySnapshot(t.notify_channels));
-    const notifyList = notifyChannels.map(c => `
-      <label style="${ESA_ROW}">
-        <input type="checkbox" data-id="${c.id}" ${notifyChecked.has(String(c.id)) ? 'checked' : ''}>
-        <span><b>${esc(c.name)}</b> · ${notifyTypeBadge(c.type)}${c.enabled === 1 ? ''
-            : '<b style="color:var(--red)">　渠道已停用（不会发送）</b>'}</span>
-      </label>`).join('')
+    // 类型徽标与「已停用」状态标统一落在行右侧，行内只留渠道名（外观共用 .pick-row）
+    const notifySide = c => notifyTypeBadge(c.type)
+        + (c.enabled === 1 ? '' : '<span class="pick-tag err">已停用 · 不会发送</span>');
+    const notifyList = notifyChannels.map(c => pickRow({
+        id: c.id, name: c.name, side: notifySide(c), on: notifyChecked.has(String(c.id))
+    })).join('')
         // 快照中已被删除的渠道：保留可取消（与 ESA 勾选快照同样处理），投递时后端自动跳过
         + [...notifyChecked]
             .filter(id => !notifyChannels.some(c => String(c.id) === id))
-            .map(id => `
-      <label style="${ESA_ROW}">
-        <input type="checkbox" data-id="${esc(id)}" checked>
-        <span><b>渠道 #${esc(id)}</b><b style="color:var(--red)">　已删除（不会发送，请取消勾选或改选其他渠道）</b></span>
-      </label>`).join('');
+            .map(id => pickRow({
+                id, name: '渠道 #' + id, desc: '已从「告警通知」页删除',
+                side: '<span class="pick-tag err">已删除 · 不会发送</span>', on: true
+            })).join('');
     modal(id ? '编辑穿透任务' : '新增穿透任务', `
       <form id="stunFormEl" class="form-grid">
         <div class="field"><label>任务名称 <b>*</b></label><input name="name" required value="${esc(t.name || '')}"></div>
@@ -270,18 +275,18 @@ window.stunForm = async (id) => {
               <div id="esaTip" class="small muted" style="margin-top:5px"></div>
             </div>
             <div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <div class="pick-head">
                 <button type="button" class="btn small" onclick="stunEsaLoadRecords()">拉取 DNS 解析记录</button>
-                <span class="small muted">勾选需要写入映射 IP 的记录（仅 A / AAAA 生效）</span>
+                <span class="pick-hint">勾选需要写入映射 IP 的记录（仅 A / AAAA 生效）</span>
               </div>
-              <div id="esaRecList" style="margin-top:6px"></div>
+              <div id="esaRecList" class="pick-list"></div>
             </div>
             <div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <div class="pick-head">
                 <button type="button" class="btn small" onclick="stunEsaLoadRules()">拉取回源规则</button>
-                <span class="small muted">勾选需要写入映射端口的回源规则（仅 TCP 任务生效）</span>
+                <span class="pick-hint">勾选需要写入映射端口的回源规则（仅 TCP 任务生效）</span>
               </div>
-              <div id="esaRuleList" style="margin-top:6px"></div>
+              <div id="esaRuleList" class="pick-list"></div>
             </div>
             <div class="small muted" style="line-height:1.8;padding:10px;background:var(--code-bg);border:1px solid var(--border);border-radius:8px">
               只更新<b>已勾选</b>的解析记录（记录值）与回源规则（回源 HTTPS 端口），<b>不会新增或删除</b>云端配置；
@@ -344,8 +349,8 @@ window.stunForm = async (id) => {
             </select>
             <span class="small muted">渠道（Webhook / 邮件 / 钉钉机器人）在「告警通知」页集中维护</span>
           </div>
-          <div id="notifyCfg" class="${t.notify_enabled === 1 ? '' : 'hidden'}" style="margin-top:10px">
-            ${notifyList || '<div class="small muted">暂无通知渠道，请先到「告警通知」页新增渠道。</div>'}
+          <div id="notifyCfg" class="pick-list ${t.notify_enabled === 1 ? '' : 'hidden'}">
+            ${notifyList || '<div class="pick-empty">暂无通知渠道，请先到「告警通知」页新增渠道。</div>'}
           </div>
           <div class="small muted" style="margin-top:6px;line-height:1.7">
             通知正文包含任务名、协议、内网目标、外网映射地址与 NAT 类型；投递结果写入「告警通知」页的
@@ -364,12 +369,8 @@ window.stunForm = async (id) => {
     const esaVal = sel => { const el = $(sel); return el ? el.value : ''; };
     const esaTip = html => { const el = $('#esaTip'); if (el) el.innerHTML = html; };
 
-    /** 单行勾选项：tag 为需要直出样式的尾标提示（线上未找到 / 未核对） */
-    const esaPickRow = (id, name, desc, tag, on) => `
-      <label style="${ESA_ROW}">
-        <input type="checkbox" data-id="${esc(String(id))}" data-name="${esc(name)}" ${on ? 'checked' : ''}>
-        <span><b>${esc(name)}</b>${desc ? `<span class="muted"> · ${esc(desc)}</span>` : ''}${tag || ''}</span>
-      </label>`;
+    /** 单行勾选项：tag 为右侧状态标（线上未找到 / 未核对） */
+    const esaPickRow = (id, name, desc, tag, on) => pickRow({ id, name, desc, side: tag, on });
 
     /** 渲染记录勾选列表：线上记录 + 快照中线上已不存在的项（保留可取消，避免默认丢掉用户的勾选） */
     const renderEsaRecs = () => {
@@ -384,10 +385,10 @@ window.stunForm = async (id) => {
         });
         const orphans = [...recChecked].filter(([id]) => !seen.has(id)).map(([id, name]) => esaPickRow(id, name,
             '快照 ID ' + id,
-            esaRecOnline ? '<b style="color:var(--red)">　线上未找到（只更新不新增）</b>' : '<span class="muted">　未与线上核对</span>',
+            esaRecOnline ? '<span class="pick-tag err">线上未找到 · 只更新不新增</span>' : '<span class="pick-tag">未与线上核对</span>',
             true));
         box.innerHTML = rows.concat(orphans).join('')
-            || '<div class="small muted">尚未拉取。可点击“拉取 DNS 解析记录”后勾选。</div>';
+            || '<div class="pick-empty">尚未拉取。可点击“拉取 DNS 解析记录”后勾选。</div>';
     };
 
     /** 渲染回源规则勾选列表（全局回源配置不适用规则端口同步，不列出） */
@@ -404,10 +405,10 @@ window.stunForm = async (id) => {
         });
         const orphans = [...ruleChecked].filter(([id]) => !seen.has(id)).map(([id, name]) => esaPickRow(id, name,
             '快照 ID ' + id,
-            esaRuleOnline ? '<b style="color:var(--red)">　线上未找到（只更新不新增）</b>' : '<span class="muted">　未与线上核对</span>',
+            esaRuleOnline ? '<span class="pick-tag err">线上未找到 · 只更新不新增</span>' : '<span class="pick-tag">未与线上核对</span>',
             true));
         box.innerHTML = rows.concat(orphans).join('')
-            || '<div class="small muted">尚未拉取。可点击“拉取回源规则”后勾选（UDP 任务不会改动回源端口）。</div>';
+            || '<div class="pick-empty">尚未拉取。可点击“拉取回源规则”后勾选（UDP 任务不会改动回源端口）。</div>';
     };
 
     window.stunEsaToggle = v => $('#esaSyncCfg').classList.toggle('hidden', v !== 'true');
@@ -461,7 +462,7 @@ window.stunForm = async (id) => {
         const site = esaVal('#fEsaSite');
         if (!site) { toast('请先选择 ESA 站点（可点“拉取站点”）', 'err'); return; }
         const box = $('#esaRecList');
-        box.innerHTML = '<div class="small muted">解析记录加载中…</div>';
+        box.innerHTML = '<div class="pick-empty">解析记录加载中…</div>';
         try {
             esaRecOnline = (await api('POST', '/api/stun/esa/records',
                 { provider_config_id: esaVal('#fEsaCred'), site_id: site })).records || [];
@@ -476,7 +477,7 @@ window.stunForm = async (id) => {
         const site = esaVal('#fEsaSite');
         if (!site) { toast('请先选择 ESA 站点（可点“拉取站点”）', 'err'); return; }
         const box = $('#esaRuleList');
-        box.innerHTML = '<div class="small muted">回源规则加载中…</div>';
+        box.innerHTML = '<div class="pick-empty">回源规则加载中…</div>';
         try {
             esaRuleOnline = (await api('POST', '/api/stun/esa/origin-rules',
                 { provider_config_id: esaVal('#fEsaCred'), site_id: site })).rules || [];

@@ -56,6 +56,8 @@ ENV MALLOC_ARENA_MAX=2
 # 剩余 ~60% 留给 Metaspace(≤128m)/CodeCache(≤64m)/线程栈等非堆内存；
 # 低内存调优：Serial GC + 小线程栈（ip2region 已用 VIndexCache 按需读文件，无需大堆）
 # NativeMemoryTracking=summary：开启轻量原生内存跟踪，供「内存诊断」页拆分堆外（Netty 池化等）占用；仅记类别汇总，开销约 5% 内、无额外线程
-ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-XX:MaxRAMPercentage=40.0", "-XX:NativeMemoryTracking=summary", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
+# MaxDirectMemorySize=64m：封顶堆外直接内存（默认等于堆上限，会放任 Netty 池化 arena 一路撑高不回落）；
+# 家用代理每连接 64KB 高水位背压，64MB 足以容纳上千路并发在途，超限会触发 Netty 回收复用而非继续涨 RSS
+ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-XX:MaxRAMPercentage=40.0", "-XX:NativeMemoryTracking=summary", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-XX:MaxDirectMemorySize=64m", "-jar", "app.jar"]
 
 EXPOSE 8090
