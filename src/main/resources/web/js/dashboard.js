@@ -285,11 +285,11 @@ async function renderDashboard() {
             <div class="dash-visit-sub">每日总访问次数</div>
             <div class="dash-visit-chart" id="dashVisitChart"></div>
           </div>
-          <div>
+          <div class="dash-visit-top dash-top-sites">
             <div class="dash-visit-sub">网站访问 TOP10</div>
             ${topList(visits.topSites)}
           </div>
-          <div>
+          <div class="dash-visit-top dash-top-regions">
             <div class="dash-visit-sub">来源地区 TOP10</div>
             ${topList(visits.topRegions)}
           </div>
@@ -317,14 +317,16 @@ async function renderDashboard() {
       </div>
       <div class="tip">数据每 15 秒自动刷新一次；点击顶部指标卡可跳转到对应模块查看详情。</div>`;
     drawVisitChart($('#dashVisitChart'), visitDays);
-    // TOP10 名称等宽：以两列全部名称中最长为准统一列宽，比例条起点与次数纵向对齐
-    // （scrollWidth 含被 ellipsis 截断的完整文本宽；超出 max-width 时全体一致截断，仍保持对齐）
-    const nameEls = $$('.dash-top-name');
-    if (nameEls.length) {
+    // TOP10 名称等宽：两列各自独立测量对齐——网站域名长、地区城市名短，
+    // 各按本列最长名称定宽（受 .dash-top-sites / .dash-top-regions 的 max-width 约束），互不牵制
+    // （scrollWidth 含被 ellipsis 截断的完整文本宽；超出 max-width 时本列全体一致截断，仍保持对齐）
+    $$('.dash-visit-top').forEach(col => {
+        const nameEls = Array.from(col.querySelectorAll('.dash-top-name'));
+        if (!nameEls.length) return;
         let maxW = 0;
         nameEls.forEach(el => { maxW = Math.max(maxW, el.scrollWidth); });
-        nameEls.forEach(el => { el.style.width = maxW + 1 + 'px'; });  // +1 防亚像素取整误差深出省略号
-    }
+        nameEls.forEach(el => { el.style.width = maxW + 1 + 'px'; });  // +1 防亚像素取整误差溢出省略号
+    });
     setRefresh(renderDashboard, 15000);
 }
 

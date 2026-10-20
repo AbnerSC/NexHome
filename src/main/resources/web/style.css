@@ -1259,10 +1259,14 @@ th.docker-sort:hover { color: var(--cyan); text-shadow: var(--glow-cyan); }
     display: inline-flex; align-items: center; justify-content: center;
 }
 .dash-top-item:nth-child(1) .dash-top-rank { background: rgba(52, 211, 153, .18); color: #6ee7b7; }
-.dash-top-name { flex-shrink: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.dash-top-name { flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+/* 两列名称宽度分别配置：网站域名单较长给更宽上限，地区城市名短收窄上限（实际宽度由 JS 按本列最长名称自适应） */
+.dash-top-sites .dash-top-name { max-width: 60%; }
+.dash-top-regions .dash-top-name { max-width: 34%; }
 .dash-top-bar { flex: 1; height: 6px; border-radius: 3px; background: rgba(255, 255, 255, .06); overflow: hidden; }
 .dash-top-bar i { display: block; height: 100%; border-radius: 3px; background: var(--grad-primary); box-shadow: 0 0 6px rgba(52, 211, 153, .5); }
-.dash-top-hits { flex-shrink: 0; color: var(--muted); font-variant-numeric: tabular-nums; }
+/* 次数列定宽 + 右对齐：预留 7 位数（最大 9,999,999）宽度，长短不一时右边缘仍对齐成一条线 */
+.dash-top-hits { flex-shrink: 0; width: 68px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* ---------- 总览：网络测速 ---------- */
 .dash-speed-grid {
