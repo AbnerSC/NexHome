@@ -38,9 +38,12 @@
 脚手架均在 `D:\tmp\nexhome-upbench\`：
 
 ```
-node bench.mjs  <sizeMB> <h1|h2|both>   # 吞吐对比；RTT_MS=40 走延迟中继，H2WIN=N 覆盖流控窗口
-node regress.mjs                        # 13 项针对性回归（报告 regress-report.json）
+node bench.mjs  <sizeMB> <h1|h2|both>   # 上传吞吐对比；RTT_MS=40 走延迟中继，H2WIN=N 覆盖流控窗口
+node regress.mjs                        # 16 项针对性回归（报告 regress-report.json）
 node mem.mjs  <streams> <mbEach>        # 慢后端停顿下的内存上界，H2WIN=N 对比不同窗口
+node sp-dl.mjs                          # 线上下载分诊：direct / proxy-h1 / proxy-h2；SP_SIZE SP_WIN SP_CONNS
+node dl-local.mjs                       # 本地下载复现：ONLY=h1,h2,h2x GRAD=1,2,4 ROUNDS=3 SEC=6 JVM_ARGS
+java -cp target/nexhome.jar AlpnProbe.java   # 验证站点 frontProtocol 对 ALPN 的实际影响（需 data/certs/task-9001 证书）
 ```
 
 - mock 后端 `127.0.0.1:19001`：统计收到的请求体字节数，收满才响应
@@ -158,7 +161,8 @@ Netty `Http2FrameCodecBuilder.forServer()` 的本地窗口取 RFC 基线 **65535
 | 2 | B | `beginRelay()` 对 h2 同样 `setAutoRead(false)` + 显式 `ctx.read()`（h2 下即"不 read 就不放开窗口"的真背压） | **已落地** |
 | 3 | C | 前端 h2 本地流控窗口默认抬到 **1 MB**（`ProxyCenter.installHttp2`，`-Dnx.proxy.h2StreamWin` 可调，0 或 65535 回退 Netty 默认）；连接级窗口由 Netty 按“基线 + 2×增量”自动放大 | **已落地 + 已 A/B** |
 | 4 | 定界 | h2 前端无 `content-length` 时回源声明 chunked（见 §7） | **已落地** |
-| 5 | 回归 | `regress.mjs` 13 项：GET 无体、定长/chunked 上传、h1 流水线、h2 同连接 4 流并发、h2 并发下载、后端连不上、上传中途断开 | **13/13 通过** |
+| 5 | 下载 | 站点级前端协议开关 `frontProtocol`（h2 / http1，ALPN 只通告 http/1.1） | **已落地 + ALPN 实测** |
+| 6 | 回归 | `regress.mjs` 16 项：GET 无体、定长/chunked 上传、h1 流水线、h2 同连接 4 流并发、h2 并发下载、后端连不上、上传中途断开、frontProtocol 往返 | **16/16 通过** |
 
 已落地改动的复现验证（`node bench.mjs 64 both`，同机环回）：
 
@@ -246,30 +250,55 @@ if (HttpUtil.isTransferEncodingChunked(req)) {
 - **代理 h1 与直连基线持平** → 代理的 TLS / 回源 / 拷贝路径不是瓶颈；
 - **h2 只能到一半且并发越高越差** → 卡在本应共享的维度上；
 - 把客户端通告的**流级**窗口从 64KB 抬到 8MB，吞吐纹丝不动（55.3→55.5）→ 排除流级窗口；
-- 本地环回对照（`dl-local.mjs`，512MB 流式）：**h2 单连接 1 流 = 107 MB/s 与 h1 持平**，而 **N 条独立 h2 连接（h2x）也与 h1 持平**，只有**单连接内多流**不扩展 → 瓶颈是 **h2 连接级流控窗口**（由客户端通告：Chrome 15MB、Node 64KB），代理无法代劳。
+- 本地环回对照（`dl-local.mjs`）在**干净基线**下：h2 单连接 1 流即可跑 **320~385 MB/s**（与 h1 持平甚至更高），把 Node 的 `maxSessionMemory` 从默认 16 抬到 256 无变化（385→388）→ **代理的 h2 下载路径本身没有吞吐缺陷**，也排除「连接级窗口卡住」这一说；但同机环回带宽无限、往返≈0，**根本复现不出线上那 40% 的差距**。
 
-### 8.2 已落地：`-Dnx.proxy.h2DlWm`（h2 子流出站写水位）
+> 更正：本节初次排查时，本地梯度跑在「16 路 h1 狂拉」之后，基线被前置负载污染（当时记为 h2 1 流仅 107 MB/s），
+> 并据此得出「瓶颈是客户端通告的 h2 连接级窗口、代理无法代劳」的结论。该结论**不成立，已撤回**。
+> 线上 h2 与 h1 的差距成因**尚未定位**（候选：Chrome 按自身观测的 BDP 自调流级窗口，未涨到足以喂满带宽），
+> 但「h1 经代理持平直连」是硬实测数据 → 直接提供开关让站点走 h1（见 8.4）。
 
-`BackendRelay` 在 `front.channel().isWritable()` 为假时停掉后端读；而 h2 子流的可写性恢复条件是「写缓冲回落到低水位以下 且 父连接可写」（`AbstractHttp2StreamChannel` L277）。Netty 默认 32K/64K 对 h2 出站太敏感——**窗口还没用满就先停了后端读**。抬高子流水位后代理内常备待发数据，窗口一开即发满；也能让 Chrome 的窗口 auto-tuning 更快观察到高带宽而涨窗。
+### 8.2 试过的旋钮：`-Dnx.proxy.h2DlWm`（h2 子流出站写水位）→ 默认关闭
 
-本地 3 轮取最优（单连接 1/2/4 流，MB/s）：
+机理上值得试：`BackendRelay` 在 `front.channel().isWritable()` 为假时停掉后端读，而 h2 子流的可写性恢复条件是「写缓冲回落到低水位以下 且 父连接可写」（`AbstractHttp2StreamChannel` L277），Netty 默认 32K/64K 对 h2 出站偏敏感。
+
+**实测无效，默认已回退为 0（不覆盖 Netty 默认）**。每轮前静默 8 秒取干净基线，3 轮取最优（单连接 1/2/4 流，MB/s）：
 
 | 子流写水位（高） | 1 流 | 2 流 | 4 流 |
 |---|---|---|---|
-| 0（Netty 默认 32K/64K） | 117.0 | 105.4 | 83.9 |
-| 512 KB | 128.9 | 113.1 | 93.8 |
-| 2048 KB | 139.6 | 119.7 | 98.3 |
+| 0（Netty 默认 32K/64K） | 348.0 / 321.9 | 330.6 / 321.8 | 252.6 / 251.9 |
+| 1024 KB | 382.1 / 379.4 | 317.3 / 317.6 | 236.7 / 271.6 |
 
-取 **1024 KB** 为默认（再大到 2MB 仅多 +8%，而每条 h2 下载流要多缓冲一个高水位量）。收益幅度真实但温和（+12~17%），来不了决定性变化——决定性的限制在客户端通告的连接级窗口。
+差异在 ±15% 内且**方向不一致**（1 流略升、2 流略降）。线上部署 1MB 后 Chrome 四次实测下载 **520 / 590 / 601 / 657 Mbit/s**，与未部署时的 605 无可测差异。旋钮保留，供受限带宽 / 高往返的下载链路自行试值。
 
 ### 8.3 未采纳的候选与理由
 
 - **抬 `maxFrameSize`**：无效。DATA 帧上限受**接收方**通告的 `SETTINGS_MAX_FRAME_SIZE`（Chrome/Node 均 16384），服务端抬自己的通告只影响入站。
-- **多后端连接并行拉同一响应**：只提升回源侧，不改变前端 h2 窗口限制，无用。
-- **站点级强制 http/1.1（ALPN 不通告 h2）**：根据 8.1 实测，这是唯一能让 h2 下载追平直连的手段（h1 经代理已持平直连），代价是失去多路复用，对小资源密集的普通站点是负优化 → 待产品决策。
+- **多后端连接并行拉同一响应**：只提升回源侧，不改变前端 h2 的窗口限制，无用。
+- ~~站点级强制 http/1.1~~ → **已实现**，见 8.4。
+
+### 8.4 已落地：站点级前端协议开关 `frontProtocol`
+
+既然「h1 经代理 ≈ 直连、h2 经代理 ≈ 一半」是线上硬数据，就直接把选择权交给站点：
+
+- **字段**：`advanced.frontProtocol`，取 `h2`（默认）或 `http1`；面板「高级配置」页签有对应下拉，`/api/proxy/defaults` 同步返回默认值（前后端一致）。
+- **实现**：`SslStore.buildContext(taskId, h2)` 在 `http1` 时 ALPN **只通告 `http/1.1`**，客户端协商不到 h2 即回退 h1。`contexts` 缓存的 key 由「证书任务 ID」改为「ID + `|h2`/`|h1`」两套并存 —— 站点改开关后下次握手直接落到另一个 key，**无需重启、无需清证书缓存**。
+- **判定范围**：`SslStore.frontH2(host, sites)` 遍历命中该域名的启用站点，**任一**关闭即关闭（同域名多站点时取保守的一侧）。
+- **不受控于该项的部分**：明文端口的 h2c prior-knowledge 由客户端在握手前显式发起，探测到预面时还没有域名可判，因此只能保持原样；要彻底禁 h2 需用 HTTPS 监听（浏览器一定是 HTTPS）。
+- **代价**：失去多路复用，浏览器对同一 origin 最多 6 条 h1 连接。**适合测速 / 大文件下载型站点**，小资源密集的普通站点保持 h2 更省连接。
+
+验证（`AlpnProbe.java`，用真实的 `SslStore.buildContext` 起 TLS 服务，客户端像 Chrome 一样同时支持 h2/http/1.1）：
+
+```
+[client] 站点 frontProtocol=h2    -> ALPN 协商=h2
+[client] 站点 frontProtocol=http1 -> ALPN 协商=http/1.1
+```
+
+配置面另有回归用例 K1/K2/K3（默认补 `h2`、显式 `http1` 原样读回、关了 h2 的站点仍能正常服务）。回归用例由 13 项增至 **16 项，全部通过**。
 
 ---
 
 ## 9. 结论一句话
 
-**"优化代理性能"的批次 flush 改动只给 HTTP/1.1 前端接了泵，HTTPS 前端协商到的 HTTP/2 既不 flush 也不设背压——请求体卡在代理出站缓冲里（上传≈0）并把内存顶满（表现为高频 GC）；叠加 h2 默认 64 KB 流控窗口，高 RTT 链路的上传本身就被钉在 ~3.3 MB/s。** 四处均已修复并有实测背书：`ProxyHandler` 去 `!isH2` 守卫 + h2 同走停等泵（上传 2.8 → 68~83 MB/s）、`ProxyCenter` 抬 h2 本地窗口到 1 MB（40ms 往返下 0.6 → 10.9 MB/s）、h2 无 CL 时回源转 chunked；13 项针对性回归全通过，慢后端下工作集增量不随窗口放大。
+**上传**：“优化代理性能”的批次 flush 改动只给 HTTP/1.1 前端接了泵，HTTPS 前端协商到的 HTTP/2 既不 flush 也不设背压——请求体卡在代理出站缓冲里（上传≈0）并把内存顶满（表现为高频 GC）；叠加 h2 默认 64 KB 流控窗口，高 RTT 链路的上传本身就被钉在 ~3.3 MB/s。四处均已修复并有实测背书：`ProxyHandler` 去 `!isH2` 守卫 + h2 同走停等泵（上传 2.8 → 68~83 MB/s）、`ProxyCenter` 抬 h2 本地窗口到 1 MB（40ms 往返下 0.6 → 10.9 MB/s）、h2 无 CL 时回源转 chunked；线上 OpenList 上传 3.28 → 100 MB/s、LibreSpeed 0.01 → 990 Mbit/s。
+
+**下载**：代理的 h1 路径已持平直连，h2 路径差 35~40%；本地环回（干净基线下 h2 单流 320~385 MB/s）证明**代理 h2 下载代码没有缺陷**，差距出在客户端通告的 h2 流控窗口上，而代理无法代劳；水位旋钮（h2DlWm）实测无效已默认关闭。因此提供站点级 `frontProtocol=http1` 开关（ALPN 只通告 http/1.1）让带宽型站点拿满，已端到端验证 ALPN 确实回退。

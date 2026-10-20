@@ -37,8 +37,10 @@ public final class SslStore {
     private static volatile Map<Long, CertEntry> entries = Map.of();
     /** 域名（精确或 *.父域）-> 证书任务 ID（reload 全量替换） */
     private static volatile Map<String, Long> domainMap = Map.of();
-    /** 任务 ID -> 懒构建的 SslContext 缓存（reload 时清空） */
-    private static final ConcurrentHashMap<Long, SslContext> contexts = new ConcurrentHashMap<>();
+    /** 「证书任务 + 是否通告 h2」-> 懒构建的 SslContext 缓存（reload 时清空）。
+     *  ALPN 是 per-SslContext 的，故按站点 frontProtocol 分两套并存；站点改开关后下次握手
+     *  直接落到另一个 key，无需清缓存即生效 */
+    private static final ConcurrentHashMap<String, SslContext> contexts = new ConcurrentHashMap<>();
 
     /** 一张已签发证书的元信息 */
     public record CertEntry(long taskId, String name, List<String> domains, Instant notAfter) {
@@ -100,23 +102,35 @@ public final class SslStore {
      * SNI 握手选证：先按当前站点列表解析（cert_mode=TASK 指定优先），
      * 再按域名映射自动匹配（精确 > 逐级父域通配）；均未命中时兜底选用
      * 剩余有效期最长的证书。返回 null 仅当证书库为空（握手终止）。
+     * <p>
+     * ALPN 通告按命中站点的 {@code frontProtocol} 决定：站点关闭 h2 时只通告 http/1.1，
+     * 浏览器即回退 h1（用于绕开 h2 流控窗口对大文件下载的限制）。
      */
     public static SslContext forSni(String hostname, List<ProxySite> sites) {
-        if (hostname == null || hostname.isEmpty()) return longestValidContext();
+        if (hostname == null || hostname.isEmpty()) return longestValidContext(true);
         String host = hostname.toLowerCase(Locale.ROOT);
+        boolean h2 = frontH2(host, sites);
         // 1. 站点指定证书任务优先
         for (ProxySite s : sites) {
             if (!s.enabled() || !s.matchDomain(host)) continue;
             if ("TASK".equals(s.certMode()) && s.certTaskId() > 0 && entries.containsKey(s.certTaskId()))
-                return context(s.certTaskId());
+                return context(s.certTaskId(), h2);
         }
         // 2. 域名自动匹配（精确 > 逐级父域通配）：未被站点 TASK 证书锁定即尝试，
         //    覆盖三种情形——AUTO 站点、证书先行站点后建、以及未配置站点的域名复用通配证书
         //    （如访问 npm.pi.mmxx.fun 无对应站点，仍应命中 *.pi.mmxx.fun 而非兜底错证）
         Long taskId = lookupDomain(host);
-        if (taskId != null) return context(taskId);
+        if (taskId != null) return context(taskId, h2);
         // 3. 未匹配到域名证书：兜底剩余有效期最长的证书，避免直接中断握手
-        return longestValidContext();
+        return longestValidContext(h2);
+    }
+
+    /** 前端是否通告 h2：命中该域名的启用站点只要有一个关了 http1 就关（无站点则保持默认 h2） */
+    private static boolean frontH2(String host, List<ProxySite> sites) {
+        for (ProxySite s : sites) {
+            if (s.enabled() && s.matchDomain(host) && !s.adv().frontH2()) return false;
+        }
+        return true;
     }
 
     /** 域名查表：精确 -> *.一级父域 -> *.二级父域 ...（nginx 通配最长匹配语义） */
@@ -136,19 +150,19 @@ public final class SslStore {
     }
 
     /** 任务 -> SslContext（懒构建：SNI 首握手或预热时创建，reload 后失效重建） */
-    private static SslContext context(long taskId) {
-        return contexts.computeIfAbsent(taskId, id -> {
+    private static SslContext context(long taskId, boolean h2) {
+        return contexts.computeIfAbsent(taskId + (h2 ? "|h2" : "|h1"), key -> {
             try {
-                return buildContext(id);
+                return buildContext(taskId, h2);
             } catch (Exception e) {
-                Logs.error(Logs.PROXY, "构建证书任务 #" + id + " 的 TLS 上下文失败: " + e.getMessage());
+                Logs.error(Logs.PROXY, "构建证书任务 #" + taskId + " 的 TLS 上下文失败: " + e.getMessage());
                 throw new IllegalStateException(e);
             }
         });
     }
 
     /** 兜底选证：剩余有效期最长的一张（无 SNI 或域名未命中时使用，后续按 HTTP 层再校验域名归属） */
-    private static SslContext longestValidContext() {
+    private static SslContext longestValidContext(boolean h2) {
         Long bestId = null;
         Instant bestNotAfter = null;
         for (CertEntry e : entries.values()) {
@@ -157,10 +171,10 @@ public final class SslStore {
                 bestNotAfter = e.notAfter();
             }
         }
-        return bestId == null ? null : context(bestId);
+        return bestId == null ? null : context(bestId, h2);
     }
 
-    private static SslContext buildContext(long taskId) throws Exception {
+    private static SslContext buildContext(long taskId, boolean h2) throws Exception {
         Path dir = AppConfig.DATA_DIR.resolve("certs").resolve("task-" + taskId);
         Path keyFile = dir.resolve("domain.key.pem");
         Path certFile = Files.exists(dir.resolve("fullchain.pem"))
@@ -168,13 +182,17 @@ public final class SslStore {
         if (!Files.exists(keyFile) || !Files.exists(certFile))
             throw new IllegalArgumentException("证书文件缺失: " + dir);
         // Netty 直接读 PEM（支持 PKCS8 RSA/EC 私钥），ALPN 走 JDK 内置能力（JDK9+）
+        // 站点关 h2 时只通告 http/1.1：客户端（Chrome/curl --http2）协商不到 h2 即回退 h1
+        String[] protos = h2
+                ? new String[]{ApplicationProtocolNames.HTTP_2, ApplicationProtocolNames.HTTP_1_1}
+                : new String[]{ApplicationProtocolNames.HTTP_1_1};
         return SslContextBuilder.forServer(certFile.toFile(), keyFile.toFile())
                 .protocols("TLSv1.2", "TLSv1.3")
                 .applicationProtocolConfig(new ApplicationProtocolConfig(
                         ApplicationProtocolConfig.Protocol.ALPN,
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                        ApplicationProtocolNames.HTTP_2, ApplicationProtocolNames.HTTP_1_1))
+                        protos))
                 .build();
     }
 

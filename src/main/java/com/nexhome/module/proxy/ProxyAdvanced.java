@@ -28,6 +28,7 @@ import java.util.Set;
  *   "ipAllow":     ["192.168.1.", "10.0.0.5"],                      // 来源 IP 白名单：精确 IP 或以点结尾的网段前缀（空=不限）
  *   "backendInsecure": false,                                       // 后端 HTTPS 跳过证书校验
  *   "backendProtocol": "http1",                                     // 回源协议：http1 | h2（明文 h2c prior-knowledge / https ALPN 协商 h2）
+ *   "frontProtocol":  "h2",                                         // 前端协议（ALPN 通告）：h2 | http1
  *   "h2MaxConcurrentStreams": 100,                                  // h2 单连接并发流上限（与后端 SETTINGS 取小）
  *   "h2MaxConns": 4,                                                // h2 后端连接（每路由每事件循环）保留上限
  *   "upstreamKeepalive": false,                                     // 回源长连接池（按后端 host:port 复用空闲连接）
@@ -74,7 +75,7 @@ public final class ProxyAdvanced {
     /** 每个后端路由在每个事件循环上保留的最大空闲连接数 */
     public int upstreamMaxIdleConns = 32;
 
-    // ---------- 回源 HTTP/2（h2c / ALPN h2） ----------
+    // ---------- 回源 HTTP/2（h2c / ALPN h2）与前端 ALPN 通告 ----------
     /** 回源协议：http1（默认）或 h2。h2 时明文后端走 prior-knowledge，https 后端走 ALPN 协商 h2 */
     public String backendProtocol = "http1";
     /** 单条 h2 后端连接的并发流上限（与后端 SETTINGS 通告值取小） */
@@ -82,9 +83,26 @@ public final class ProxyAdvanced {
     /** 每后端路由每事件循环保留的 h2 连接上限（满载时允许临时超出新建，用完即关不入池） */
     public int h2MaxConns = 4;
 
+    /**
+     * 前端协议：h2（默认，ALPN 通告 h2,http/1.1）或 http1（ALPN 只通告 http/1.1）。
+     * <p>
+     * h2 是信用制流控：浏览器给每条流的窗口从 64KB 起步并按它观测的 BDP 自动扩，
+     * 单流下载稳态速率被钉在「窗口 / RTT」，且同连接多流共享连接级窗口。实测大文件下载
+     * 经代理 h2 明显低于 h1（LibreSpeed：h2 465~657 Mbit/s，h1 842~939，直连 870~945），
+     * 因为 h1 的 socket 缓冲由内核自调、没有这一层信用额度。对纯带宽型站点可关 h2 拿满。
+     * <p>
+     * 仅影响 TLS ALPN 通告；明文端口的 h2c prior-knowledge 由客户端显式发起、握手期无域名可判，不受此项约束。
+     */
+    public String frontProtocol = "h2";
+
     /** 回源是否走 HTTP/2 */
     public boolean backendH2() {
         return "h2".equals(backendProtocol);
+    }
+
+    /** 前端是否通告 h2（ALPN） */
+    public boolean frontH2() {
+        return !"http1".equals(frontProtocol);
     }
 
     // ---------- 文件缓存 ----------
@@ -174,6 +192,11 @@ public final class ProxyAdvanced {
         }
         a.h2MaxConcurrentStreams = rangeInt(o, "h2MaxConcurrentStreams", a.h2MaxConcurrentStreams, 1, 1000, "h2MaxConcurrentStreams");
         a.h2MaxConns = rangeInt(o, "h2MaxConns", a.h2MaxConns, 1, 1024, "h2MaxConns");
+        if (o.has("frontProtocol") && !o.get("frontProtocol").isJsonNull()) {
+            a.frontProtocol = JsonUtils.str(o, "frontProtocol").trim().toLowerCase(Locale.ROOT);
+            if (!a.frontProtocol.equals("h2") && !a.frontProtocol.equals("http1"))
+                throw new IllegalArgumentException("frontProtocol 只能是 h2 或 http1: " + a.frontProtocol);
+        }
         a.upstreamKeepalive = JsonUtils.bool(o, "upstreamKeepalive", a.upstreamKeepalive);
         a.upstreamIdleSec = rangeInt(o, "upstreamIdleSec", a.upstreamIdleSec, 1, 3600, "upstreamIdleSec");
         a.upstreamMaxIdleConns = rangeInt(o, "upstreamMaxIdleConns", a.upstreamMaxIdleConns, 1, 4096, "upstreamMaxIdleConns");
@@ -228,6 +251,7 @@ public final class ProxyAdvanced {
         o.add("ipAllow", ip);
         o.addProperty("backendInsecure", backendInsecure);
         o.addProperty("backendProtocol", backendProtocol);
+        o.addProperty("frontProtocol", frontProtocol);
         o.addProperty("h2MaxConcurrentStreams", h2MaxConcurrentStreams);
         o.addProperty("h2MaxConns", h2MaxConns);
         o.addProperty("upstreamKeepalive", upstreamKeepalive);

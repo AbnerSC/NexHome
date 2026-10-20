@@ -759,6 +759,14 @@
                         <li><b>IP 白名单</b>：逗号分隔，支持<b>精确 IP</b>（<code>10.0.0.5</code>）或<b>以点结尾的网段前缀</b>（<code>192.168.1.</code>）；<b>留空 = 不限</b>。开启「解析真实来源 IP」时按转发头判定。</li>
                         <li><b>后端 TLS 免校验</b>：后端为自签证书 https 时选「是」，否则保持「否」（默认不信任）。</li>
                     </ul>
+                    <p><b>前端协议（浏览器 → 代理）</b></p>
+                    <table>
+                        <thead><tr><th style="width:210px">字段</th><th style="width:130px">默认</th><th>说明</th></tr></thead>
+                        <tbody>
+                        <tr><td>前端协议</td><td>HTTP/2</td><td>可选 <b>HTTP/1.1（关闭 h2）</b>：该域名的 ALPN 只通告 http/1.1，浏览器即回退 h1。仅影响 HTTPS 监听的 ALPN 通告，明文端口的 h2c prior-knowledge 由客户端显式发起、握手期无域名可判，不受此项约束。</td></tr>
+                        </tbody>
+                    </table>
+                    <div class="doc-note warn"><b>何时该关掉 h2</b>h2 是<b>信用制流控</b>：浏览器给每条流的窗口从 64KB 起步、按它自己观测到的 BDP 缓慢自调，于是<b>单流下载速率会被钉在「窗口 ÷ 往返」</b>，同连接多流还要共享连接级窗口。实测大文件下载经代理 h2 明显低于 h1（同一 LibreSpeed：<b>h2 465~657 Mbit/s，h1 842~939，直连 870~945</b>）。所以<b>纯带宽型站点（测速、大文件下载）建议改为 HTTP/1.1</b>；多小请求 / 多路复用型站点保持 h2 更省连接。改动<b>无需重启</b>，下一次 TLS 握手即生效（浏览器需另建连接，开个新标签即可）。</div>
                     <p><b>回源协议 / HTTP/2</b></p>
                     <table>
                         <thead><tr><th style="width:210px">字段</th><th style="width:130px">默认</th><th>说明</th></tr></thead>

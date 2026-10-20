@@ -446,13 +446,17 @@ public final class ProxyCenter {
      * 下载方向的停后端读由 {@code BackendRelay} 根据 {@code front.channel().isWritable()} 判定，
      * 而 h2 子流的可写性恢复条件是「写缓冲回落到低水位以下 且 父连接可写」
      * （{@code AbstractHttp2StreamChannel}），默认 32K/64K 对 h2 出站太敏感：窗口未用满就先停后端读。
-     * 抬高水位后代理内常备待发数据，窗口一开即发满。本地环回实测（512MB 流式下载，3 轮取最优）：
-     * 单连接 1/2/4 流由 117.0/105.4/83.9 MB/s 抬到 139.6/119.7/98.3 MB/s（多流场景 +17%）。
-     * 取 1MB 为收益/内存折中（再大到 2MB 仅多 +8%）；代价是每条 h2 下载流最多多缓冲一个高水位量。
-     * 注意：单连接多流不扩展的根源是 h2 <em>连接级</em>流控窗口（由客户端通告，Chrome 15MB、Node 64KB），
-     * 代理无法代劳；本项只能把已有窗口用满。
+     * 抬高水位后代理内常备待发数据，窗口一开即发满。
+     * <p>
+     * 实测结论：本项默认关闭（0）。同机环回（带宽无限、往返≈0）下单连接 1 流即可跑 320~385 MB/s，
+     * 远超经代理链路的实际上限，水位调整只在噪声内（±15%、方向不一致）——先前记录的
+     * 「1/2/4 流 117.0/105.4/83.9 → 139.6/119.7/98.3」系前置负载污染基线所致；线上
+     * （LibreSpeed + Chrome）开 1MB 后下载仍为 520~657 Mbit/s，与关闭时的 605 无可测差异。
+     * 保留为诊断旋钮：受限带宽 / 高往返的下载链路可试 512~2048；代价是每条 h2 下载流
+     * 最多多缓冲一个高水位量。下载吞吐的真正上限是 h2 流控窗口（由客户端通告并按其
+     * 观测的 BDP 自调），代理无法代劳——要拿满带宽就把站点 frontProtocol 设为 http1。
      */
-    static final int H2_DL_WM = Integer.getInteger("nx.proxy.h2DlWm", 1024);
+    static final int H2_DL_WM = Integer.getInteger("nx.proxy.h2DlWm", 0);
 
     /** 回源出站连接的高速优化项（仅在 {@link #FAST_PATH} 生效）：按子开关逐项应用 */
     private static void applyFastPath(io.netty.bootstrap.Bootstrap b) {

@@ -255,6 +255,12 @@ window.pxForm = async (id) => {
           <div class="field full"><label>IP 白名单</label><input id="aIpAllow" placeholder="192.168.1., 10.0.0.5（精确 IP 或以点结尾的网段前缀，逗号分隔，留空=不限）"></div>
           <div class="field"><label>后端 TLS 免校验（自签 https 后端）</label>
             <select id="aInsecure"><option value="true">是</option><option value="false">否</option></select></div>
+          <div class="field"><label>前端协议（浏览器 → 代理）</label>
+            <select id="aFrontProto"><option value="h2">HTTP/2（默认）</option><option value="http1">HTTP/1.1（关闭 h2）</option></select></div>
+          <div class="small muted full">h2 是信用制流控：浏览器给每条流的窗口从 64KB 起步、按其观测的 BDP 自调，
+            单流下载速率会被钉在「窗口 / 往返」。大文件下载型站点若跑不满带宽可改 <b>HTTP/1.1</b>
+            （socket 缓冲由内核自调，无这层额度；实测经代理吞吐高于 h2）。仅影响 HTTPS 的 ALPN 通告，
+            明文端口的 h2c prior-knowledge 不受此项约束。</div>
           <div class="field full adv-cache-title"><b>回源协议 / HTTP/2</b></div>
           <div class="field"><label>回源协议</label>
             <select id="aBackendProto"><option value="http1">HTTP/1.1</option><option value="h2">HTTP/2（h2c / ALPN h2）</option></select></div>
@@ -348,6 +354,7 @@ function pxFillAdvControls() {
     $('#aAuthPass').value = ba.pass || '';
     $('#aIpAllow').value = (a.ipAllow || []).join(', ');
     $('#aInsecure').value = String(!!a.backendInsecure);
+    $('#aFrontProto').value = a.frontProtocol === 'http1' ? 'http1' : 'h2';
     $('#aBackendProto').value = a.backendProtocol === 'h2' ? 'h2' : 'http1';
     $('#aH2Streams').value = a.h2MaxConcurrentStreams ?? 100;
     $('#aH2Conns').value = a.h2MaxConns ?? 4;
@@ -379,6 +386,7 @@ function pxReadAdvControls() {
     const ip = csv($('#aIpAllow').value);
     if (ip.length) a.ipAllow = ip; else delete a.ipAllow;
     a.backendInsecure = $('#aInsecure').value === 'true';
+    a.frontProtocol = $('#aFrontProto').value === 'http1' ? 'http1' : 'h2';
     const proto = $('#aBackendProto').value === 'h2' ? 'h2' : 'http1';
     a.backendProtocol = proto;
     a.h2MaxConcurrentStreams = Math.min(1000, Math.max(1, num($('#aH2Streams').value) || 100));
