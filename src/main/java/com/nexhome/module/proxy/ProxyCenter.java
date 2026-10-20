@@ -1341,4 +1341,204 @@ public final class ProxyCenter {
         io.netty.channel.ChannelFuture f = ctx.writeAndFlush(res);
         if (!keepAlive) f.addListener(ChannelFutureListener.CLOSE);
     }
+
+    /**
+     * 输出「未找到匹配站点」的 404 页（白底主题，与 {@link #sendErrorPage} 同风格）。
+     * host / path 来自客户端，一律经 HTML 转义后嵌入，避免标记注入。
+     */
+    static void sendNotFoundPage(ChannelHandlerContext ctx, String host, String path, boolean keepAlive) {
+        String meta = metaBlock("Host", host, "路径", path);
+        String html = renderError("404", "未找到匹配的站点",
+                "该域名尚未在代理中心配置，或当前未处于启用状态。",
+                meta, "请在「代理中心」添加或启用该域名的站点", false);
+        writeHtml(ctx, 404, html, keepAlive);
+    }
+
+    /**
+     * 输出转发过程中的错误页（500/502/503/504 等），与 404 页同风格（白底主题，5xx 用暖色强调）。
+     * detail 为技术原因（异常信息等），展示于详情块并 HTML 转义；hint 为空时按状态码给默认建议。
+     */
+    static void sendErrorPage(ChannelHandlerContext ctx, int status, String detail, String hint, boolean keepAlive) {
+        String title, desc, defHint;
+        switch (status) {
+            case 504 -> {
+                title = "网关超时";
+                desc = "后端服务未在规定时间内返回响应。";
+                defHint = "后端处理可能过慢或已挂起，请检查后端负载与超时配置后重试。";
+            }
+            case 503 -> {
+                title = "服务不可用";
+                desc = "后端服务暂时不可用。";
+                defHint = "请稍后重试，或检查后端服务是否已启动。";
+            }
+            case 502 -> {
+                title = "网关错误";
+                desc = "无法从后端服务获得有效响应。";
+                defHint = "请检查后端服务是否运行，以及代理中心中该站点的后端地址与端口配置。";
+            }
+            case 500 -> {
+                title = "服务器内部错误";
+                desc = "代理在处理请求时发生内部错误。";
+                defHint = "请稍后重试，若持续出现请查看「操作日志」定位原因。";
+            }
+            default -> {
+                title = "请求未成功";
+                desc = "代理返回了一个错误状态。";
+                defHint = "请稍后重试。";
+            }
+        }
+        String meta = (detail == null || detail.isBlank()) ? "" : metaBlock("详情", detail);
+        String h = (hint == null || hint.isBlank()) ? defHint : hint;
+        writeHtml(ctx, status, renderError(String.valueOf(status), title, desc, meta, h, status >= 500), keepAlive);
+    }
+
+    /** 组装错误页 HTML：先替换固定样式变量，最后再注入含用户输入的 META / HINT，避免其内容被后续占位符替换二次处理 */
+    private static String renderError(String code, String title, String desc, String meta, String hint, boolean serverError) {
+        return ERROR_PAGE
+                .replace("{{GRAD}}", serverError ? "linear-gradient(135deg, #ef4444, #f97316)"
+                        : "linear-gradient(135deg, #2563eb, #7c3aed)")
+                .replace("{{BADGE_FG}}", serverError ? "#dc2626" : "#2563eb")
+                .replace("{{BADGE_BG}}", serverError ? "#fef2f2" : "#eff6ff")
+                .replace("{{CODE}}", escapeHtml(code))
+                .replace("{{TITLE}}", escapeHtml(title))
+                .replace("{{DESC}}", escapeHtml(desc))
+                .replace("{{META}}", meta)
+                .replace("{{HINT}}", escapeHtml(hint));
+    }
+
+    /** 详情块 HTML：成对的「标签-值」行，值经转义；无内容时返回空串（不渲染 meta 容器） */
+    private static String metaBlock(String... kv) {
+        StringBuilder rows = new StringBuilder();
+        for (int i = 0; i + 1 < kv.length; i += 2) {
+            rows.append("<div class=\"row\"><span class=\"k\">")
+                    .append(escapeHtml(kv[i]))
+                    .append("</span><span class=\"v\">")
+                    .append(escapeHtml(kv[i + 1]))
+                    .append("</span></div>");
+        }
+        return rows.isEmpty() ? "" : "<div class=\"meta\">" + rows + "</div>";
+    }
+
+    /** 输出 HTML 响应（供错误页等自包含页面复用）：charset=utf-8，keepAlive=false 时写后关闭 */
+    static void writeHtml(ChannelHandlerContext ctx, int status, String html, boolean keepAlive) {
+        byte[] body = html.getBytes(StandardCharsets.UTF_8);
+        io.netty.handler.codec.http.DefaultFullHttpResponse res =
+                new io.netty.handler.codec.http.DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
+                        io.netty.handler.codec.http.HttpResponseStatus.valueOf(status),
+                        Unpooled.wrappedBuffer(body));
+        res.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/html; charset=utf-8")
+                .set(HttpHeaderNames.CONTENT_LENGTH, body.length)
+                .set(HttpHeaderNames.SERVER, "NexHome");
+        HttpUtil.setKeepAlive(res, keepAlive);
+        io.netty.channel.ChannelFuture f = ctx.writeAndFlush(res);
+        if (!keepAlive) f.addListener(ChannelFutureListener.CLOSE);
+    }
+
+    /** HTML 文本转义（& < > " '），用于把不可控输入安全嵌入页面 */
+    private static String escapeHtml(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '&' -> sb.append("&amp;");
+                case '<' -> sb.append("&lt;");
+                case '>' -> sb.append("&gt;");
+                case '"' -> sb.append("&quot;");
+                case '\'' -> sb.append("&#39;");
+                default -> sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 代理错误页统一模板（白底主题）：404 与 5xx 共用，
+     * 占位符 {{CODE}} {{TITLE}} {{DESC}} {{META}} {{HINT}} 及样式变量 {{GRAD}} {{BADGE_FG}} {{BADGE_BG}}。
+     */
+    private static final String ERROR_PAGE = """
+            <!doctype html>
+            <html lang="zh-CN">
+            <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>{{CODE}} · {{TITLE}}</title>
+            <style>
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              html, body { height: 100%; }
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+                background: #f5f7fa;
+                color: #1f2937;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 24px;
+                -webkit-font-smoothing: antialiased;
+              }
+              .card {
+                background: #ffffff;
+                width: 100%;
+                max-width: 520px;
+                border-radius: 18px;
+                padding: 48px 40px 40px;
+                text-align: center;
+                border: 1px solid #eef1f5;
+                box-shadow: 0 12px 40px rgba(15, 23, 42, .08);
+              }
+              .badge {
+                display: inline-block;
+                font-size: 13px;
+                font-weight: 600;
+                letter-spacing: .5px;
+                color: {{BADGE_FG}};
+                background: {{BADGE_BG}};
+                padding: 6px 14px;
+                border-radius: 999px;
+                margin-bottom: 22px;
+              }
+              .code {
+                font-size: 76px;
+                font-weight: 800;
+                line-height: 1;
+                letter-spacing: -2px;
+                background: {{GRAD}};
+                -webkit-background-clip: text;
+                background-clip: text;
+                -webkit-text-fill-color: transparent;
+                margin-bottom: 14px;
+              }
+              h1 { font-size: 20px; font-weight: 600; margin-bottom: 10px; }
+              .desc { font-size: 14px; color: #6b7280; line-height: 1.7; margin-bottom: 26px; }
+              .meta {
+                text-align: left;
+                background: #f9fafb;
+                border: 1px solid #eef1f5;
+                border-radius: 12px;
+                padding: 14px 18px;
+                font-size: 13px;
+                margin-bottom: 24px;
+              }
+              .meta .row { display: flex; gap: 10px; padding: 4px 0; }
+              .meta .k { color: #9ca3af; min-width: 44px; }
+              .meta .v {
+                color: #374151;
+                word-break: break-all;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+              }
+              .hint { font-size: 12px; color: #9ca3af; line-height: 1.6; }
+            </style>
+            </head>
+            <body>
+              <div class="card">
+                <div class="badge">NexHome 反向代理</div>
+                <div class="code">{{CODE}}</div>
+                <h1>{{TITLE}}</h1>
+                <p class="desc">{{DESC}}</p>
+                {{META}}
+                <p class="hint">{{HINT}}</p>
+              </div>
+            </body>
+            </html>
+            """;
 }

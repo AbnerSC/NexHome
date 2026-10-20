@@ -271,8 +271,7 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
         ProxyCenter.noteError(tx.site, "后端响应报文非法: " + why);
         abortWriter();
         if (!tx.done.get()) {
-            ProxyCenter.sendSimple(tx.front, 502, "NexHome 代理：后端响应报文非法（" + why + "）",
-                    null, null, false);
+            ProxyCenter.sendErrorPage(tx.front, 502, "后端响应报文非法: " + why, null, false);
             tx.finish(false);
         }
         ctx.close();
@@ -295,7 +294,7 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
                         ? "后端响应超时（" + tx.site.adv().idleSec + " 秒无响应头）"
                         : "后端连接失败: " + cause.getMessage();
                 ProxyCenter.noteError(tx.site, msg);
-                ProxyCenter.sendSimple(tx.front, code, "NexHome 代理：" + msg, null, null, false);
+                ProxyCenter.sendErrorPage(tx.front, code, msg, null, false);
             }
             abortWriter();
             tx.finish(false);
@@ -316,8 +315,7 @@ final class BackendRelay extends SimpleChannelInboundHandler<Object> {
         if (tx != null && !tx.done.get()) {
             if (!headSeen) {
                 ProxyCenter.noteError(tx.site, "后端在响应前关闭连接");
-                ProxyCenter.sendSimple(tx.front, 502,
-                        "NexHome 代理：后端在响应前关闭了连接，请检查后端服务与端口", null, null, false);
+                ProxyCenter.sendErrorPage(tx.front, 502, "后端在响应前关闭了连接", null, false);
             } else {
                 // 响应头已写出后后端中断（FIN / RST_STREAM）：既不能补错误页，也绝不能把半截响应
                 // 当成完整交付——先把已转发的部分体刷给客户端，再立即终止前端连接
@@ -413,8 +411,8 @@ final class UpgradeBridge extends SimpleChannelInboundHandler<ByteBuf> {
     private void fail(ChannelHandlerContext ctx, String reason) {
         ProxyCenter.noteError(tx.site, "隧道建立失败: " + reason);
         if (tx.front.channel().isActive()) {
-            ProxyCenter.sendSimple(tx.front, 502, "NexHome 代理：协议升级失败 - " + reason,
-                    null, null, false);
+            ProxyCenter.sendErrorPage(tx.front, 502, "协议升级失败: " + reason,
+                    "WebSocket / 协议升级需后端支持，请确认该站点的后端与回源协议配置。", false);
         }
         tx.finish(false);
         ctx.close();

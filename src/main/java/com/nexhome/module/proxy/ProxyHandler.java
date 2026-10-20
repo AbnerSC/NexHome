@@ -199,9 +199,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
 
         ProxySite site = ProxyCenter.route(host, path);
         if (site == null) {
-            ProxyCenter.sendSimple(ctx, 404,
-                    "NexHome 代理：未找到匹配站点\nHost: " + host + "\n路径: " + path
-                            + "\n（请在「代理中心」添加或启用该域名的站点）", null, null, true);
+            ProxyCenter.sendNotFoundPage(ctx, host, path + (query.isEmpty() ? "" : "?" + query), true);
             return;
         }
         ProxyCenter.SiteStats st = ProxyCenter.stats(site.id());
@@ -397,8 +395,7 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
     private void connectFailed(Tx t, String reason) {
         if (t == null || t.done.get()) return;
         ProxyCenter.noteError(t.site, reason);
-        ProxyCenter.sendSimple(t.front, 502, "NexHome 代理：" + reason + "，请检查后端服务与端口",
-                null, null, false);
+        ProxyCenter.sendErrorPage(t.front, 502, reason, null, false);
         t.front.close();
         t.finish(false);
     }
@@ -563,7 +560,8 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
             try {
                 fc = FileChannel.open(hit.file, StandardOpenOption.READ);
             } catch (Exception e) {
-                ProxyCenter.sendSimple(ctx, 500, "缓存文件读取失败: " + e.getMessage(), null, null, false);
+                ProxyCenter.sendErrorPage(ctx, 500, "缓存文件读取失败: " + e.getMessage(),
+                        "请稍后重试，或在代理中心清空该站点的磁盘缓存。", false);
                 ctx.close();
                 return;
             }
@@ -598,7 +596,8 @@ final class ProxyHandler extends SimpleChannelInboundHandler<Object> {
                 fc.close();
             } catch (Exception ignored) {
             }
-            ProxyCenter.sendSimple(ctx, 500, "缓存文件读取失败: " + e.getMessage(), null, null, false);
+            ProxyCenter.sendErrorPage(ctx, 500, "缓存文件读取失败: " + e.getMessage(),
+                    "请稍后重试，或在代理中心清空该站点的磁盘缓存。", false);
             ctx.close();
         }
     }

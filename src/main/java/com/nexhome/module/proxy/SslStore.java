@@ -105,18 +105,16 @@ public final class SslStore {
         if (hostname == null || hostname.isEmpty()) return longestValidContext();
         String host = hostname.toLowerCase(Locale.ROOT);
         // 1. 站点指定证书任务优先
-        boolean auto = false;
         for (ProxySite s : sites) {
             if (!s.enabled() || !s.matchDomain(host)) continue;
             if ("TASK".equals(s.certMode()) && s.certTaskId() > 0 && entries.containsKey(s.certTaskId()))
                 return context(s.certTaskId());
-            if ("AUTO".equals(s.certMode())) auto = true;
         }
-        // 2. 域名自动匹配（无站点匹配时也尝试，允许证书先行、站点后建）
-        if (auto || sites.isEmpty()) {
-            Long taskId = lookupDomain(host);
-            if (taskId != null) return context(taskId);
-        }
+        // 2. 域名自动匹配（精确 > 逐级父域通配）：未被站点 TASK 证书锁定即尝试，
+        //    覆盖三种情形——AUTO 站点、证书先行站点后建、以及未配置站点的域名复用通配证书
+        //    （如访问 npm.pi.mmxx.fun 无对应站点，仍应命中 *.pi.mmxx.fun 而非兜底错证）
+        Long taskId = lookupDomain(host);
+        if (taskId != null) return context(taskId);
         // 3. 未匹配到域名证书：兜底剩余有效期最长的证书，避免直接中断握手
         return longestValidContext();
     }
