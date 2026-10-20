@@ -46,6 +46,11 @@ WORKDIR /app
 
 COPY --from=build /build/target/nexhome.jar app.jar
 
+# glibc malloc arena 收敛：默认每个线程可各建一个 arena（上限 8×CPU，8 核即 64 个），
+# 高并发 I/O 尖峰（如「网络测速」短时间猛灌数据）后 freed chunk 散落在各 arena 无法 munmap 归还 OS，
+# 表现为 RSS 涨上去不回落（堆与 NIO 直接缓冲均无变化）。限成 2 个 arena 后 freed 内存集中在堆顶可被 trim 回收。
+ENV MALLOC_ARENA_MAX=2
+
 # JVM 内存自适应：堆上限按容器内存限制（cgroup；裸机运行时为物理总内存）的 50% 自动计算
 # （-XX:MaxRAMPercentage），无需固定 -Xmx，低配/高配环境均可自适应；
 # 剩余 ~50% 留给 Metaspace(≤128m)/CodeCache(≤64m)/线程栈等非堆内存；

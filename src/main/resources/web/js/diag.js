@@ -5,6 +5,7 @@
 
 let diagAutoRefresh = true;
 let diagTimer = null;
+let diagChartState = null; // 时间线图当前数据 { history, maxV }，供悬停 tooltip 读取
 
 /** MB 数值（后端已给 MB 浮点）-> 人类可读；-1 表示不可用 */
 function fmtDiagMB(mb) {
@@ -35,30 +36,93 @@ function diagSeriesPoints(history, key, maxV, w, h) {
     }).join(' ');
 }
 
-/** 内存时间线双折线图（容器内存 + JVM 堆），纯内联 SVG，无第三方图表库 */
+/** 时间字符串取 HH:MM:SS 短格式（后端给的是 "YYYY-MM-DD HH:MM:SS"） */
+function diagTimeShort(t) {
+    if (!t) return '';
+    const p = String(t).trim().split(/\s+/);
+    return p.length > 1 ? p[1] : t;
+}
+
+/** 内存时间线双折线图（容器内存 + JVM 堆）：SVG 只画网格线与折线，坐标轴/悬停用 HTML 叠加，
+    规避 preserveAspectRatio="none" 对 SVG 文字的拉伸变形。 */
 function diagChart(history) {
-    const w = 900, h = 220, pad = 6;
+    const W = 900, H = 220;
     let maxV = 1;
     history.forEach(s => {
         maxV = Math.max(maxV, Number(s.mem || 0), Number(s.heapC || 0));
     });
     maxV = Math.ceil(maxV * 1.1);
-    const cPts = diagSeriesPoints(history, 'mem', maxV, w - pad * 2, h);
-    const hPts = diagSeriesPoints(history, 'heap', maxV, w - pad * 2, h);
+    diagChartState = { history, maxV };
+    const cPts = diagSeriesPoints(history, 'mem', maxV, W, H);
+    const hPts = diagSeriesPoints(history, 'heap', maxV, W, H);
     const first = history[0], last = history[history.length - 1];
+    const n = history.length;
+    // Y 轴刻度（5 档）+ 对应水平网格线
+    let yLabels = '', gLines = '';
+    for (let i = 0; i <= 4; i++) {
+        yLabels += `<span style="top:${i / 4 * 100}%">${fmtDiagMB(maxV * (1 - i / 4))}</span>`;
+        const y = i / 4 * H;
+        gLines += `<line x1="0" y1="${y}" x2="${W}" y2="${y}" class="diag-grid"/>`;
+    }
+    // X 轴时间刻度（最多 5 个，首尾贴边避免裁切）
+    const ticks = Math.min(5, n);
+    let xLabels = '';
+    for (let k = 0; k < ticks; k++) {
+        const idx = ticks > 1 ? Math.round(k * (n - 1) / (ticks - 1)) : 0;
+        const left = n > 1 ? idx / (n - 1) * 100 : 0;
+        const cls = k === 0 ? 'edge-l' : (k === ticks - 1 ? 'edge-r' : '');
+        xLabels += `<span class="${cls}" style="left:${left}%">${esc(diagTimeShort(history[idx].time))}</span>`;
+    }
     return `
       <div class="diag-legend">
         <span><i class="dot" style="background:var(--cyan)"></i>容器内存（当前 ${fmtDiagMB(last?.mem)} / 上限 ${fmtDiagMB(last?.memM)}）</span>
         <span><i class="dot" style="background:var(--green)"></i>JVM 堆（当前 ${fmtDiagMB(last?.heap)}）</span>
-        <span class="muted small">纵轴满刻度 ${fmtDiagMB(maxV)}，共 ${history.length} 个样本${first ? `，跨度 ${first.time} ~ ${last.time}` : ''}</span>
+        <span class="muted small">纵轴满刻度 ${fmtDiagMB(maxV)}，共 ${n} 个样本${first ? `，跨度 ${first.time} ~ ${last.time}` : ''}</span>
       </div>
-      <svg class="diag-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-        <g transform="translate(${pad},${pad / 2})">
-          <line x1="0" y1="${h}" x2="${w - pad * 2}" y2="${h}" stroke="rgba(255,255,255,.15)"/>
-          <polyline fill="none" stroke="var(--cyan)" stroke-width="1.6" points="${cPts}"/>
-          <polyline fill="none" stroke="var(--green)" stroke-width="1.6" points="${hPts}"/>
-        </g>
-      </svg>`;
+      <div class="diag-chart">
+        <div class="diag-yaxis">${yLabels}</div>
+        <div class="diag-plot" id="diagPlot">
+          <svg class="diag-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+            ${gLines}
+            <polyline fill="none" stroke="var(--cyan)" stroke-width="1.6" vector-effect="non-scaling-stroke" points="${cPts}"/>
+            <polyline fill="none" stroke="var(--green)" stroke-width="1.6" vector-effect="non-scaling-stroke" points="${hPts}"/>
+          </svg>
+          <div class="diag-crosshair" id="diagCross"></div>
+          <div class="diag-tip" id="diagTip" hidden></div>
+        </div>
+        <div class="diag-xaxis">${xLabels}</div>
+      </div>`;
+}
+
+/** 绑定时间线图悬停交互：十字准线 + tooltip（loadDiag 每次重渲染后调用） */
+function bindDiagChart() {
+    const plot = document.getElementById('diagPlot');
+    if (!plot || !diagChartState) return;
+    const tip = document.getElementById('diagTip');
+    const cross = document.getElementById('diagCross');
+    const history = diagChartState.history;
+    const n = history.length;
+    plot.addEventListener('mousemove', e => {
+        const r = plot.getBoundingClientRect();
+        if (r.width <= 0) return;
+        let fx = (e.clientX - r.left) / r.width;
+        fx = Math.max(0, Math.min(1, fx));
+        const idx = Math.round(fx * (n - 1));
+        const s = history[idx] || {};
+        const xPct = n > 1 ? idx / (n - 1) * 100 : 0;
+        cross.style.left = xPct + '%';
+        cross.style.display = 'block';
+        tip.hidden = false;
+        tip.innerHTML = `<div class="t">${esc(s.time || '')}</div>`
+            + `<div><i class="dot" style="background:var(--cyan)"></i>容器内存 ${fmtDiagMB(s.mem)}</div>`
+            + `<div><i class="dot" style="background:var(--green)"></i>JVM 堆 ${fmtDiagMB(s.heap)}</div>`;
+        tip.style.left = xPct + '%';
+        tip.classList.toggle('flip', xPct > 62); // 靠近右缘时把气泡翻到准线左侧，避免溢出
+    });
+    plot.addEventListener('mouseleave', () => {
+        cross.style.display = 'none';
+        tip.hidden = true;
+    });
 }
 
 /** 日志密度迷你柱状（每分钟条数），横轴为时间线跨度 */
@@ -87,6 +151,7 @@ async function loadDiag() {
     try { snap = await api('GET', '/api/diag/snapshot'); } catch (e) { return; }
     const body = $('#diagLive');
     if (!body) return; // 已离开页面
+    diagChartState = null; // 重渲染前先失效，避免悬停读到已卸载的旧图
     const s = snap.latest || {};
     const jvm = snap.jvm || {};
     body.innerHTML = `
@@ -114,6 +179,7 @@ async function loadDiag() {
         ${snap.history && snap.history.length >= 2 ? diagChart(snap.history)
               : '<p class="muted small">样本不足（需至少 2 个，每 ' + (snap.intervalSec || 10) + ' 秒采一次），请稍候再刷新。</p>'}
       </div>`;
+    if (snap.history && snap.history.length >= 2) bindDiagChart();
 }
 
 async function runDiagAnalysis() {
