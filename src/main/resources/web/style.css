@@ -398,6 +398,9 @@ body::after {
 .btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
 .btn.ghost:hover { color: var(--red); box-shadow: none; }
 .btn.small { padding: 4px 11px; font-size: 12px; border-radius: 8px; }
+/* 链接式按钮（如顶栏「使用文档」）：抑制全局 a / a:hover 的下划线，保持与 button 按钮同形 */
+a.btn, a.btn:visited { text-decoration: none; }
+a.btn:hover { text-decoration: none; text-shadow: none; }
 .btn.block { width: 100%; justify-content: center; padding: 12px; }
 .btn:disabled { opacity: .6; cursor: not-allowed; transform: none !important; box-shadow: none !important; }
 

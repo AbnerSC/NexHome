@@ -18,7 +18,7 @@
             <input type="password" id="loginPwd" placeholder="请输入登录密码" autocomplete="current-password" required>
             <button type="submit" class="btn primary block">登 录</button>
         </form>
-        <p class="muted small">首次使用默认密码查看控制台</p>
+        <p class="muted small">首次使用默认密码查看控制台 · <a href="docs.html" target="_blank" rel="noopener">使用文档</a></p>
     </div>
 </div>
 
@@ -51,6 +51,8 @@
             <!-- 顶栏系统资源监控（CPU / 内存 / 虚拟内存），由 app.js 每 5 秒刷新 -->
             <div id="sysMetrics" class="sys-metrics"></div>
             <div class="topbar-actions">
+                <!-- 使用文档随系统打包部署（web/docs.html），相对路径以兼容安全入口前缀模式 -->
+                <a class="btn small" id="btnDocs" href="docs.html" target="_blank" rel="noopener">📖 使用文档</a>
                 <button class="btn ghost small" id="btnLogout">退出登录</button>
             </div>
         </header>
