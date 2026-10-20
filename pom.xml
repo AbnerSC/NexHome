@@ -35,7 +35,7 @@
         <dependency>
             <groupId>org.xerial</groupId>
             <artifactId>sqlite-jdbc</artifactId>
-            <version>3.53.2.1</version>
+            <version>3.53.4.0</version>
         </dependency>
         <dependency>
             <groupId>com.google.code.gson</groupId>
@@ -76,7 +76,7 @@
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-jdk14</artifactId>
-            <version>2.0.18</version>
+            <version>2.0.20</version>
         </dependency>
         <!-- 告警通知中心 email 渠道：Jakarta Mail API + Eclipse Angus 实现（SMTP/STARTTLS/SMTPS）。
              angus-mail 传递引入 jakarta.mail-api 与 angus-activation，此处显式声明锁定版本。 -->
@@ -151,7 +151,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.6.1</version>
+                <version>3.6.2</version>
                 <executions>
                     <execution>
                         <phase>package</phase>
