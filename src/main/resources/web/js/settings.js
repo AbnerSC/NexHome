@@ -22,6 +22,8 @@ async function renderSettings() {
     let sec = { maxFails: 3, lockMinutes: 30 };
     try { sec = await api('GET', '/api/auth/security'); } catch (e) { /* ignore */ }
     const memPct = metrics.memTotalMB > 0 ? Math.round(metrics.memUsedMB * 100 / metrics.memTotalMB) : 0;
+    // JVM 堆内存：来自 /api/system/info，与容器物理内存区分，便于定位堆增长
+    const heapPct = info.maxMemoryMB > 0 ? Math.round(info.usedMemoryMB * 100 / info.maxMemoryMB) : 0;
     const typeName = code => types[code] || code;
     const cfgRows = configs.map(c => `
       <tr>
@@ -43,6 +45,7 @@ async function renderSettings() {
           <tr><th>操作系统</th><td>${esc(info.os || '')}</td></tr>
           <tr><th>运行时长</th><td>${Math.floor((info.uptimeSec || 0) / 3600)} 小时 ${Math.floor((info.uptimeSec || 0) % 3600 / 60)} 分钟</td></tr>
           <tr><th>内存占用</th><td>${metrics.memUsedMB != null ? `${fmtMB(metrics.memUsedMB)} / ${fmtMB(metrics.memTotalMB)}（${memPct}%）` : ''}</td></tr>
+          <tr><th>堆内存</th><td>${info.maxMemoryMB > 0 ? `${fmtMB(info.usedMemoryMB)} / ${fmtMB(info.maxMemoryMB)}（${heapPct}%）` : ''}</td></tr>
         </table>
       </div>
       <div class="panel">

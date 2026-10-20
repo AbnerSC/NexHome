@@ -50,6 +50,6 @@ COPY --from=build /build/target/nexhome.jar app.jar
 # （-XX:MaxRAMPercentage），无需固定 -Xmx，低配/高配环境均可自适应；
 # 剩余 ~25% 留给 Metaspace(≤128m)/CodeCache(≤64m)/线程栈等非堆内存；
 # 低内存调优：Serial GC + 小线程栈（ip2region 已用 VIndexCache 按需读文件，无需大堆）
-ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseG1GC", "-XX:MaxRAMPercentage=75.0", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
+ENTRYPOINT ["java", "--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders", "-XX:+UseSerialGC", "-XX:MaxRAMPercentage=75.0", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-jar", "app.jar"]
 
 EXPOSE 8090
