@@ -1,5 +1,8 @@
 # NexHome｜联枢
 
+## 转移
+已使用Golang重构：https://github.com/AbnerSC/NexHomeGo.git
+
 ## GitHub
 https://github.com/AbnerSC/NexHome.git
 
